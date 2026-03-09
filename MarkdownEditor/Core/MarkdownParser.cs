@@ -145,6 +145,22 @@ public static class MarkdownParser
                 continue;
             }
 
+            // 兼容单个 $ 包裹单行公式的旧式块级写法：
+            // $
+            // +123
+            // $
+            // 仅当起始 $ 与首个非空内容之间不存在空行，且内容行与结束 $ 行之间也不存在空行时才视为块级数学；
+            // 若存在空行（例如 "$"、空行、"+123"、"$"），则整体按普通段落处理。
+            if (trimmed.Length > 0 && trimmed[0] == '$')
+            {
+                if (TryParseSingleDollarMathBlock(lines, i, out var mathBlock, out var consumedLines))
+                {
+                    blocks.Add(mathBlock!);
+                    i += consumedLines;
+                    continue;
+                }
+            }
+
             // HTML 块：行首为 < 且紧跟字母、/、!、?
             if (IsHtmlBlockStart(trimmed))
             {
@@ -608,11 +624,11 @@ public static class MarkdownParser
     }
 
     /// <summary>
-    /// 判断是否为块级数学公式起始行（$$）
+    /// 判断是否为块级数学公式起始行（仅支持 $$ 开头的标准形式）。
     /// 规则：
-    /// - 行首必须是 $$
-    /// - 若同一行内没有再次出现 $$，则 $$ 后面只能是空白，否则视为普通文本
-    /// - 若同一行内再次出现 $$（形如 $$...$$），则允许行内有 LaTeX 内容
+    /// - 行首必须是 \"$$\"；
+    /// - 若同一行内没有再次出现 \"$$\"，则 \"$$\" 后面只能是空白，否则视为普通文本；
+    /// - 若同一行内再次出现 \"$$\"（形如 \"$$...$$\"），则允许行内有 LaTeX 内容。
     /// </summary>
     private static bool IsMathBlockStart(ReadOnlySpan<char> trimmed)
     {
@@ -672,6 +688,74 @@ public static class MarkdownParser
             i++;
         }
         return (new MathBlockNode { LaTeX = sb.ToString().Trim() }, i - start);
+    }
+
+    /// <summary>
+    /// 兼容旧式单个 $ 包裹单行公式的块级写法：
+    /// $
+    /// +123
+    /// $
+    /// - 起始行为 \"$\";
+    /// - 起始行与首个非空内容行之间不能出现空行；
+    /// - 首个非空内容行之后紧跟一行必须是 \"$\";
+    /// 其他情况一律视为普通文本。
+    /// </summary>
+    private static bool TryParseSingleDollarMathBlock(
+        List<string> lines,
+        int start,
+        out MathBlockNode? block,
+        out int consumed)
+    {
+        block = null;
+        consumed = 0;
+        if (start >= lines.Count)
+            return false;
+
+        var firstTrimmed = lines[start].Trim();
+        if (!string.Equals(firstTrimmed, "$", StringComparison.Ordinal))
+            return false;
+
+        int current = start + 1;
+        if (current >= lines.Count)
+            return false;
+
+        // 首个非空内容行
+        int firstContentIndex = -1;
+        bool sawBlankBeforeContent = false;
+        for (int i = current; i < lines.Count; i++)
+        {
+            var t = lines[i].Trim();
+            if (t.Length == 0)
+            {
+                if (firstContentIndex < 0)
+                    sawBlankBeforeContent = true;
+                continue;
+            }
+            if (t == "$")
+            {
+                // 遇到结束符前没有任何内容，视为普通文本
+                return false;
+            }
+            firstContentIndex = i;
+            break;
+        }
+
+        if (firstContentIndex < 0)
+            return false;
+        if (sawBlankBeforeContent)
+            return false;
+
+        int formulaLineIndex = firstContentIndex;
+        int closingIndex = formulaLineIndex + 1;
+        if (closingIndex >= lines.Count)
+            return false;
+        if (!string.Equals(lines[closingIndex].Trim(), "$", StringComparison.Ordinal))
+            return false;
+
+        var latex = lines[formulaLineIndex].Trim();
+        block = new MathBlockNode { LaTeX = latex };
+        consumed = closingIndex - start + 1;
+        return true;
     }
 
     private static (HtmlBlockNode, int) ParseHtmlBlock(List<string> lines, int start)

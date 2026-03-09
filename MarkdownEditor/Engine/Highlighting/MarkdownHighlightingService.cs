@@ -10,7 +10,12 @@ namespace MarkdownEditor.Engine.Highlighting;
 /// </summary>
 public sealed class MarkdownHighlightingService
 {
-    public IReadOnlyList<HighlightToken> Analyze(string text)
+    /// <summary>
+    /// 对整篇或指定行范围的 Markdown 文本进行语法高亮分析。
+    /// visibleStartLine / visibleEndLine 为可见行号（0-based，含），用于在大文档中只分析可见窗口附近的块。
+    /// 传入 null 时则扫描整篇文档。
+    /// </summary>
+    public IReadOnlyList<HighlightToken> Analyze(string text, int? visibleStartLine = null, int? visibleEndLine = null)
     {
         if (string.IsNullOrEmpty(text))
             return Array.Empty<HighlightToken>();
@@ -25,48 +30,128 @@ public sealed class MarkdownHighlightingService
             if (span.LineCount <= 0)
                 break;
 
-            AddBlockTokens(docSource, span, tokens);
+            // 若指定了可见窗口，则仅对与窗口有交集的块做分析，避免在大文档中对完全不可见块反复解析。
+            if (visibleStartLine.HasValue && visibleEndLine.HasValue)
+            {
+                int start = visibleStartLine.Value;
+                int end = visibleEndLine.Value;
+                if (span.EndLine <= start)
+                {
+                    line = span.EndLine;
+                    continue;
+                }
+                if (span.StartLine > end)
+                    break;
+            }
+
+            AddBlockTokens(docSource, span, tokens, visibleStartLine, visibleEndLine);
             line = span.EndLine;
         }
 
         return tokens;
     }
 
-    private static void AddBlockTokens(IDocumentSource doc, BlockSpan span, List<HighlightToken> output)
+    private static void AddBlockTokens(
+        IDocumentSource doc,
+        BlockSpan span,
+        List<HighlightToken> output,
+        int? visibleStartLine,
+        int? visibleEndLine)
     {
         switch (span.Kind)
         {
             case BlockKind.Heading:
-                AddHeadingTokens(doc, span, output);
+                AddHeadingTokens(doc, span, output, visibleStartLine, visibleEndLine);
                 break;
             case BlockKind.CodeBlock:
-                AddCodeBlockTokens(doc, span, output);
+                AddCodeBlockTokens(doc, span, output, visibleStartLine, visibleEndLine);
                 break;
             case BlockKind.List:
-                AddListTokens(doc, span, output);
+                AddListTokens(doc, span, output, visibleStartLine, visibleEndLine);
                 break;
             case BlockKind.Blockquote:
-                AddBlockquoteTokens(doc, span, output);
+                AddBlockquoteTokens(doc, span, output, visibleStartLine, visibleEndLine);
                 break;
             case BlockKind.Table:
-                // 表格符号（|、:）不高亮，保持普通文本
+                AddTableTokens(doc, span, output, visibleStartLine, visibleEndLine);
                 break;
             case BlockKind.HorizontalRule:
-                AddHorizontalRuleTokens(doc, span, output);
+                AddHorizontalRuleTokens(doc, span, output, visibleStartLine, visibleEndLine);
                 break;
             case BlockKind.MathBlock:
-                AddMathBlockTokens(doc, span, output);
+                AddMathBlockTokens(doc, span, output, visibleStartLine, visibleEndLine);
                 break;
             case BlockKind.Paragraph:
-                AddParagraphInlineTokens(doc, span, output);
+                AddParagraphInlineTokens(doc, span, output, visibleStartLine, visibleEndLine);
                 break;
             default:
                 break;
         }
     }
 
-    private static void AddHeadingTokens(IDocumentSource doc, BlockSpan span, List<HighlightToken> output)
+    /// <summary>
+    /// 表格块高亮：
+    /// - 首行表头及分隔行中的 '|' 和 ':' 使用 TableSeparator 颜色；
+    /// - 单元格内容继续按行内规则扫描（粗体/链接/行内代码/行内数学等）。
+    /// </summary>
+    private static void AddTableTokens(
+        IDocumentSource doc,
+        BlockSpan span,
+        List<HighlightToken> output,
+        int? visibleStartLine,
+        int? visibleEndLine)
     {
+        if (span.LineCount <= 0)
+            return;
+
+        int headerLine = span.StartLine;
+        int separatorLine = span.StartLine + 1 < span.EndLine ? span.StartLine + 1 : -1;
+
+        for (int i = span.StartLine; i < span.EndLine; i++)
+        {
+            if (visibleStartLine.HasValue && visibleEndLine.HasValue)
+            {
+                if (i < visibleStartLine.Value || i > visibleEndLine.Value)
+                    continue;
+            }
+
+            var lineSpan = doc.GetLine(i).ToString();
+            if (lineSpan.Length == 0)
+                continue;
+
+            // 1) 竖线和对齐冒号高亮为 TableSeparator
+            for (int col = 0; col < lineSpan.Length; col++)
+            {
+                char ch = lineSpan[col];
+                if (ch == '|' || (i == separatorLine && ch == ':'))
+                {
+                    output.Add(new HighlightToken(i, col, 1, HighlightKind.TableSeparator));
+                }
+            }
+
+            // 2) 单元格内容行内高亮：
+            //    - 对分隔行，仅做竖线/冒号高亮，不再重复扫描；
+            //    - 其他行按普通行内语法扫描。
+            if (i == separatorLine)
+                continue;
+
+            ScanLineInline(lineSpan, i, 0, output);
+        }
+    }
+
+    private static void AddHeadingTokens(
+        IDocumentSource doc,
+        BlockSpan span,
+        List<HighlightToken> output,
+        int? visibleStartLine,
+        int? visibleEndLine)
+    {
+        if (visibleStartLine.HasValue && visibleEndLine.HasValue)
+        {
+            if (span.StartLine < visibleStartLine.Value || span.StartLine > visibleEndLine.Value)
+                return;
+        }
+
         var lineSpan = doc.GetLine(span.StartLine);
         if (lineSpan.Length == 0)
             return;
@@ -84,13 +169,24 @@ public sealed class MarkdownHighlightingService
         {
             output.Add(new HighlightToken(span.StartLine, textStart, lineSpan.Length - textStart, HighlightKind.Heading));
         }
-        AddHeadingInlineTokens(doc, span, output);
+        AddHeadingInlineTokens(doc, span, output, visibleStartLine, visibleEndLine);
     }
 
-    private static void AddCodeBlockTokens(IDocumentSource doc, BlockSpan span, List<HighlightToken> output)
+    private static void AddCodeBlockTokens(
+        IDocumentSource doc,
+        BlockSpan span,
+        List<HighlightToken> output,
+        int? visibleStartLine,
+        int? visibleEndLine)
     {
         for (int i = span.StartLine; i < span.EndLine; i++)
         {
+            if (visibleStartLine.HasValue && visibleEndLine.HasValue)
+            {
+                if (i < visibleStartLine.Value || i > visibleEndLine.Value)
+                    continue;
+            }
+
             var line = doc.GetLine(i);
             if (line.Length == 0)
                 continue;
@@ -99,10 +195,21 @@ public sealed class MarkdownHighlightingService
         }
     }
 
-    private static void AddListTokens(IDocumentSource doc, BlockSpan span, List<HighlightToken> output)
+    private static void AddListTokens(
+        IDocumentSource doc,
+        BlockSpan span,
+        List<HighlightToken> output,
+        int? visibleStartLine,
+        int? visibleEndLine)
     {
         for (int i = span.StartLine; i < span.EndLine; i++)
         {
+            if (visibleStartLine.HasValue && visibleEndLine.HasValue)
+            {
+                if (i < visibleStartLine.Value || i > visibleEndLine.Value)
+                    continue;
+            }
+
             var line = doc.GetLine(i);
             if (line.Length == 0)
                 continue;
@@ -139,10 +246,21 @@ public sealed class MarkdownHighlightingService
         }
     }
 
-    private static void AddBlockquoteTokens(IDocumentSource doc, BlockSpan span, List<HighlightToken> output)
+    private static void AddBlockquoteTokens(
+        IDocumentSource doc,
+        BlockSpan span,
+        List<HighlightToken> output,
+        int? visibleStartLine,
+        int? visibleEndLine)
     {
         for (int i = span.StartLine; i < span.EndLine; i++)
         {
+            if (visibleStartLine.HasValue && visibleEndLine.HasValue)
+            {
+                if (i < visibleStartLine.Value || i > visibleEndLine.Value)
+                    continue;
+            }
+
             var line = doc.GetLine(i);
             if (line.Length == 0)
                 continue;
@@ -161,20 +279,42 @@ public sealed class MarkdownHighlightingService
         }
     }
 
-    private static void AddHorizontalRuleTokens(IDocumentSource doc, BlockSpan span, List<HighlightToken> output)
+    private static void AddHorizontalRuleTokens(
+        IDocumentSource doc,
+        BlockSpan span,
+        List<HighlightToken> output,
+        int? visibleStartLine,
+        int? visibleEndLine)
     {
         for (int i = span.StartLine; i < span.EndLine; i++)
         {
+            if (visibleStartLine.HasValue && visibleEndLine.HasValue)
+            {
+                if (i < visibleStartLine.Value || i > visibleEndLine.Value)
+                    continue;
+            }
+
             var line = doc.GetLine(i);
             if (line.Length == 0) continue;
             output.Add(new HighlightToken(i, 0, line.Length, HighlightKind.HorizontalRule));
         }
     }
 
-    private static void AddMathBlockTokens(IDocumentSource doc, BlockSpan span, List<HighlightToken> output)
+    private static void AddMathBlockTokens(
+        IDocumentSource doc,
+        BlockSpan span,
+        List<HighlightToken> output,
+        int? visibleStartLine,
+        int? visibleEndLine)
     {
         for (int i = span.StartLine; i < span.EndLine; i++)
         {
+            if (visibleStartLine.HasValue && visibleEndLine.HasValue)
+            {
+                if (i < visibleStartLine.Value || i > visibleEndLine.Value)
+                    continue;
+            }
+
             var line = doc.GetLine(i);
             if (line.Length == 0) continue;
             output.Add(new HighlightToken(i, 0, line.Length, HighlightKind.MathBlock));
@@ -184,10 +324,21 @@ public sealed class MarkdownHighlightingService
     /// <summary>
     /// 段落块：对每一行做行内语法扫描，精确到每个关键字符，与原文完全对齐。
     /// </summary>
-    private static void AddParagraphInlineTokens(IDocumentSource doc, BlockSpan span, List<HighlightToken> output)
+    private static void AddParagraphInlineTokens(
+        IDocumentSource doc,
+        BlockSpan span,
+        List<HighlightToken> output,
+        int? visibleStartLine,
+        int? visibleEndLine)
     {
         for (int i = span.StartLine; i < span.EndLine; i++)
         {
+            if (visibleStartLine.HasValue && visibleEndLine.HasValue)
+            {
+                if (i < visibleStartLine.Value || i > visibleEndLine.Value)
+                    continue;
+            }
+
             var line = doc.GetLine(i).ToString();
             ScanLineInline(line, i, 0, output);
         }
@@ -196,8 +347,19 @@ public sealed class MarkdownHighlightingService
     /// <summary>
     /// 标题行：标题文字后可能还有行内语法（粗体、链接等），对整行做行内扫描；扫描起点为 # 和空格之后。
     /// </summary>
-    private static void AddHeadingInlineTokens(IDocumentSource doc, BlockSpan span, List<HighlightToken> output)
+    private static void AddHeadingInlineTokens(
+        IDocumentSource doc,
+        BlockSpan span,
+        List<HighlightToken> output,
+        int? visibleStartLine,
+        int? visibleEndLine)
     {
+        if (visibleStartLine.HasValue && visibleEndLine.HasValue)
+        {
+            if (span.StartLine < visibleStartLine.Value || span.StartLine > visibleEndLine.Value)
+                return;
+        }
+
         var line = doc.GetLine(span.StartLine).ToString();
         int pos = 0;
         while (pos < line.Length && line[pos] == '#') pos++;

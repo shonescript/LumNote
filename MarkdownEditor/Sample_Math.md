@@ -1,15 +1,12 @@
-# MathLaTeX 公式速查手册
+﻿# MathLaTeX 公式速查手册
 
-阿$
-\sqrt{\sqrt{\sqrt{\sqrt{\sqrt{\sqrt{2}}}}}} = \frac{\sqrt{\sqrt{\sqrt{\sqrt{\sqrt{\sqrt{2}}}}}}}{\frac{2}{3}}
-$分
+$\sqrt{\sqrt{\sqrt{\sqrt{\sqrt{\sqrt{2}}}}}} = \frac{\sqrt{\sqrt{\sqrt{\sqrt{\sqrt{\sqrt{2}}}}}}}{\frac{2}{3}}$
 
 ${{{x^{2^2}}^2}^2}^2$
 
 $3+ \sqrt{{\sqrt[1+{\sqrt{3}^2}]{x^2 + y^2}}^2}-1$
-$
-{{{x^2}^2}^2}^2
-$
+
+${{{x^2}^2}^2}^2$
 
 ## 一、分数 (Fractions)
 

@@ -28,7 +28,12 @@ public sealed class MarkdownColorizer : DocumentColorizingTransformer
             return;
 
         int lineNumber = line.LineNumber - 1; // AvaloniaEdit 行号从 1 开始
-        var lineTokens = _tokens.Where(t => t.Line == lineNumber).ToList();
+        var lineTokens = new List<HighlightToken>(8);
+        for (int i = 0; i < _tokens.Count; i++)
+        {
+            if (_tokens[i].Line == lineNumber)
+                lineTokens.Add(_tokens[i]);
+        }
         if (lineTokens.Count == 0)
             return;
 

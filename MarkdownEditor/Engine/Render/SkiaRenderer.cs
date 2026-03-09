@@ -1,3 +1,4 @@
+using MarkdownEditor.Engine;
 using MarkdownEditor.Engine.Document;
 using MarkdownEditor.Engine.Layout;
 using MarkdownEditor.Latex;
@@ -7,17 +8,22 @@ using System.IO;
 namespace MarkdownEditor.Engine.Render;
 
 /// <summary>
-/// Skia 渲染器 - 批量绘制，Font 缓存
+/// Skia 渲染器 - 批量绘制，Font 缓存；实现 ITextMeasurer 供表格布局使用以与绘制宽度一致。
 /// </summary>
-public sealed class SkiaRenderer
+public sealed class SkiaRenderer : ITextMeasurer
 {
     private readonly SKPaint _textPaint;
     private readonly SKPaint _codeBgPaint;
-    private readonly SKPaint _mathBgPaint;
     private readonly SKPaint _selectionPaint;
     private readonly SKPaint _imagePlaceholderPaint;
     private readonly SKPaint _tableBorderPaint;
     private readonly SKPaint _tableHeaderBgPaint;
+    private readonly uint _codeKeywordColor;
+    private readonly uint _codeStringColor;
+    private readonly uint _codeCommentColor;
+    private readonly uint _codeNumberColor;
+    private readonly uint _codeDefaultColor;
+    private readonly uint _linkColor;
     private readonly string _bodyFontFamily;
     private readonly string _codeFontFamily;
     private readonly string _mathFontFamily;
@@ -54,7 +60,6 @@ public sealed class SkiaRenderer
             Color = FromUint(config.TextColor)
         };
         _codeBgPaint = new SKPaint { Color = FromUint(config.CodeBackground) };
-        _mathBgPaint = new SKPaint { Color = FromUint(config.MathBackground) };
         _selectionPaint = new SKPaint { Color = FromUint(config.SelectionColor) };
         _imagePlaceholderPaint = new SKPaint { Color = FromUint(config.ImagePlaceholderColor) };
         var bc = config.TableBorderColor;
@@ -66,7 +71,49 @@ public sealed class SkiaRenderer
         };
         var hc = config.TableHeaderBackground;
         _tableHeaderBgPaint = new SKPaint { Color = FromUint(hc), Style = SKPaintStyle.Fill };
+        _codeKeywordColor = config.CodeKeywordColor;
+        _codeStringColor = config.CodeStringColor;
+        _codeCommentColor = config.CodeCommentColor;
+        _codeNumberColor = config.CodeNumberColor;
+        _codeDefaultColor = config.CodeDefaultColor;
+        _linkColor = config.LinkColor;
         _imageLoader = imageLoader ?? new DefaultImageLoader();
+    }
+
+    /// <summary>文本是否含 \r 或 \n，用于避免无谓的 Replace 分配。</summary>
+    private static bool ContainsCrLf(string s)
+    {
+        for (int i = 0; i < s.Length; i++)
+            if (s[i] == '\r' || s[i] == '\n') return true;
+        return false;
+    }
+
+    private static string GetDrawableText(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return text;
+        return ContainsCrLf(text) ? text.Replace("\r", " ").Replace("\n", " ") : text;
+    }
+
+    private static bool IsCodeBlockHighlightStyle(RunStyle style) =>
+        style is RunStyle.CodeKeyword or RunStyle.CodeString or RunStyle.CodeComment or RunStyle.CodeNumber or RunStyle.CodeDefault;
+
+    private SKColor GetCodeTokenColor(RunStyle style)
+    {
+        uint c = style switch
+        {
+            RunStyle.CodeKeyword => _codeKeywordColor,
+            RunStyle.CodeString => _codeStringColor,
+            RunStyle.CodeComment => _codeCommentColor,
+            RunStyle.CodeNumber => _codeNumberColor,
+            RunStyle.CodeDefault => _codeDefaultColor,
+            _ => 0u
+        };
+        if (c == 0) return _textPaint.Color;
+        var a = (byte)(c >> 24);
+        var r = (byte)(c >> 16);
+        var g = (byte)(c >> 8);
+        var b = (byte)c;
+        return new SKColor(r, g, b, a);
     }
 
     private SKFont GetFont(RunStyle style)
@@ -94,19 +141,22 @@ public sealed class SkiaRenderer
                 _ => 20
             };
         SKFont font;
-        if (style == RunStyle.Code)
+        if (style == RunStyle.Code || IsCodeBlockHighlightStyle(style))
         {
+            if (_fontCache.TryGetValue(RunStyle.Code, out var codeFont))
+                return codeFont;
             foreach (var name in _codeFontFamily.Split(',', StringSplitOptions.TrimEntries))
             {
                 var tf = SKTypeface.FromFamilyName(name.Trim());
                 if (tf != null)
                 {
                     font = new SKFont(tf, _baseFontSize * 0.9f);
-                    _fontCache[style] = font;
+                    _fontCache[RunStyle.Code] = font;
                     return font;
                 }
             }
             font = new SKFont(SKTypeface.FromFamilyName("Cascadia Code"), _baseFontSize * 0.9f);
+            _fontCache[RunStyle.Code] = font;
         }
         else
         {
@@ -222,17 +272,29 @@ public sealed class SkiaRenderer
         return _codeCjkFont;
     }
 
+    /// <summary>绘制块列表的指定区间，避免调用方 GetRange 拷贝。</summary>
     public void Render(
         ISkiaRenderContext ctx,
         IReadOnlyList<LayoutBlock> blocks,
+        int startIndex,
+        int count,
         SelectionRange? selection
     )
     {
+        if (blocks == null)
+            return;
         var canvas = ctx.Canvas;
         var scale = ctx.Scale;
+        int n = blocks.Count;
+        if (startIndex >= n)
+            return;
+        int end = Math.Min(startIndex + count, n);
 
-        foreach (var block in blocks)
+        for (int idx = startIndex; idx < end; idx++)
         {
+            var block = blocks[idx];
+            if (block == null)
+                continue;
             canvas.Save();
             canvas.Translate(block.Bounds.Left, block.Bounds.Top);
 
@@ -251,6 +313,10 @@ public sealed class SkiaRenderer
             if (block.Kind == BlockKind.Footnotes)
             {
                 DrawFootnotesStyle(canvas, block);
+            }
+            if (block.Kind == BlockKind.HorizontalRule)
+            {
+                DrawHorizontalRule(canvas, block);
             }
 
             if (block.TableInfo is { } ti)
@@ -328,15 +394,13 @@ public sealed class SkiaRenderer
         if (startInRun >= endInRun)
             return (0, 0);
         var font =
-            run.Style == RunStyle.Code && ContainsCjk(run.Text)
+            (run.Style == RunStyle.Code || IsCodeBlockHighlightStyle(run.Style)) && ContainsCjk(run.Text)
                 ? GetCodeCjkFont()
                 : GetFont(run.Style);
         using var paint = new SKPaint { Typeface = font.Typeface, TextSize = font.Size };
         var left = startInRun > 0 ? paint.MeasureText(run.Text.AsSpan(0, startInRun)) : 0;
         var width = paint.MeasureText(run.Text.AsSpan(startInRun, endInRun - startInRun));
-        // 表格单元格内文字有 8px 左内边距，高亮也需要对齐
-        if (run.Style is RunStyle.TableHeaderCell or RunStyle.TableCell)
-            left += 8;
+        // 表格 run.Bounds 已是该片段在单元格内的实际矩形，无需再加内边距
         return (run.Bounds.Left + left, width);
     }
 
@@ -359,8 +423,15 @@ public sealed class SkiaRenderer
             return;
         }
 
+        // 待办复选框：渲染为方框+勾选状态，点击由 EngineRenderControl 的 todo-toggle 处理
+        if (run.LinkUrl != null && run.LinkUrl.StartsWith("todo-toggle:", StringComparison.Ordinal))
+        {
+            DrawTodoCheckbox(canvas, run);
+            return;
+        }
+
         var font =
-            run.Style == RunStyle.Code && ContainsCjk(run.Text)
+            (run.Style == RunStyle.Code || IsCodeBlockHighlightStyle(run.Style)) && ContainsCjk(run.Text)
                 ? GetCodeCjkFont()
                 : GetFont(run.Style);
         // 仅行内代码（`code`）绘制单行背景；代码块/HTML 块由 DrawCodeBlockStyle 统一绘制整块背景
@@ -372,26 +443,18 @@ public sealed class SkiaRenderer
             canvas.DrawRect(run.Bounds, _codeBgPaint);
 
         var baseTextColor = _textPaint.Color;
-        var textColor = run.Style == RunStyle.Link ? FromLinkColor() : _textPaint.Color;
+        var textColor = run.Style == RunStyle.Link
+            ? FromLinkColor()
+            : IsCodeBlockHighlightStyle(run.Style)
+                ? GetCodeTokenColor(run.Style)
+                : _textPaint.Color;
         _textPaint.Color = textColor;
         _textPaint.TextSize = font.Size;
-        var drawText = run.Text.Replace("\r", " ").Replace("\n", " "); // 避免控制符渲染为小方块
+        var drawText = GetDrawableText(run.Text);
         float textX = run.Bounds.Left;
         float textY = run.Bounds.Bottom - 4;
         if (run.Style is RunStyle.TableHeaderCell or RunStyle.TableCell)
-        {
-            textY = run.Bounds.Bottom - 8;
-            const float cellPaddingH = 8f;
-            var align = run.TableAlign ?? TableCellAlign.Left;
-            var textW = _textPaint.MeasureText(drawText);
-            var cellW = run.Bounds.Width;
-            textX = align switch
-            {
-                TableCellAlign.Center => run.Bounds.Left + (cellW - textW) / 2f,
-                TableCellAlign.Right => run.Bounds.Right - cellPaddingH - textW,
-                _ => run.Bounds.Left + cellPaddingH
-            };
-        }
+            textY = run.Bounds.Bottom - 4;
         canvas.DrawText(drawText, textX, textY, font, _textPaint);
 
         if (
@@ -425,12 +488,52 @@ public sealed class SkiaRenderer
         _textPaint.Color = baseTextColor;
     }
 
+    private void DrawTodoCheckbox(SKCanvas canvas, LayoutRun run)
+    {
+        bool isChecked = run.Text.IndexOf('x') >= 0 || run.Text.IndexOf('X') >= 0;
+        float h = run.Bounds.Height;
+        float size = Math.Min(h * 0.65f, 16f);
+        float left = run.Bounds.Left;
+        float top = run.Bounds.Top + (h - size) * 0.5f;
+        var boxRect = new SKRect(left, top, left + size, top + size);
+
+        using (var strokePaint = new SKPaint
+        {
+            Color = _textPaint.Color,
+            Style = SKPaintStyle.Stroke,
+            StrokeWidth = 1.5f,
+            IsAntialias = true
+        })
+        {
+            canvas.DrawRect(boxRect, strokePaint);
+        }
+
+        if (isChecked)
+        {
+            using var checkPaint = new SKPaint
+            {
+                Color = _textPaint.Color,
+                Style = SKPaintStyle.Stroke,
+                StrokeWidth = 1.8f,
+                StrokeCap = SKStrokeCap.Round,
+                StrokeJoin = SKStrokeJoin.Round,
+                IsAntialias = true
+            };
+            float pad = size * 0.2f;
+            var path = new SKPath();
+            path.MoveTo(boxRect.Left + pad, boxRect.MidY);
+            path.LineTo(boxRect.Left + size * 0.4f, boxRect.Bottom - pad);
+            path.LineTo(boxRect.Right - pad, boxRect.Top + pad);
+            canvas.DrawPath(path, checkPaint);
+        }
+    }
+
     private void DrawFootnoteRefRun(SKCanvas canvas, LayoutRun run)
     {
         var font = GetFont(RunStyle.Normal);
         var size = _baseFontSize * 0.75f;
         var smallFont = new SKFont(font.Typeface, size);
-        var drawText = run.Text.Replace("\r", " ").Replace("\n", " ");
+        var drawText = GetDrawableText(run.Text);
         float textX = run.Bounds.Left;
         float baselineY = run.Bounds.Bottom - 4;
         float raise = _baseFontSize * 0.35f;
@@ -443,8 +546,8 @@ public sealed class SkiaRenderer
 
     private SKColor FromLinkColor()
     {
-        // 链接颜色目前直接使用 VSCode 风格蓝色，后续如需根据配置细分可在此扩展
-        return new SKColor(0x37, 0x94, 0xff);
+        var c = _linkColor;
+        return new SKColor((byte)(c >> 16), (byte)(c >> 8), (byte)c, (byte)(c >> 24));
     }
 
     private void DrawImageRun(SKCanvas canvas, LayoutRun run)
@@ -481,9 +584,7 @@ public sealed class SkiaRenderer
         {
             canvas.DrawRect(rect, _imagePlaceholderPaint);
             _textPaint.TextSize = _baseFontSize * 0.9f;
-            var altDraw = (string.IsNullOrEmpty(alt) ? "[图]" : alt)
-                .Replace("\r", " ")
-                .Replace("\n", " ");
+            var altDraw = GetDrawableText(string.IsNullOrEmpty(alt) ? "[图]" : alt);
             canvas.DrawText(
                 altDraw,
                 rect.Left + 4,
@@ -498,16 +599,42 @@ public sealed class SkiaRenderer
     {
         if (string.IsNullOrEmpty(run.Text))
             return;
-        canvas.DrawRect(run.Bounds, _mathBgPaint);
         var bodyTf = _bodyTypeface ??= ResolveBodyTypeface();
         var mathTf = GetMathTypeface();
         var mathFontSize = Math.Max(16, _baseFontSize * 1.15f);
         MathSkiaRenderer.DrawFormula(canvas, run.Bounds, run.Text, bodyTf, mathTf, mathFontSize);
     }
 
+    /// <inheritdoc />
+    public float MeasureText(string text, RunStyle style)
+    {
+        if (string.IsNullOrEmpty(text))
+            return 0f;
+        if (style == RunStyle.Math)
+        {
+            var bodyTf = _bodyTypeface ?? ResolveBodyTypeface();
+            var mathTf = GetMathTypeface();
+            var mathFontSize = Math.Max(16, _baseFontSize * 1.15f);
+            var (w, _, _) = MathSkiaRenderer.MeasureFormula(text, bodyTf, mathTf, mathFontSize);
+            return w + 8f;
+        }
+        var font = GetFont(style);
+        using var paint = new SKPaint
+        {
+            Typeface = font.Typeface,
+            TextSize = font.Size,
+            SubpixelText = true,
+            IsAntialias = true
+        };
+        // 与绘制相同 Typeface/TextSize；+1 像素安全余量，吸收舍入或个别测量偏差
+        return paint.MeasureText(text) + 1f;
+    }
+
     /// <summary>与布局中表格起始边距一致，按列宽绘制网格和表头背景，不依赖 run 边界。</summary>
     private const float TableLeftInBlock = 12f;
-    /// <summary>表格单元格垂直内边距，应与布局中的 cellPaddingV 保持一致。</summary>
+    /// <summary>表格单元格水平内边距，与布局中 cellPaddingH 一致，文字与竖线留出间隙。</summary>
+    private const float TableCellPaddingH = 8f;
+    /// <summary>表格单元格垂直内边距，与布局中 cellPaddingV 一致。</summary>
     private const float TableCellPaddingV = 4f;
 
     private void DrawTableGrid(SKCanvas canvas, LayoutBlock block, TableLayoutInfo ti)
@@ -597,6 +724,18 @@ public sealed class SkiaRenderer
             Style = SKPaintStyle.Fill
         };
         canvas.DrawRect(new SKRect(0, 0, barWidth, r.Height), barPaint);
+    }
+
+    /// <summary>分割线（---）：在块内绘制一条横线。</summary>
+    private void DrawHorizontalRule(SKCanvas canvas, LayoutBlock block)
+    {
+        var r = block.Bounds;
+        const float padX = 24f;
+        const float lineY = 6f; // 与 LayoutHorizontalRule 行高 12 居中
+        float left = Math.Min(padX, r.Width * 0.2f);
+        float right = Math.Max(r.Width - padX, r.Width * 0.8f);
+        if (right > left)
+            canvas.DrawLine(left, lineY, right, lineY, _tableBorderPaint);
     }
 
     /// <summary>脚注区：顶部分隔线。</summary>

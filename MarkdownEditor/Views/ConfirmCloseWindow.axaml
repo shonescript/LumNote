@@ -1,0 +1,19 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="MarkdownEditor.Views.ConfirmCloseWindow"
+        Title="未保存的更改"
+        Width="360"
+        Height="140"
+        WindowStartupLocation="CenterOwner"
+        Background="#252526">
+  <StackPanel Margin="20" Spacing="16">
+    <TextBlock Text="当前文档有未保存的更改，是否保存？"
+               Foreground="#d4d4d4"
+               TextWrapping="Wrap"/>
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+      <Button x:Name="SaveButton" Content="保存" Width="80"/>
+      <Button x:Name="DiscardButton" Content="不保存" Width="80"/>
+      <Button x:Name="CancelButton" Content="取消" Width="80"/>
+    </StackPanel>
+  </StackPanel>
+</Window>

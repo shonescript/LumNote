@@ -1,5 +1,4 @@
 using System;
-using System.Globalization;
 using System.IO;
 
 namespace MarkdownEditor.Engine;
@@ -9,49 +8,148 @@ namespace MarkdownEditor.Engine;
 /// </summary>
 public sealed class EngineConfig
 {
-    public string BodyFontFamily { get; set; } = "Microsoft YaHei UI,Segoe UI,PingFang SC,sans-serif";
-    public string CodeFontFamily { get; set; } = "Cascadia Code,Consolas,Microsoft YaHei Mono,monospace";
+    public string BodyFontFamily { get; set; } =
+        "Microsoft YaHei UI,Segoe UI,PingFang SC,sans-serif";
+    public string CodeFontFamily { get; set; } =
+        "Cascadia Code,Consolas,Microsoft YaHei Mono,monospace";
+
     /// <summary>
     /// 数学公式首选字体列表（逗号分隔，优先级从左到右），
     /// 建议包含 Latin Modern Math / STIX Two Math / Cambria Math 等支持 MATH 表的字体。
     /// </summary>
-    public string MathFontFamily { get; set; } = "Latin Modern Math,STIX Two Math,Cambria Math,Times New Roman";
+    public string MathFontFamily { get; set; } =
+        "Latin Modern Math,STIX Two Math,Cambria Math,Times New Roman";
+
     /// <summary>
     /// 可选：显式指定数学字体文件路径（OTF/TTF），
     /// 若设置且存在，则优先通过 SKTypeface.FromFile 加载该字体。
     /// </summary>
     public string? MathFontFilePath { get; set; } = DetectDefaultMathFontFilePath();
     public float BaseFontSize { get; set; } = 16;
-    public float LineSpacing { get; set; } = 1.4f;
-    public float ParaSpacing { get; set; } = 8f;
+    public float LineSpacing { get; set; } = 1.35f;
+    public float ParaSpacing { get; set; } = 10f;
+
+    /// <summary>预览区整体缩放（1f=100%），作用于字号与所有间距。</summary>
+    public float ZoomLevel { get; set; } = 1f;
+
+    /// <summary>列表块顶部/底部与段落的额外间距（使段落与列表不会贴太近）。</summary>
+    public float ListBlockMarginTop { get; set; } = 6f;
+    public float ListBlockMarginBottom { get; set; } = 6f;
+    /// <summary>列表项与下一项之间的额外间距。</summary>
+    public float ListItemGap { get; set; } = 3f;
+
+    /// <summary>预览区内容左右内边距（与布局引擎协调，用于测量/滚动）。</summary>
+    public float ContentPaddingX { get; set; } = 24f;
+
+    /// <summary>预览区内容上下内边距。</summary>
+    public float ContentPaddingY { get; set; } = 16f;
+
+    /// <summary>块级内容左侧缩进（与视口边缘的距离）。</summary>
+    public float BlockIndent { get; set; } = 14f;
+
+    /// <summary>文档底部额外留白。</summary>
+    public float ExtraBottomPadding { get; set; } = 8f;
+
+    /// <summary>代码块/HTML 块内边距。</summary>
+    public float CodeBlockPadding { get; set; } = 16f;
+
+    /// <summary>块内文本与块边缘的内边距。</summary>
+    public float BlockInnerPadding { get; set; } = 12f;
+
+    /// <summary>引用块与正文的间距及缩进。</summary>
+    public float BlockquotePadding { get; set; } = 8f;
+    public float BlockquoteIndent { get; set; } = 14f;
+
+    /// <summary>列表项相对列表边缘的缩进。</summary>
+    public float ListItemIndent { get; set; } = 20f;
+
+    /// <summary>脚注区块顶部留白。</summary>
+    public float FootnoteTopMargin { get; set; } = 24f;
+
+    /// <summary>定义列表术语与定义的缩进差。</summary>
+    public float DefinitionListIndent { get; set; } = 24f;
 
     public uint TextColor { get; set; } = 0xFFD4D4D4;
     public uint TableBorderColor { get; set; } = 0xFFD0D7DE;
     public uint TableHeaderBackground { get; set; } = 0xFFF6F8FA;
 
     public uint CodeBackground { get; set; } = 0xFF252526;
+    public uint CodeKeywordColor { get; set; } = 0xFF569CD6;
+    public uint CodeStringColor { get; set; } = 0xFFCE9178;
+    public uint CodeCommentColor { get; set; } = 0xFF6A9955;
+    public uint CodeNumberColor { get; set; } = 0xFFB5CEA8;
+    public uint CodeDefaultColor { get; set; } = 0xFFD4D4D4;
     public uint MathBackground { get; set; } = 0xFF252526;
     public uint SelectionColor { get; set; } = 0x503399FF; // 默认带透明度的高亮
     public uint ImagePlaceholderColor { get; set; } = 0xFF404040;
     public uint LinkColor { get; set; } = 0xFF3794FF;
 
+    /// <summary>返回将 ZoomLevel 应用到所有像素尺寸后的新配置，ZoomLevel 置为 1。用于传入布局/渲染引擎。</summary>
+    public EngineConfig WithZoomApplied()
+    {
+        float z = Math.Clamp(ZoomLevel, 0.5f, 2.5f);
+        return new EngineConfig
+        {
+            BodyFontFamily = BodyFontFamily,
+            CodeFontFamily = CodeFontFamily,
+            MathFontFamily = MathFontFamily,
+            MathFontFilePath = MathFontFilePath,
+            BaseFontSize = BaseFontSize * z,
+            LineSpacing = LineSpacing,
+            ParaSpacing = ParaSpacing * z,
+            ZoomLevel = 1f,
+            ListBlockMarginTop = ListBlockMarginTop * z,
+            ListBlockMarginBottom = ListBlockMarginBottom * z,
+            ListItemGap = ListItemGap * z,
+            ContentPaddingX = ContentPaddingX * z,
+            ContentPaddingY = ContentPaddingY * z,
+            BlockIndent = BlockIndent * z,
+            ExtraBottomPadding = ExtraBottomPadding * z,
+            CodeBlockPadding = CodeBlockPadding * z,
+            BlockInnerPadding = BlockInnerPadding * z,
+            BlockquotePadding = BlockquotePadding * z,
+            BlockquoteIndent = BlockquoteIndent * z,
+            ListItemIndent = ListItemIndent * z,
+            FootnoteTopMargin = FootnoteTopMargin * z,
+            DefinitionListIndent = DefinitionListIndent * z,
+            TextColor = TextColor,
+            TableBorderColor = TableBorderColor,
+            TableHeaderBackground = TableHeaderBackground,
+            CodeBackground = CodeBackground,
+            CodeKeywordColor = CodeKeywordColor,
+            CodeStringColor = CodeStringColor,
+            CodeCommentColor = CodeCommentColor,
+            CodeNumberColor = CodeNumberColor,
+            CodeDefaultColor = CodeDefaultColor,
+            MathBackground = MathBackground,
+            SelectionColor = SelectionColor,
+            ImagePlaceholderColor = ImagePlaceholderColor,
+            LinkColor = LinkColor
+        };
+    }
+
     public static EngineConfig FromStyle(Core.MarkdownStyleConfig? style)
     {
-        if (style == null) return new EngineConfig();
+        if (style == null)
+            return new EngineConfig();
         var c = new EngineConfig
         {
             BodyFontFamily = style.BodyFontFamily,
             CodeFontFamily = style.CodeFontFamily,
-            // 若未来 MarkdownStyleConfig 扩展了数学字体相关字段，可在此补充映射；
-            // 目前保留 EngineConfig.MathFontFamily/MathFontFilePath 的默认值或外部显式设置。
-            TextColor = ParseHexColor(style.TextColor),
-            TableBorderColor = ParseHexColor(style.TableBorderColor),
-            TableHeaderBackground = ParseHexColor(style.TableHeaderBackground),
-            CodeBackground = ParseHexColor(style.CodeBlockBackground),
-            MathBackground = ParseHexColor(style.MathBackground),
-            SelectionColor = ParseHexColor(style.SelectionColor),
-            ImagePlaceholderColor = ParseHexColor(style.ImagePlaceholderColor),
-            LinkColor = ParseHexColor(style.LinkColor)
+            ZoomLevel = (float)Math.Clamp(style.ZoomLevel, 0.5, 2.5),
+            TextColor = Core.ColorUtils.ParseHexColor(style.TextColor),
+            TableBorderColor = Core.ColorUtils.ParseHexColor(style.TableBorderColor),
+            TableHeaderBackground = Core.ColorUtils.ParseHexColor(style.TableHeaderBackground),
+            CodeBackground = Core.ColorUtils.ParseHexColor(style.CodeBlockBackground),
+            CodeKeywordColor = Core.ColorUtils.ParseHexColor(style.CodeKeywordColor),
+            CodeStringColor = Core.ColorUtils.ParseHexColor(style.CodeStringColor),
+            CodeCommentColor = Core.ColorUtils.ParseHexColor(style.CodeCommentColor),
+            CodeNumberColor = Core.ColorUtils.ParseHexColor(style.CodeNumberColor),
+            CodeDefaultColor = Core.ColorUtils.ParseHexColor(style.CodeDefaultColor),
+            MathBackground = Core.ColorUtils.ParseHexColor(style.MathBackground),
+            SelectionColor = Core.ColorUtils.ParseHexColor(style.SelectionColor),
+            ImagePlaceholderColor = Core.ColorUtils.ParseHexColor(style.ImagePlaceholderColor),
+            LinkColor = Core.ColorUtils.ParseHexColor(style.LinkColor)
         };
         return c;
     }
@@ -86,14 +184,4 @@ public sealed class EngineConfig
         return null;
     }
 
-    private static uint ParseHexColor(string hex)
-    {
-        if (string.IsNullOrWhiteSpace(hex)) return 0xFFD0D7DE;
-        hex = hex.TrimStart('#');
-        if (hex.Length == 6)
-            return 0xFF000000u | uint.Parse(hex, NumberStyles.HexNumber);
-        if (hex.Length == 8)
-            return uint.Parse(hex, NumberStyles.HexNumber);
-        return 0xFFD0D7DE;
-    }
 }

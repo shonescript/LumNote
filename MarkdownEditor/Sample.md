@@ -1,4 +1,4 @@
-# Welcome to Leanote! 欢迎来到Leanote!
+﻿# Welcome to Leanote! 欢迎来到Leanote!
  
 ## 1. 排版
  
@@ -10,6 +10,17 @@
  
 > 引用Leanote官方的话, 为什么要做Leanote, 原因是...
  
+
+---
+$+123
+$
+
+ as
+ sss
+ccc
+vvvccc
+
+
 有充列表:
  1. 支持Vim
  2. 支持Emacs
@@ -19,6 +30,10 @@
  - 项目1
  - 项目2
  
+- [x] Write the press release
+- [x] Update the website
+- [x] Contact the media
+  
  
 ## 2. 图片与链接
  
@@ -40,6 +55,10 @@
 ##### h4
 ###### h5
 ```
+
+- [x] Write the press release
+- [x] Update the website
+- [x] Contact the media
  
 ## 4. 代码
  
@@ -176,7 +195,7 @@ Leanote[^footnote]来创建一个脚注
 ```sequence
 Alice->Bob: Hello Bob, how are you?
 Note right of Bob: Bob thinks
-Bob-->Alice: I am good thanks!
+Bob-->Alice: I am good thanks!111111111111111111111111111111111111111111111111111111112222222222222222222222222222
 ```
  
 流程图:
@@ -206,11 +225,11 @@ $ 表示行内公式：
 $$ 表示整行公式：
  
 $$\sum_{i=1}^n a_i=0$$
+
  
-$$f(x_1,x_x,\ldots,x_n) = x_1^2 + x_2^2 + \cdots + x_n^2 $$
- 
+
+  
 $$\sum^{j-1}_{k=0}{\widehat{\gamma}_{kj} z_k}$$
- 
 更复杂的公式:
 $$
 \begin{eqnarray}

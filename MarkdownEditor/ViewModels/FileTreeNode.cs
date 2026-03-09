@@ -10,6 +10,8 @@ namespace MarkdownEditor.ViewModels;
 public sealed class FileTreeNode : ViewModelBase
 {
     private bool _isExpanded = true;
+    private bool _isRenaming;
+    private string _editName = "";
 
     public string DisplayName { get; }
     public string FullPath { get; }
@@ -44,5 +46,28 @@ public sealed class FileTreeNode : ViewModelBase
 
     /// <summary>节点图标列内容：文件为 📄，文件夹为空但保留固定宽度。</summary>
     public string IconText => IsFolder ? "" : "📄";
+
+    /// <summary>是否处于就地重命名状态（显示 TextBox 代替名称）。</summary>
+    public bool IsRenaming
+    {
+        get => _isRenaming;
+        set
+        {
+            if (SetProperty(ref _isRenaming, value))
+            {
+                OnPropertyChanged(nameof(ShowLabel));
+            }
+        }
+    }
+
+    /// <summary>重命名时编辑中的名称，与 DisplayName 同步进入编辑时。</summary>
+    public string EditName
+    {
+        get => _editName;
+        set => SetProperty(ref _editName, value ?? "");
+    }
+
+    /// <summary>是否显示名称标签（非重命名时）。用于模板中 IsVisible。</summary>
+    public bool ShowLabel => !IsRenaming;
 
 }

@@ -76,9 +76,9 @@ public static class MathParser
     /// 解析一个通用的多行环境体（不含 \begin/\end），支持 eqnarray/align/matrix/pmatrix 等：
     /// - 按 \\ 切行
     /// - 每行按 & 切列
-    /// - 每个单元格单独用 Parser 解析为 MathNode
+    /// - array 的列格式若已由 ParseEnvironmentInline 从 \begin{array}{ccc|c} 传入，则不再把首行当列格式吃掉
     /// </summary>
-    private static MathEnvironment ParseEnvironmentBody(string body, string envName)
+    private static MathEnvironment ParseEnvironmentBody(string body, string envName, string? arrayColumnSpecFromBegin = null)
     {
         body = body.Replace("\r\n", "\n").Replace('\r', '\n');
 
@@ -115,12 +115,14 @@ public static class MathParser
         if (sb.Length > 0 || rowBuffers.Count == 0)
             rowBuffers.Add(sb.ToString());
 
-        // array 环境的首行通常是列格式说明，如 {ccc|c}，应跳过不当作数据行解析。
-        if (envName == "array" && rowBuffers.Count > 0)
+        string? columnSpec = arrayColumnSpecFromBegin;
+        // array 列格式：若未从 \begin{array}{ccc|c} 传入，则尝试从首行取（旧写法首行是 {ccc|c}）
+        if (envName == "array" && string.IsNullOrEmpty(columnSpec) && rowBuffers.Count > 0)
         {
             var first = rowBuffers[0].Trim();
             if (first.Length > 0 && first[0] == '{' && first.LastIndexOf('}') > 0)
             {
+                columnSpec = first.TrimStart('{').TrimEnd('}').Trim();
                 rowBuffers.RemoveAt(0);
             }
         }
@@ -159,7 +161,8 @@ public static class MathParser
         return new MathEnvironment
         {
             Name = envName,
-            Rows = rows
+            Rows = rows,
+            ColumnSpec = columnSpec
         };
     }
 
@@ -252,7 +255,7 @@ public static class MathParser
                 if (command == "text")
                     return ParseText();
 
-                if (command == "frac")
+                if (command == "frac" || command == "dfrac")
                     return ParseFraction();
                 if (command == "sqrt")
                     return ParseSqrt();
@@ -516,18 +519,41 @@ public static class MathParser
             if (!End && Current == '}')
                 _pos++; // consume '}'
 
+            string? arrayColumnSpec = null;
+            if (envName == "array")
+            {
+                SkipWhitespace();
+                if (!End && Current == '{')
+                {
+                    _pos++; // '{'
+                    int specStart = _pos;
+                    int depth = 1;
+                    while (!End && depth > 0)
+                    {
+                        var c = _text[_pos];
+                        if (c == '{') depth++;
+                        else if (c == '}') depth--;
+                        if (depth > 0) _pos++;
+                    }
+                    if (!End && _text[_pos] == '}')
+                    {
+                        arrayColumnSpec = _text[specStart.._pos].Trim();
+                        _pos++; // consume '}'
+                    }
+                }
+            }
+
             int bodyStart = _pos;
             var endTag = "\\end{" + envName + "}";
             int end = _text.IndexOf(endTag, _pos, StringComparison.Ordinal);
             if (end < 0)
             {
-                // 找不到结束标签，退化为将剩余内容整体当作环境体
                 end = _text.Length;
             }
             var body = _text[bodyStart..end];
             _pos = Math.Min(_text.Length, end + endTag.Length);
 
-            return ParseEnvironmentBody(body, envName);
+            return ParseEnvironmentBody(body, envName, arrayColumnSpec);
         }
 
         /// <summary>解析强制分组 { ... }，若缺失则回退为单个原子。</summary>

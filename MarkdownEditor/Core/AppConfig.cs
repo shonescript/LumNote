@@ -41,8 +41,16 @@ public sealed class AppConfig
         catch { }
     }
 
-    public static string DefaultConfigPath =>
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".markdown-editor", "config.json");
+    private static string BaseDirectory => AppContext.BaseDirectory;
+
+    /// <summary>配置文件路径：与可执行文件同目录，方便便携分发。</summary>
+    public static string DefaultConfigPath => Path.Combine(BaseDirectory, "config.json");
+
+    /// <summary>最近打开文件列表持久化路径（与 config 同目录）。</summary>
+    public static string RecentFilesPath => Path.Combine(BaseDirectory, "recent-files.json");
+
+    /// <summary>最近打开文件夹列表持久化路径。</summary>
+    public static string RecentFoldersPath => Path.Combine(BaseDirectory, "recent-folders.json");
 }
 
 public sealed class UiConfig
@@ -73,6 +81,21 @@ public sealed class MarkdownStyleConfig
 
     [JsonPropertyName("codeBlockTextColor")]
     public string CodeBlockTextColor { get; set; } = "#dcdcdc";
+
+    [JsonPropertyName("codeKeywordColor")]
+    public string CodeKeywordColor { get; set; } = "#569cd6";
+
+    [JsonPropertyName("codeStringColor")]
+    public string CodeStringColor { get; set; } = "#ce9178";
+
+    [JsonPropertyName("codeCommentColor")]
+    public string CodeCommentColor { get; set; } = "#6a9955";
+
+    [JsonPropertyName("codeNumberColor")]
+    public string CodeNumberColor { get; set; } = "#b5cea8";
+
+    [JsonPropertyName("codeDefaultColor")]
+    public string CodeDefaultColor { get; set; } = "#d4d4d4";
 
     [JsonPropertyName("blockquoteBorderColor")]
     public string BlockquoteBorderColor { get; set; } = "#3f3f46";
@@ -117,4 +140,8 @@ public sealed class MarkdownStyleConfig
     // 图片占位符背景
     [JsonPropertyName("imagePlaceholderColor")]
     public string ImagePlaceholderColor { get; set; } = "#404040";
+
+    /// <summary>预览区整体缩放，1.0 = 100%，作用于字号与间距。</summary>
+    [JsonPropertyName("zoomLevel")]
+    public double ZoomLevel { get; set; } = 1.0;
 }

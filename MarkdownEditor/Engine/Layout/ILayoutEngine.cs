@@ -10,14 +10,9 @@ namespace MarkdownEditor.Engine.Layout;
 public interface ILayoutEngine
 {
     /// <summary>
-    /// 布局单个块。footnoteRefOrder 为正文中脚注引用出现顺序（用于上标编号），null 表示不解析脚注。
+    /// 布局单个块。
     /// </summary>
-    LayoutBlock Layout(MarkdownNode node, float width, int blockIndex, int startLine, int endLine, IReadOnlyList<string>? footnoteRefOrder = null);
-
-    /// <summary>
-    /// 布局文末脚注区（按 refOrder 顺序、自动编号）。refPositionsById 为每个 id 的引用位置列表，用于生成 ↩︎ 回链。
-    /// </summary>
-    LayoutBlock LayoutFootnoteSection(IReadOnlyList<string> refOrder, IReadOnlyDictionary<string, FootnoteDefNode> defs, IReadOnlyDictionary<string, List<(int blockIndex, int charOffset)>> refPositionsById, float width, int blockIndex);
+    LayoutBlock Layout(MarkdownNode node, float width, int blockIndex, int startLine, int endLine);
 
     /// <summary>
     /// 可用宽度变化时是否需重新布局

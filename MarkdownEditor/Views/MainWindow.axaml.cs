@@ -2,14 +2,20 @@ using System.ComponentModel;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
+using Avalonia.Interactivity;
+using Avalonia.Media;
 using Avalonia.Platform.Storage;
 using Avalonia.VisualTree;
 using System.Linq;
 using System.Reactive.Linq;
 using Avalonia.Threading;
 using AvaloniaEdit;
+using AvaloniaEdit.Document;
+using AvaloniaEdit.Search;
 using MarkdownEditor.ViewModels;
 using MarkdownEditor.Engine.Highlighting;
+using MarkdownEditor.Export;
+using System.Threading.Tasks;
 
 namespace MarkdownEditor.Views;
 
@@ -18,9 +24,32 @@ public partial class MainWindow : Window
     private ScrollViewer? _editorScroll;
     private ScrollViewer? _previewScroll;
     private bool _isSyncingScroll;
+    private string _currentEditorPath = "";
+    private int _pendingGoToLine = -1;
+    private bool _isClosingProgrammatically;
     private readonly DispatcherTimer _highlightTimer;
+    private readonly DispatcherTimer _searchDebounceTimer;
+    private DispatcherTimer? _fileCheckTimer;
+    private int _highlightVersion;
+    private int _appliedHighlightVersion;
     private readonly MarkdownHighlightingService _highlightService = new();
     private readonly MarkdownColorizer _markdownColorizer = new(MarkdownHighlightTheme.DarkTheme);
+    private SearchPanel? _editorSearchPanel;
+    /// <summary>标记当前是否需要拦截下一次 Alt 键抬起事件，避免 Alt 组合键操作后激活菜单访问键。</summary>
+    private bool _suppressNextAltKeyUp;
+    /// <summary>标记当前 CurrentMarkdown 的变更是否来自编辑器 TextChanged。为 true 时 PropertyChanged 不写回 editor.Text，避免 Replace→TextChanged→VM 规范化→写回 导致的二次文档修改与撤销组异常。</summary>
+    private bool _currentMarkdownChangeFromEditor;
+    /// <summary>侧栏分隔条是否正在拖动（仅显示蓝色预览线，松手后应用布局）。</summary>
+    private bool _sidebarSplitterDragging;
+    /// <summary>编辑/预览分隔条是否正在拖动。</summary>
+    private bool _contentSplitterDragging;
+    private readonly ExportService _exportService = new(
+    [
+        new HtmlExporter(),
+        new PdfExporter(),
+        new LongImageExporter(),
+        new DocxExporter()
+    ]);
 
     public MainWindow()
     {
@@ -31,7 +60,14 @@ public partial class MainWindow : Window
         // 初始化编辑器语法高亮
         SetupEditorHighlighting();
 
-        Opened += (_, _) => SetupScrollSync();
+        Opened += (_, _) =>
+        {
+            SetupScrollSync();
+            if (PreviewEngine != null && DataContext is MainViewModel m)
+                PreviewEngine.GotFocus += (_, _) => m.ActivePane = "Preview";
+            // 默认让编辑区获得焦点，使 Ctrl+/- 控制编辑区缩放，直到用户点击预览区
+            EditorTextBox?.Focus();
+        };
 
         // 根据窗口状态调整内边距，解决最大化时内容被挤到屏幕外的问题（Reactive 写法）
         this.GetObservable(WindowStateProperty)
@@ -65,28 +101,68 @@ public partial class MainWindow : Window
         LayoutEditorOnlyButton.Click += (_, _) => vm.LayoutMode = EditorLayoutMode.EditorOnly;
         LayoutPreviewOnlyButton.Click += (_, _) => vm.LayoutMode = EditorLayoutMode.PreviewOnly;
 
-        OpenFolderMenuItem.Click += async (_, _) =>
-        {
-            var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
-            {
-                Title = "选择 Markdown 文档所在文件夹",
-                AllowMultiple = false
-            });
+        NewFileMenuItem.Click += (_, _) => vm.NewDocument();
 
-            if (folders.Count > 0 && folders[0].TryGetLocalPath() is { } path)
-            {
-                vm.LoadFolder(path);
-            }
+        OpenFileMenuItem.Click += async (_, _) => await DoOpenFileAsync(vm);
+        WelcomeOpenFileButton!.Click += async (_, _) => await DoOpenFileAsync(vm);
+
+        OpenFolderMenuItem.Click += async (_, _) => await DoOpenFolderAsync(vm);
+        WelcomeOpenFolderButton!.Click += async (_, _) => await DoOpenFolderAsync(vm);
+
+        SaveMenuItem.Click += async (_, _) =>
+        {
+            if (string.IsNullOrEmpty(vm.CurrentFilePath))
+                await DoSaveAsAsync(vm);
+            else
+                vm.SaveCurrent();
         };
 
-        SaveMenuItem.Click += (_, _) => vm.SaveCurrent();
+        SaveAsMenuItem.Click += async (_, _) => await DoSaveAsAsync(vm);
+
+        CloseEditorMenuItem.Click += async (_, _) => await ConfirmCloseCurrentEditorAsync(vm);
+
+        ExitMenuItem.Click += async (_, _) => await ConfirmExitAsync(vm);
+
+        ExportHtmlMenuItem.Click += async (_, _) => await DoExportAsync(vm, "html");
+        ExportPdfMenuItem.Click += async (_, _) => await DoExportAsync(vm, "pdf");
+        ExportPngMenuItem.Click += async (_, _) => await DoExportAsync(vm, "png");
+        ExportDocxMenuItem.Click += async (_, _) => await DoExportAsync(vm, "docx");
+
+        Closing += (_, e) =>
+        {
+            if (_isClosingProgrammatically) return;
+            if (DataContext is MainViewModel m && m.IsModified)
+            {
+                e.Cancel = true;
+                _ = ConfirmExitAsync(m);
+            }
+        };
 
         ActivityExplorerButton.Click += (_, _) => vm.IsExplorerActive = true;
         ActivitySearchButton.Click += (_, _) => vm.IsSearchActive = true;
         ActivityGitButton.Click += (_, _) => vm.IsGitActive = true;
+        ActivitySettingsButton.Click += (_, _) => vm.IsSettingsActive = true;
         UpdateActivityBarHighlight(vm);
 
-        Closed += (_, _) => vm.Config.Save(Core.AppConfig.DefaultConfigPath);
+        SetupEditorContextMenuAndKeys(vm);
+        SetupFileTreeContextMenu(vm);
+        SetupFileTreeRootButtons(vm);
+        SetupDocumentTabBackStack(vm);
+        SetupSearchResultsNavigation(vm);
+        SettingsSaveButton.Click += (_, _) => vm.Config.Save(Core.AppConfig.DefaultConfigPath);
+        Closed += (_, _) =>
+        {
+            try
+            {
+                StopAllTimers();
+                vm.Config.Save(Core.AppConfig.DefaultConfigPath);
+                vm.SaveRecentState();
+            }
+            catch
+            {
+                // 关闭时保存或停定时器失败也不影响窗口关闭
+            }
+        };
 
         _highlightTimer = new DispatcherTimer
         {
@@ -94,48 +170,310 @@ public partial class MainWindow : Window
         };
         _highlightTimer.Tick += (_, _) =>
         {
-            _highlightTimer.Stop();
-            UpdateEditorHighlight();
+            try
+            {
+                _highlightTimer.Stop();
+                UpdateEditorHighlight();
+            }
+            catch
+            {
+                _highlightTimer.Stop();
+            }
         };
+
+        _searchDebounceTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(400) };
+        _searchDebounceTimer.Tick += (_, _) =>
+        {
+            try
+            {
+                _searchDebounceTimer.Stop();
+                if (DataContext is MainViewModel v)
+                    v.DoSearch();
+            }
+            catch
+            {
+                _searchDebounceTimer.Stop();
+            }
+        };
+        vm.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(MainViewModel.SearchQuery))
+            {
+                _searchDebounceTimer.Stop();
+                _searchDebounceTimer.Start();
+            }
+            if (e.PropertyName == nameof(MainViewModel.CurrentFilePath))
+            {
+                if (string.IsNullOrEmpty(vm.CurrentFilePath))
+                    _fileCheckTimer?.Stop();
+                else
+                    _fileCheckTimer?.Start();
+            }
+        };
+        _fileCheckTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+        _fileCheckTimer.Tick += (_, _) =>
+        {
+            try
+            {
+                if (DataContext is MainViewModel v)
+                    v.CheckFileChangedExternally();
+            }
+            catch
+            {
+                // 文件 IO 等异常不影响使用，仅跳过本次检测
+            }
+        };
+        if (!string.IsNullOrEmpty(vm.CurrentFilePath))
+            _fileCheckTimer.Start();
+
+        if (EditorTextBox != null)
+            EditorTextBox.GotFocus += (_, _) => vm.ActivePane = "Editor";
+
+        // 点击编辑区/预览区任意位置即切换激活窗格（焦点可能落在子控件上，GotFocus 不一定冒泡到 EditorTextBox）
+        if (EditorPaneGrid != null)
+            EditorPaneGrid.AddHandler(PointerPressedEvent, (_, _) => vm.ActivePane = "Editor", RoutingStrategies.Bubble);
+        if (PreviewPaneGrid != null)
+            PreviewPaneGrid.AddHandler(PointerPressedEvent, (_, _) => vm.ActivePane = "Preview", RoutingStrategies.Bubble);
+
+        if (FileTreeView != null)
+        {
+            // 使用 AddHandler 确保在冒泡阶段也能收到事件，并统一用单击折叠/展开文件夹
+            FileTreeView.AddHandler(PointerPressedEvent, FileTreeViewOnPointerPressed, RoutingStrategies.Tunnel);
+        }
+
+        // 监听按键抬起事件，用于在执行 Alt 组合键（键盘或鼠标）后拦截随后的“裸 Alt”抬起，避免焦点跳到菜单栏。
+        AddHandler(KeyUpEvent, OnWindowKeyUp, RoutingStrategies.Tunnel);
+
+        // 监听全局鼠标按下事件：当检测到 Alt+左键（列选择等）时，标记需要拦截下一次 Alt KeyUp。
+        AddHandler(PointerPressedEvent, OnWindowPointerPressed, RoutingStrategies.Tunnel);
+
+        SetupDeferredSplitters();
+    }
+
+    /// <summary>
+    /// 根据当前文本长度动态调整语法高亮的防抖间隔：文档越大，间隔越长，避免频繁全量分析。
+    /// </summary>
+    private static TimeSpan GetHighlightInterval(string text)
+    {
+        var length = text?.Length ?? 0;
+        if (length <= 5_000)
+            return TimeSpan.FromMilliseconds(180);
+        if (length <= 50_000)
+            return TimeSpan.FromMilliseconds(320);
+        return TimeSpan.FromMilliseconds(650);
+    }
+
+    /// <summary>
+    /// 获取当前编辑视图的大致可见行范围（0-based，含），并在顶部/底部各扩展一段缓冲区。
+    /// 若视图尚未生成可视行，则返回 null，表示分析整篇文档。
+    /// </summary>
+    private static (int startLine, int endLine)? GetVisibleLineRange(TextEditor editor, int extraLines = 40)
+    {
+        var textView = editor.TextArea?.TextView;
+        if (textView == null)
+            return null;
+        var visualLines = textView.VisualLines;
+        if (visualLines == null || visualLines.Count == 0)
+            return null;
+
+        int first = visualLines.Min(v => v.FirstDocumentLine.LineNumber) - 1;
+        int last = visualLines.Max(v => v.LastDocumentLine.LineNumber) - 1;
+
+        if (editor.Document == null)
+            return (Math.Max(0, first), Math.Max(first, last));
+
+        int maxIndex = Math.Max(0, editor.Document.LineCount - 1);
+        int start = Math.Max(0, first - extraLines);
+        int end = Math.Min(maxIndex, last + extraLines);
+        if (end < start)
+            end = start;
+        return (start, end);
+    }
+
+    /// <summary>VS 风格分隔条：拖动时只显示蓝色预览线，松手后再应用布局。</summary>
+    private void SetupDeferredSplitters()
+    {
+        const double sidebarMin = 180;
+        const double sidebarMax = 420;
+        const double contentMinWidth = 120;
+
+        if (SidebarSplitter != null && MainGrid != null && SidebarSplitterPreviewLine != null && SidebarSplitterOverlay != null)
+        {
+            SidebarSplitter.PointerPressed += (s, e) =>
+            {
+                if (!e.GetCurrentPoint(SidebarSplitter).Properties.IsLeftButtonPressed) return;
+                e.Handled = true;
+                _sidebarSplitterDragging = true;
+                var pt = e.GetPosition(MainGrid);
+                SidebarSplitterPreviewLine.IsVisible = true;
+                SidebarSplitterPreviewLine.Margin = new Thickness(Math.Clamp(pt.X, sidebarMin, sidebarMax), 0, 0, 0);
+                e.Pointer.Capture(SidebarSplitter);
+            };
+            SidebarSplitter.PointerMoved += (s, e) =>
+            {
+                if (!_sidebarSplitterDragging || MainGrid == null) return;
+                var pt = e.GetPosition(MainGrid);
+                var x = Math.Clamp(pt.X, sidebarMin, sidebarMax);
+                SidebarSplitterPreviewLine!.Margin = new Thickness(x, 0, 0, 0);
+            };
+            SidebarSplitter.PointerReleased += (s, e) =>
+            {
+                if (e.GetCurrentPoint(SidebarSplitter).Properties.PointerUpdateKind != PointerUpdateKind.LeftButtonReleased) return;
+                if (!_sidebarSplitterDragging) return;
+                _sidebarSplitterDragging = false;
+                e.Pointer.Capture(null);
+                SidebarSplitterPreviewLine!.IsVisible = false;
+                var pt = e.GetPosition(MainGrid);
+                var w = Math.Clamp(pt.X, sidebarMin, sidebarMax);
+                var cols = MainGrid!.ColumnDefinitions;
+                if (cols.Count >= 1) cols[0].Width = new GridLength(w, GridUnitType.Pixel);
+            };
+            SidebarSplitter.PointerCaptureLost += (s, e) =>
+            {
+                if (_sidebarSplitterDragging)
+                {
+                    _sidebarSplitterDragging = false;
+                    SidebarSplitterPreviewLine!.IsVisible = false;
+                }
+            };
+        }
+
+        if (ContentSplitter != null && ContentSplitGrid != null && ContentSplitterPreviewLine != null && ContentSplitterOverlay != null)
+        {
+            ContentSplitter.PointerPressed += (s, e) =>
+            {
+                if (!e.GetCurrentPoint(ContentSplitter).Properties.IsLeftButtonPressed) return;
+                e.Handled = true;
+                _contentSplitterDragging = true;
+                var pt = e.GetPosition(ContentSplitGrid);
+                var total = ContentSplitGrid.Bounds.Width;
+                var maxX = Math.Max(contentMinWidth, total - 4 - contentMinWidth);
+                var x = Math.Clamp(pt.X, contentMinWidth, maxX);
+                ContentSplitterPreviewLine.IsVisible = true;
+                ContentSplitterPreviewLine.Margin = new Thickness(x, 0, 0, 0);
+                e.Pointer.Capture(ContentSplitter);
+            };
+            ContentSplitter.PointerMoved += (s, e) =>
+            {
+                if (!_contentSplitterDragging || ContentSplitGrid == null) return;
+                var pt = e.GetPosition(ContentSplitGrid);
+                var total = ContentSplitGrid.Bounds.Width;
+                var maxX = Math.Max(contentMinWidth, total - 4 - contentMinWidth);
+                var x = Math.Clamp(pt.X, contentMinWidth, maxX);
+                ContentSplitterPreviewLine!.Margin = new Thickness(x, 0, 0, 0);
+            };
+            ContentSplitter.PointerReleased += (s, e) =>
+            {
+                if (e.GetCurrentPoint(ContentSplitter).Properties.PointerUpdateKind != PointerUpdateKind.LeftButtonReleased) return;
+                if (!_contentSplitterDragging) return;
+                _contentSplitterDragging = false;
+                e.Pointer.Capture(null);
+                ContentSplitterPreviewLine!.IsVisible = false;
+                var pt = e.GetPosition(ContentSplitGrid);
+                var total = ContentSplitGrid!.Bounds.Width;
+                var maxX = Math.Max(contentMinWidth, total - 4 - contentMinWidth);
+                var w = Math.Clamp(pt.X, contentMinWidth, maxX);
+                var cols = ContentSplitGrid.ColumnDefinitions;
+                if (cols.Count >= 3)
+                {
+                    cols[0].Width = new GridLength(w, GridUnitType.Pixel);
+                    cols[2].Width = new GridLength(1, GridUnitType.Star);
+                }
+            };
+            ContentSplitter.PointerCaptureLost += (s, e) =>
+            {
+                if (_contentSplitterDragging)
+                {
+                    _contentSplitterDragging = false;
+                    ContentSplitterPreviewLine!.IsVisible = false;
+                }
+            };
+        }
+    }
+
+    /// <summary>窗口关闭时停止所有定时器，避免 Tick 在析构后触发导致异常。</summary>
+    private void StopAllTimers()
+    {
+        try
+        {
+            _highlightTimer.Stop();
+            _searchDebounceTimer.Stop();
+            _fileCheckTimer?.Stop();
+        }
+        catch { }
     }
 
     private void SetupEditorHighlighting()
     {
         if (EditorTextBox is TextEditor editor)
         {
+            _editorSearchPanel = SearchPanel.Install(editor);
             editor.Options.EnableHyperlinks = false;
             editor.Options.EnableEmailHyperlinks = false;
+            if (editor.Options is { } opts && opts.GetType().GetProperty("EnableRectangularSelection") != null)
+                opts.GetType().GetProperty("EnableRectangularSelection")!.SetValue(opts, true);
             editor.TextArea.TextView.LineTransformers.Add(_markdownColorizer);
 
             if (DataContext is MainViewModel vm)
             {
-                editor.Text = vm.CurrentMarkdown ?? string.Empty;
-
+                editor.FontSize = 14.0 * vm.EditorZoomLevel;
                 vm.PropertyChanged += (_, e) =>
                 {
                     if (e.PropertyName == nameof(MainViewModel.CurrentMarkdown))
                     {
+                        if (_currentMarkdownChangeFromEditor)
+                        {
+                            _currentMarkdownChangeFromEditor = false;
+                            return;
+                        }
                         var target = vm.CurrentMarkdown ?? string.Empty;
                         if (!string.Equals(editor.Text, target, StringComparison.Ordinal))
                         {
+                            if (!string.IsNullOrEmpty(_currentEditorPath) && _currentEditorPath != (vm.CurrentFilePath ?? ""))
+                                vm.PushBack(_currentEditorPath, editor.TextArea.Caret.Offset);
                             var caret = editor.TextArea.Caret.Offset;
                             editor.Text = target;
                             editor.TextArea.Caret.Offset = System.Math.Min(caret, editor.Text.Length);
+                            _currentEditorPath = vm.CurrentFilePath ?? "";
+                            if (_pendingGoToLine > 0 && editor.Document != null)
+                            {
+                                var lineNum = Math.Clamp(_pendingGoToLine, 1, editor.Document.LineCount);
+                                var line = editor.Document.GetLineByNumber(lineNum);
+                                editor.TextArea.Caret.Offset = line.Offset;
+                                editor.TextArea.Caret.BringCaretToView();
+                                _pendingGoToLine = -1;
+                            }
                         }
                     }
                 };
+                editor.Text = vm.CurrentMarkdown ?? string.Empty;
+                _currentEditorPath = vm.CurrentFilePath ?? "";
 
                 editor.TextChanged += (_, _) =>
                 {
                     var text = editor.Text ?? string.Empty;
                     if (!string.Equals(vm.CurrentMarkdown, text, StringComparison.Ordinal))
                     {
+                        _currentMarkdownChangeFromEditor = true;
                         vm.CurrentMarkdown = text;
                     }
 
                     _highlightTimer.Stop();
+                    _highlightTimer.Interval = GetHighlightInterval(text);
                     _highlightTimer.Start();
                 };
+
+                editor.TextArea.Caret.PositionChanged += (_, _) =>
+                {
+                    vm.CaretLine = editor.TextArea.Caret.Line;
+                    vm.CaretColumn = editor.TextArea.Caret.Column;
+                    if (vm.ActiveDocument != null)
+                        vm.ActiveDocument.LastCaretOffset = editor.TextArea.Caret.Offset;
+                };
+                vm.CaretLine = editor.TextArea.Caret.Line;
+                vm.CaretColumn = editor.TextArea.Caret.Column;
+                if (vm.ActiveDocument != null)
+                    vm.ActiveDocument.LastCaretOffset = editor.TextArea.Caret.Offset;
             }
             else
             {
@@ -153,9 +491,44 @@ public partial class MainWindow : Window
         if (EditorTextBox is not TextEditor editor)
             return;
         var text = editor.Text ?? string.Empty;
-        var tokens = _highlightService.Analyze(text);
-        _markdownColorizer.UpdateTokens(tokens);
-        editor.TextArea.TextView.Redraw();
+        var version = ++_highlightVersion;
+        int? visibleStart = null;
+        int? visibleEnd = null;
+        var range = GetVisibleLineRange(editor);
+        if (range.HasValue)
+        {
+            visibleStart = range.Value.startLine;
+            visibleEnd = range.Value.endLine;
+        }
+
+        Task.Run(() =>
+        {
+            try
+            {
+                var tokens = _highlightService.Analyze(text, visibleStart, visibleEnd);
+                Dispatcher.UIThread.Post(() =>
+                {
+                    try
+                    {
+                        if (version <= _appliedHighlightVersion)
+                            return;
+                        if (EditorTextBox is not TextEditor ed || ed.TextArea?.TextView == null)
+                            return;
+                        _appliedHighlightVersion = version;
+                        _markdownColorizer.UpdateTokens(tokens);
+                        ed.TextArea.TextView.Redraw();
+                    }
+                    catch
+                    {
+                        // 控件已销毁或断开视觉树时忽略，不影响使用
+                    }
+                }, DispatcherPriority.Background);
+            }
+            catch
+            {
+                // 高亮分析异常不影响编辑
+            }
+        });
     }
 
     private void SetupScrollSync()
@@ -173,18 +546,214 @@ public partial class MainWindow : Window
             _editorScroll.ScrollChanged += EditorScrollOnScrollChanged;
 
         if (_previewScroll != null)
+        {
             _previewScroll.ScrollChanged += PreviewScrollOnScrollChanged;
+            _previewScroll.GotFocus += (_, _) =>
+            {
+                if (DataContext is MainViewModel m)
+                    m.ActivePane = "Preview";
+            };
+        }
     }
+
+    private void FileTreeViewOnPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if (e.Source is not Control control)
+            return;
+
+        var item = control
+            .GetVisualAncestors()
+            .OfType<TreeViewItem>()
+            .FirstOrDefault();
+
+        if (e.GetCurrentPoint(this).Properties.IsRightButtonPressed)
+        {
+            if (item?.DataContext is FileTreeNode node && DataContext is MainViewModel vm)
+            {
+                vm.SelectedTreeNode = node;
+            }
+            return;
+        }
+
+        if (!e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
+            return;
+
+        if (item?.DataContext is FileTreeNode node2 && node2.IsFolder)
+        {
+            node2.IsExpanded = !node2.IsExpanded;
+            e.Handled = true;
+        }
+    }
+
+    private void SetupFileTreeRootButtons(MainViewModel vm)
+    {
+        if (FileTreeRefreshRootBtn != null)
+            FileTreeRefreshRootBtn.Click += (_, _) => vm.RefreshFileTree();
+    }
+
+    private void SetupFileTreeContextMenu(MainViewModel vm)
+    {
+        if (FileTreeCopyPathItem == null || FileTreeRenameItem == null || FileTreeNewFileItem == null || FileTreeNewFolderItem == null || FileTreeDeleteItem == null)
+            return;
+
+        FileTreeCopyPathItem.Click += async (_, _) =>
+        {
+            var node = vm.SelectedTreeNode;
+            if (node == null) return;
+            var clipboard = TopLevel.GetTopLevel(this)?.Clipboard;
+            if (clipboard != null)
+                await clipboard.SetTextAsync(node.FullPath);
+        };
+
+        FileTreeNewFileItem.Click += (_, _) =>
+        {
+            var node = vm.SelectedTreeNode;
+            if (node == null) return;
+            var dir = node.IsFolder ? node.FullPath : System.IO.Path.GetDirectoryName(node.FullPath);
+            if (!string.IsNullOrEmpty(dir))
+                vm.NewFileInFolder(dir);
+        };
+
+        FileTreeNewFolderItem.Click += (_, _) =>
+        {
+            var node = vm.SelectedTreeNode;
+            if (node == null) return;
+            var dir = node.IsFolder ? node.FullPath : System.IO.Path.GetDirectoryName(node.FullPath);
+            if (!string.IsNullOrEmpty(dir))
+                vm.NewFolderInFolder(dir);
+        };
+
+        FileTreeDeleteItem.Click += async (_, _) =>
+        {
+            var node = vm.SelectedTreeNode;
+            if (node == null || node.IsFolder) return;
+            var path = node.FullPath;
+            var dialog = new Window
+            {
+                Title = "确认删除",
+                Width = 320,
+                Height = 120,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner
+            };
+            var ok = new Button { Content = "删除" };
+            var cancel = new Button { Content = "取消" };
+            cancel.Click += (_, _) => dialog.Close();
+            ok.Click += (_, _) =>
+            {
+                if (vm.DeleteFileByPath(path))
+                    dialog.Close();
+            };
+            dialog.Content = new StackPanel
+            {
+                Margin = new Thickness(16),
+                Spacing = 12,
+                Children =
+                {
+                    new TextBlock { Text = "确定要删除此文件吗？", TextWrapping = TextWrapping.Wrap },
+                    new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, Spacing = 8, Children = { ok, cancel } }
+                }
+            };
+            await dialog.ShowDialog(this);
+        };
+
+        FileTreeRenameItem.Click += (_, _) =>
+        {
+            var node = vm.SelectedTreeNode;
+            if (node == null || node.IsFolder) return;
+            node.EditName = node.DisplayName;
+            node.IsRenaming = true;
+        };
+
+        void UpdateFileTreeMenuState()
+        {
+            var node = vm.SelectedTreeNode;
+            var hasNode = node != null;
+            FileTreeCopyPathItem.IsEnabled = hasNode;
+            FileTreeRenameItem.IsEnabled = hasNode && node is { IsFolder: false };
+            FileTreeNewFileItem.IsEnabled = hasNode;
+            FileTreeNewFolderItem.IsEnabled = hasNode;
+            FileTreeDeleteItem.IsEnabled = hasNode && node is { IsFolder: false };
+        }
+
+        if (FileTreeView?.ContextFlyout is MenuFlyout flyout)
+        {
+            flyout.Opening += (_, _) => UpdateFileTreeMenuState();
+        }
+    }
+
+    private void TreeItemRename_OnLostFocus(object? sender, RoutedEventArgs e)
+    {
+        CommitTreeItemRename(sender);
+    }
+
+    private void TreeItemRename_OnKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter)
+        {
+            CommitTreeItemRename(sender);
+            e.Handled = true;
+        }
+        else if (e.Key == Key.Escape)
+        {
+            if (sender is Control c && c.DataContext is FileTreeNode node)
+            {
+                node.IsRenaming = false;
+                node.EditName = node.DisplayName;
+            }
+            e.Handled = true;
+        }
+    }
+
+    private void CommitTreeItemRename(object? sender)
+    {
+        if (sender is not Avalonia.Controls.TextBox box || box.DataContext is not FileTreeNode node || DataContext is not MainViewModel vm)
+            return;
+        if (!node.IsRenaming) return;
+        node.IsRenaming = false;
+        var newName = box.Text?.Trim();
+        if (string.IsNullOrEmpty(newName) || newName == node.DisplayName) return;
+        vm.RenameFileByPath(node.FullPath, newName);
+    }
+
+    /// <summary>切换标签时将离开的文档 (path, LastCaretOffset) 压入后退栈，使 Alt+Left 可回到文档内光标位置。</summary>
+    private void SetupDocumentTabBackStack(MainViewModel vm)
+    {
+        if (DocumentTabControl == null) return;
+        DocumentTabControl.SelectionChanged += (_, e) =>
+        {
+            if (e.RemovedItems?.Count > 0 && e.RemovedItems[0] is DocumentItem prev && !string.IsNullOrEmpty(prev.FullPath))
+                vm.PushBack(prev.FullPath, prev.LastCaretOffset);
+        };
+
+        DocumentTabControl.AddHandler(
+            PointerReleasedEvent,
+            (sender, e) =>
+            {
+                if (e.GetCurrentPoint(DocumentTabControl).Properties.PointerUpdateKind != PointerUpdateKind.MiddleButtonReleased)
+                    return;
+                if (e.Source is not Control c || c.DataContext is not DocumentItem item)
+                    return;
+                vm.CloseDocument(item);
+                e.Handled = true;
+            },
+            RoutingStrategies.Tunnel);
+    }
+
+    /// <summary>编辑区上下 Padding 总高度（用于按内容高度同步滚动，减少留白导致的偏移）。</summary>
+    private const double EditorVerticalPaddingTotal = 16;
+    private const double EditorTopPadding = 8;
 
     private void EditorScrollOnScrollChanged(object? sender, ScrollChangedEventArgs e)
     {
         if (_isSyncingScroll || _editorScroll == null || _previewScroll == null)
             return;
+        if (DataContext is MainViewModel vm && vm.SkipEditorToPreviewScrollSync)
+            return;
 
         _isSyncingScroll = true;
         try
         {
-            SyncScroll(_editorScroll, _previewScroll);
+            SyncScrollEditorToPreview();
         }
         finally
         {
@@ -200,7 +769,7 @@ public partial class MainWindow : Window
         _isSyncingScroll = true;
         try
         {
-            SyncScroll(_previewScroll, _editorScroll);
+            SyncScrollPreviewToEditor();
         }
         finally
         {
@@ -208,16 +777,28 @@ public partial class MainWindow : Window
         }
     }
 
-    private static void SyncScroll(ScrollViewer source, ScrollViewer target)
+    private void SyncScrollEditorToPreview()
     {
-        var sourceMax = Math.Max(0, source.Extent.Height - source.Viewport.Height);
-        var targetMax = Math.Max(0, target.Extent.Height - target.Viewport.Height);
-        if (sourceMax <= 0 || targetMax <= 0)
-            return;
+        if (_editorScroll == null || _previewScroll == null) return;
+        var contentHeight = Math.Max(0, _editorScroll.Extent.Height - EditorVerticalPaddingTotal);
+        var editorScrollable = Math.Max(0, contentHeight - _editorScroll.Viewport.Height);
+        var contentOffset = Math.Max(0, _editorScroll.Offset.Y - EditorTopPadding);
+        var percent = editorScrollable > 0 ? Math.Clamp(contentOffset / editorScrollable, 0, 1) : 0;
+        var targetMax = Math.Max(0, _previewScroll.Extent.Height - _previewScroll.Viewport.Height);
+        if (targetMax <= 0) return;
+        _previewScroll.Offset = new Vector(_previewScroll.Offset.X, targetMax * percent);
+    }
 
-        var percent = source.Offset.Y / sourceMax;
-        var newY = targetMax * percent;
-        target.Offset = new Vector(target.Offset.X, newY);
+    private void SyncScrollPreviewToEditor()
+    {
+        if (_editorScroll == null || _previewScroll == null) return;
+        var sourceMax = Math.Max(0, _previewScroll.Extent.Height - _previewScroll.Viewport.Height);
+        if (sourceMax <= 0) return;
+        var percent = Math.Clamp(_previewScroll.Offset.Y / sourceMax, 0, 1);
+        var contentHeight = Math.Max(0, _editorScroll.Extent.Height - EditorVerticalPaddingTotal);
+        var editorScrollable = Math.Max(0, contentHeight - _editorScroll.Viewport.Height);
+        var newY = EditorTopPadding + percent * editorScrollable;
+        _editorScroll.Offset = new Vector(_editorScroll.Offset.X, newY);
     }
 
     private void VmOnPropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -229,8 +810,11 @@ public partial class MainWindow : Window
             ApplyLayout(vm.LayoutMode);
         else if (e.PropertyName is nameof(MainViewModel.IsExplorerActive)
                  or nameof(MainViewModel.IsSearchActive)
-                 or nameof(MainViewModel.IsGitActive))
+                 or nameof(MainViewModel.IsGitActive)
+                 or nameof(MainViewModel.IsSettingsActive))
             UpdateActivityBarHighlight(vm);
+        else if (e.PropertyName == nameof(MainViewModel.EditorZoomLevel) && EditorTextBox is TextEditor ed)
+            ed.FontSize = 14.0 * vm.EditorZoomLevel;
     }
 
     private void UpdateActivityBarHighlight(MainViewModel vm)
@@ -238,6 +822,568 @@ public partial class MainWindow : Window
         ActivityExplorerButton.Classes.Set("active", vm.IsExplorerActive);
         ActivitySearchButton.Classes.Set("active", vm.IsSearchActive);
         ActivityGitButton.Classes.Set("active", vm.IsGitActive);
+        ActivitySettingsButton.Classes.Set("active", vm.IsSettingsActive);
+    }
+
+    private void SetupEditorContextMenuAndKeys(MainViewModel vm)
+    {
+        if (EditorTextBox is not TextEditor editor)
+            return;
+
+        EditorContextUndo.Click += (_, _) => EditorUndo();
+        EditorContextRedo.Click += (_, _) => EditorRedo();
+        EditorContextCut.Click += (_, _) => EditorCut();
+        EditorContextCopy.Click += (_, _) => EditorCopy();
+        EditorContextPaste.Click += (_, _) => EditorPaste();
+        EditorContextSelectAll.Click += (_, _) => EditorSelectAll();
+
+        if (EditorTextBox.ContextFlyout is MenuFlyout editorFlyout)
+        {
+            editorFlyout.Opening += (_, _) =>
+            {
+                var seg = editor.TextArea.Selection?.SurroundingSegment;
+                var hasSelection = seg is { Length: > 0 };
+                EditorContextCut.IsEnabled = hasSelection;
+                EditorContextCopy.IsEnabled = hasSelection;
+                EditorContextUndo.IsEnabled = editor.Document?.UndoStack?.CanUndo ?? false;
+                EditorContextRedo.IsEnabled = editor.Document?.UndoStack?.CanRedo ?? false;
+                _ = UpdateEditorPasteEnabledAsync();
+            };
+        }
+
+        async System.Threading.Tasks.Task UpdateEditorPasteEnabledAsync()
+        {
+            var clipboard = TopLevel.GetTopLevel(this)?.Clipboard;
+            var hasText = false;
+            if (clipboard != null)
+            {
+                try
+                {
+                    var text = await clipboard.GetTextAsync();
+                    hasText = !string.IsNullOrEmpty(text);
+                }
+                catch { }
+            }
+            await Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                EditorContextPaste.IsEnabled = hasText;
+            });
+        }
+
+        KeyBindings.Add(new KeyBinding
+        {
+            Gesture = new KeyGesture(Key.Up, KeyModifiers.Alt),
+            Command = new RelayCommand(() =>
+            {
+                _suppressNextAltKeyUp = true;
+                EditorMoveLineUp();
+            })
+        });
+        KeyBindings.Add(new KeyBinding
+        {
+            Gesture = new KeyGesture(Key.Down, KeyModifiers.Alt),
+            Command = new RelayCommand(() =>
+            {
+                _suppressNextAltKeyUp = true;
+                EditorMoveLineDown();
+            })
+        });
+        KeyBindings.Add(new KeyBinding
+        {
+            Gesture = new KeyGesture(Key.Left, KeyModifiers.Alt),
+            Command = new RelayCommand(() =>
+            {
+                _suppressNextAltKeyUp = true;
+                DoGoBack(vm);
+            })
+        });
+        KeyBindings.Add(new KeyBinding
+        {
+            Gesture = new KeyGesture(Key.Right, KeyModifiers.Alt),
+            Command = new RelayCommand(() =>
+            {
+                _suppressNextAltKeyUp = true;
+                DoGoForward(vm);
+            })
+        });
+        // Ctrl+F 由编辑区 SearchPanel 处理（文件内查找）；跨文件搜索通过侧栏“搜索”按钮打开
+        KeyBindings.Add(new KeyBinding { Gesture = new KeyGesture(Key.F, KeyModifiers.Control), Command = new RelayCommand(() => FocusEditorFind(vm)) });
+        KeyBindings.Add(new KeyBinding { Gesture = new KeyGesture(Key.Add, KeyModifiers.Control), Command = vm.ZoomInCommand });
+        KeyBindings.Add(new KeyBinding { Gesture = new KeyGesture(Key.OemPlus, KeyModifiers.Control), Command = vm.ZoomInCommand });
+        KeyBindings.Add(new KeyBinding { Gesture = new KeyGesture(Key.Subtract, KeyModifiers.Control), Command = vm.ZoomOutCommand });
+        KeyBindings.Add(new KeyBinding { Gesture = new KeyGesture(Key.OemMinus, KeyModifiers.Control), Command = vm.ZoomOutCommand });
+    }
+
+    /// <summary>聚焦编辑区并打开内置查找面板（Ctrl+F 文件内查找，与侧栏跨文件搜索分离）。</summary>
+    private void FocusEditorFind(MainViewModel vm)
+    {
+        if (EditorTextBox is TextEditor editor)
+        {
+            editor.Focus();
+            _editorSearchPanel?.Open();
+        }
+    }
+
+    /// <summary>
+    /// 统一拦截 Alt 组合键后的“裸 Alt 抬起”事件，避免菜单栏被激活。
+    /// 仅当之前标记了 _suppressNextAltKeyUp 时才生效，普通单独按 Alt 仍保持默认行为。
+    /// </summary>
+    private void OnWindowKeyUp(object? sender, KeyEventArgs e)
+    {
+        if (
+            !_suppressNextAltKeyUp
+            || (e.Key != Key.LeftAlt && e.Key != Key.RightAlt)
+        )
+            return;
+
+        _suppressNextAltKeyUp = false;
+        e.Handled = true;
+    }
+
+    /// <summary>
+    /// 监听 Alt+鼠标 操作（例如列选择 Alt+拖拽），一旦检测到 Alt+左键按下，
+    /// 则标记在本次交互结束时需要拦截随后的 Alt KeyUp，防止菜单获得焦点。
+    /// </summary>
+    private void OnWindowPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if ((e.KeyModifiers & KeyModifiers.Alt) == 0)
+            return;
+
+        var pt = e.GetCurrentPoint(this);
+        if (pt.Properties.IsLeftButtonPressed)
+        {
+            _suppressNextAltKeyUp = true;
+        }
+    }
+
+    private void DoGoBack(MainViewModel vm)
+    {
+        var offset = EditorTextBox is TextEditor ed ? ed.TextArea.Caret.Offset : 0;
+        var (path, newOffset) = vm.GoBack(vm.CurrentFilePath ?? "", offset);
+        if (path != null)
+            NavigateTo(path, newOffset);
+    }
+
+    private void DoGoForward(MainViewModel vm)
+    {
+        var offset = EditorTextBox is TextEditor ed ? ed.TextArea.Caret.Offset : 0;
+        var (path, newOffset) = vm.GoForward(vm.CurrentFilePath ?? "", offset);
+        if (path != null)
+            NavigateTo(path, newOffset);
+    }
+
+    internal void NavigateTo(string path, int offset)
+    {
+        if (DataContext is not MainViewModel vm) return;
+        vm.OpenDocument(path);
+        Dispatcher.UIThread.Post(() =>
+        {
+            try
+            {
+                if (EditorTextBox is TextEditor editor && editor.Document != null && DataContext is MainViewModel m)
+                {
+                    var o = Math.Clamp(offset, 0, editor.Document.TextLength);
+                    editor.TextArea.Caret.Offset = o;
+                    editor.TextArea.Caret.BringCaretToView();
+                    if (m.ActiveDocument != null)
+                        m.ActiveDocument.LastCaretOffset = o;
+                }
+            }
+            catch { }
+        });
+    }
+
+    internal void NavigateToSearchResult(SearchResultItem result)
+    {
+        if (result == null || DataContext is not MainViewModel vm) return;
+        if (result.FilePath == vm.CurrentFilePath && EditorTextBox is TextEditor editor && editor.Document != null)
+        {
+            var lineNum = Math.Clamp(result.LineNumber, 1, editor.Document.LineCount);
+            var line = editor.Document.GetLineByNumber(lineNum);
+            editor.TextArea.Caret.Offset = line.Offset;
+            editor.TextArea.Caret.BringCaretToView();
+            return;
+        }
+        _pendingGoToLine = result.LineNumber;
+        vm.OpenDocument(result.FilePath);
+    }
+
+    internal void PushFocusHistory(string path, int offset)
+    {
+        if (DataContext is MainViewModel vm)
+            vm.PushBack(path, offset);
+    }
+
+    private void EditorUndo()
+    {
+        if (EditorTextBox is not TextEditor editor || editor.Document?.UndoStack == null) return;
+        editor.Focus();
+        if (editor.Document.UndoStack.CanUndo)
+            editor.Document.UndoStack.Undo();
+    }
+
+    private void EditorRedo()
+    {
+        if (EditorTextBox is not TextEditor editor || editor.Document?.UndoStack == null) return;
+        editor.Focus();
+        if (editor.Document.UndoStack.CanRedo)
+            editor.Document.UndoStack.Redo();
+    }
+
+    private async void EditorCut()
+    {
+        if (EditorTextBox is not TextEditor editor || editor.Document == null) return;
+        editor.Focus();
+        var seg = editor.TextArea.Selection?.SurroundingSegment;
+        if (seg == null || seg.Length == 0) return;
+        var text = editor.Document.GetText(seg.Offset, seg.Length);
+        var clipboard = TopLevel.GetTopLevel(this)?.Clipboard;
+        if (clipboard != null)
+            await clipboard.SetTextAsync(text);
+        editor.Document.Replace(seg.Offset, seg.Length, "");
+    }
+
+    private async void EditorCopy()
+    {
+        if (EditorTextBox is not TextEditor editor || editor.Document == null) return;
+        editor.Focus();
+        var seg = editor.TextArea.Selection?.SurroundingSegment;
+        if (seg == null || seg.Length == 0) return;
+        var text = editor.Document.GetText(seg.Offset, seg.Length);
+        var clipboard = TopLevel.GetTopLevel(this)?.Clipboard;
+        if (clipboard != null)
+            await clipboard.SetTextAsync(text);
+    }
+
+    private async void EditorPaste()
+    {
+        if (EditorTextBox is not TextEditor editor || editor.Document == null) return;
+        editor.Focus();
+        var clipboard = TopLevel.GetTopLevel(this)?.Clipboard;
+        if (clipboard == null) return;
+        var text = await clipboard.GetTextAsync();
+        if (string.IsNullOrEmpty(text)) return;
+        var seg = editor.TextArea.Selection?.SurroundingSegment;
+        int offset = seg?.Offset ?? editor.TextArea.Caret.Offset;
+        int length = seg?.Length ?? 0;
+        editor.Document.Replace(offset, length, text);
+    }
+
+    private void EditorSelectAll()
+    {
+        if (EditorTextBox is not TextEditor editor || editor.Document == null) return;
+        // 使用异步调度，确保在上下文菜单关闭后再设置焦点和选区，避免被菜单抢焦点导致视觉上无选中效果。
+        Dispatcher.UIThread.Post(() =>
+        {
+            try
+            {
+                if (EditorTextBox is TextEditor ed)
+                {
+                    ed.Focus();
+                    ed.SelectAll();
+                }
+            }
+            catch { }
+        }, DispatcherPriority.Background);
+    }
+
+    private void EditorMoveLineUp()
+    {
+        if (EditorTextBox is not TextEditor editor || editor.Document == null) return;
+        editor.Focus();
+        var doc = editor.Document;
+        if (doc.LineCount < 2) return;
+        var selection = editor.TextArea.Selection;
+        var caretOffset = editor.TextArea.Caret.Offset;
+
+        int selStart, selEnd;
+        if (selection.IsEmpty)
+        {
+            selStart = selEnd = caretOffset;
+        }
+        else
+        {
+            var seg = selection.SurroundingSegment;
+            selStart = seg.Offset;
+            selEnd = seg.EndOffset;
+        }
+
+        if (selEnd > selStart)
+            selEnd--;
+
+        // 将选择范围映射到完整的行，确保多行选择/列选择时始终按整行移动。
+        var firstLine = doc.GetLineByOffset(selStart);
+        var lastLine = doc.GetLineByOffset(selEnd);
+        if (firstLine.LineNumber <= 1) return;
+
+        var prevLine = doc.GetLineByNumber(firstLine.LineNumber - 1);
+
+        // 选中块：从第一行行首到最后一行的行结束（含行尾换行符），使用“下一行起始/文档长度”推算行尾，避免依赖外部扩展属性。
+        int blockStart = firstLine.Offset;
+        int blockEnd = lastLine.LineNumber == doc.LineCount
+            ? doc.TextLength
+            : doc.GetLineByNumber(lastLine.LineNumber + 1).Offset;
+
+        // 被替换的整体范围：上一行开始到选中块结束
+        int segmentStart = prevLine.Offset;
+        int segmentEnd = blockEnd;
+        int segmentLength = segmentEnd - segmentStart;
+
+        int prevStart = prevLine.Offset;
+        int prevEnd = firstLine.Offset; // 第一行起始即上一行（含换行）的结束
+        var prevText = doc.GetText(prevStart, prevEnd - prevStart);
+        var blockText = doc.GetText(blockStart, blockEnd - blockStart);
+
+        var newText = blockText + prevText;
+
+        // 防御性检查：若计算出的范围超出文档长度或长度为 0，则放弃本次移动。
+        if (segmentStart < 0 || segmentLength <= 0 || segmentStart + segmentLength > doc.TextLength)
+            return;
+        if (string.IsNullOrEmpty(newText))
+            return;
+
+        doc.Replace(segmentStart, segmentLength, newText);
+
+        int newBlockStart = segmentStart;
+        if (selection.IsEmpty)
+        {
+            int caretRel = caretOffset - blockStart;
+            caretRel = Math.Clamp(caretRel, 0, blockText.Length);
+            editor.TextArea.Caret.Offset = newBlockStart + caretRel;
+        }
+        else
+        {
+            editor.Select(newBlockStart, blockText.Length);
+        }
+    }
+
+    private void EditorMoveLineDown()
+    {
+        if (EditorTextBox is not TextEditor editor || editor.Document == null) return;
+        editor.Focus();
+        var doc = editor.Document;
+        if (doc.LineCount < 2) return;
+        var selection = editor.TextArea.Selection;
+        var caretOffset = editor.TextArea.Caret.Offset;
+
+        int selStart, selEnd;
+        if (selection.IsEmpty)
+        {
+            selStart = selEnd = caretOffset;
+        }
+        else
+        {
+            var seg = selection.SurroundingSegment;
+            selStart = seg.Offset;
+            selEnd = seg.EndOffset;
+        }
+
+        if (selEnd > selStart)
+            selEnd--;
+
+        // 将选择范围映射到完整的行，确保多行选择/列选择时始终按整行移动。
+        var firstLine = doc.GetLineByOffset(selStart);
+        var lastLine = doc.GetLineByOffset(selEnd);
+        if (lastLine.LineNumber >= doc.LineCount) return;
+
+        var nextLine = doc.GetLineByNumber(lastLine.LineNumber + 1);
+
+        int blockStart = firstLine.Offset;
+        int blockEnd = lastLine.LineNumber == doc.LineCount
+            ? doc.TextLength
+            : doc.GetLineByNumber(lastLine.LineNumber + 1).Offset;
+
+        int nextStart = nextLine.Offset;
+        int nextEnd = nextLine.LineNumber == doc.LineCount
+            ? doc.TextLength
+            : doc.GetLineByNumber(nextLine.LineNumber + 1).Offset;
+
+        int segmentStart = blockStart;
+        int segmentEnd = nextEnd;
+        int segmentLength = segmentEnd - segmentStart;
+
+        var blockText = doc.GetText(blockStart, blockEnd - blockStart);
+        var nextText = doc.GetText(nextStart, nextEnd - nextStart);
+
+        var newText = nextText + blockText;
+
+        // 防御性检查：若计算出的范围超出文档长度或长度为 0，则放弃本次移动。
+        if (segmentStart < 0 || segmentLength <= 0 || segmentStart + segmentLength > doc.TextLength)
+            return;
+        if (string.IsNullOrEmpty(newText))
+            return;
+
+        doc.Replace(segmentStart, segmentLength, newText);
+
+        int newBlockStart = segmentStart + nextText.Length;
+        if (selection.IsEmpty)
+        {
+            int caretRel = caretOffset - blockStart;
+            caretRel = Math.Clamp(caretRel, 0, blockText.Length);
+            editor.TextArea.Caret.Offset = newBlockStart + caretRel;
+        }
+        else
+        {
+            editor.Select(newBlockStart, blockText.Length);
+        }
+    }
+
+    private async System.Threading.Tasks.Task DoOpenFileAsync(MainViewModel vm)
+    {
+        var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
+        {
+            Title = "打开 Markdown 文件",
+            AllowMultiple = false,
+            FileTypeFilter = [new FilePickerFileType("Markdown") { Patterns = ["*.md"] }]
+        });
+        if (files.Count > 0 && files[0].TryGetLocalPath() is { } path)
+            vm.OpenDocument(path);
+    }
+
+    private async System.Threading.Tasks.Task DoOpenFolderAsync(MainViewModel vm)
+    {
+        var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+        {
+            Title = "选择 Markdown 文档所在文件夹",
+            AllowMultiple = false
+        });
+        if (folders.Count > 0 && folders[0].TryGetLocalPath() is { } path)
+            vm.LoadFolder(path);
+    }
+
+    private async System.Threading.Tasks.Task DoSaveAsAsync(MainViewModel vm)
+    {
+        var file = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
+        {
+            Title = "另存为",
+            DefaultExtension = "md",
+            FileTypeChoices = [new FilePickerFileType("Markdown") { Patterns = ["*.md"] }]
+        });
+        if (file != null && file.TryGetLocalPath() is { } path)
+            vm.SaveToPath(path);
+    }
+
+    private async System.Threading.Tasks.Task DoExportAsync(MainViewModel vm, string formatId)
+    {
+        if (vm.CurrentMarkdown == null)
+        {
+            var msg = new Window
+            {
+                Title = "导出",
+                Width = 360,
+                Height = 100,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner
+            };
+            var closeBtn = new Button { Content = "确定", HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Right };
+            closeBtn.Click += (_, _) => msg.Close();
+            msg.Content = new StackPanel { Margin = new Thickness(16), Spacing = 12, Children = { new TextBlock { Text = "当前无内容可导出。请先打开或编辑文档。", TextWrapping = TextWrapping.Wrap }, closeBtn } };
+            await msg.ShowDialog(this);
+            return;
+        }
+        var (success, errorMessage) = await _exportService.ExportWithDialogAsync(vm, formatId, StorageProvider);
+        if (success == false && !string.IsNullOrEmpty(errorMessage))
+        {
+            var msg = new Window
+            {
+                Title = "导出失败",
+                Width = 380,
+                Height = 140,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner
+            };
+            var okButton = new Button { Content = "确定", HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Right };
+            okButton.Click += (_, _) => msg.Close();
+            msg.Content = new StackPanel
+            {
+                Margin = new Thickness(16),
+                Spacing = 12,
+                Children = { new TextBlock { Text = errorMessage, TextWrapping = TextWrapping.Wrap }, okButton }
+            };
+            await msg.ShowDialog(this);
+        }
+    }
+
+    private async System.Threading.Tasks.Task ConfirmCloseCurrentEditorAsync(MainViewModel vm)
+    {
+        if (!vm.IsModified || vm.ActiveDocument == null)
+        {
+            vm.CloseDocument(vm.ActiveDocument);
+            return;
+        }
+        var dialog = new ConfirmCloseWindow();
+        await dialog.ShowDialog(this);
+        if (dialog.Result == ConfirmCloseResult.Save)
+        {
+            if (string.IsNullOrEmpty(vm.CurrentFilePath))
+                await DoSaveAsAsync(vm);
+            else
+                vm.SaveCurrent();
+            vm.CloseDocument(vm.ActiveDocument);
+        }
+        else if (dialog.Result == ConfirmCloseResult.Discard)
+            vm.CloseDocument(vm.ActiveDocument);
+    }
+
+    private async System.Threading.Tasks.Task ConfirmExitAsync(MainViewModel vm)
+    {
+        if (!vm.IsModified)
+        {
+            _isClosingProgrammatically = true;
+            Close();
+            return;
+        }
+        var dialog = new ConfirmCloseWindow();
+        await dialog.ShowDialog(this);
+        if (dialog.Result == ConfirmCloseResult.Save)
+        {
+            if (string.IsNullOrEmpty(vm.CurrentFilePath))
+                await DoSaveAsAsync(vm);
+            else
+                vm.SaveCurrent();
+        }
+        if (dialog.Result != ConfirmCloseResult.Cancel)
+        {
+            _isClosingProgrammatically = true;
+            Close();
+        }
+    }
+
+    private void SetupSearchResultsNavigation(MainViewModel vm)
+    {
+        vm.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName != nameof(MainViewModel.SelectedSearchResult) || vm.SelectedSearchResult == null)
+                return;
+            if (EditorTextBox is TextEditor ed)
+                vm.PushBack(vm.CurrentFilePath ?? "", ed.TextArea.Caret.Offset);
+            NavigateToSearchResult(vm.SelectedSearchResult);
+        };
+    }
+
+    private void SearchResultFileHeader_OnClick(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not Control c || c.DataContext is not SearchResultGroup group)
+            return;
+        group.IsExpanded = !group.IsExpanded;
+    }
+
+    private void SearchResultLine_OnClick(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not Control c || c.DataContext is not SearchResultItem item || DataContext is not MainViewModel vm)
+            return;
+        if (EditorTextBox is TextEditor ed)
+            vm.PushBack(vm.CurrentFilePath ?? "", ed.TextArea.Caret.Offset);
+        vm.SelectedSearchResult = item;
+    }
+
+    private void FocusSearch(MainViewModel vm)
+    {
+        vm.IsSearchActive = true;
+        UpdateActivityBarHighlight(vm);
+        Dispatcher.UIThread.Post(() =>
+        {
+            try { SearchQueryTextBox?.Focus(); }
+            catch { }
+        }, DispatcherPriority.Loaded);
     }
 
     private void ApplyLayout(EditorLayoutMode mode)

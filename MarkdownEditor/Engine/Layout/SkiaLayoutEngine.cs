@@ -1,6 +1,9 @@
+using System.Collections.Generic;
 using System.Text;
 using MarkdownEditor.Core;
+using MarkdownEditor.Engine;
 using MarkdownEditor.Engine.Document;
+using MarkdownEditor.Engine.Highlighting;
 using MarkdownEditor.Engine.Render;
 using SkiaSharp;
 using System.IO;
@@ -19,21 +22,33 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
     private readonly float _baseFontSize;
     private readonly float _lineSpacing;
     private readonly float _paraSpacing;
+    private readonly float _codeBlockPadding;
+    private readonly float _blockInnerPadding;
+    private readonly float _blockquotePadding;
+    private readonly float _blockquoteIndent;
+    private readonly float _listItemIndent;
+    private readonly float _listBlockMarginTop;
+    private readonly float _listBlockMarginBottom;
+    private readonly float _listItemGap;
+    private readonly float _footnoteTopMargin;
+    private readonly float _definitionListIndent;
     private readonly IImageLoader _imageLoader;
+    private readonly ITextMeasurer? _tableTextMeasurer;
+    private readonly SKPaint _measurePaint = new();
     private SKTypeface? _bodyTypeface;
     private SKFont? _fontCache;
     private SKFont? _boldFontCache;
     private SKFont? _italicFontCache;
     private SKFont? _codeFontCache;
     private SKTypeface? _mathTypeface;
-    private IReadOnlyList<string>? _currentFootnoteRefOrder;
 
     public bool RequiresRelayoutOnWidthChange => true;
 
-    public SkiaLayoutEngine(EngineConfig? config = null, IImageLoader? imageLoader = null)
+    public SkiaLayoutEngine(EngineConfig? config = null, IImageLoader? imageLoader = null, ITextMeasurer? tableTextMeasurer = null)
     {
         config ??= new EngineConfig();
         _imageLoader = imageLoader ?? new DefaultImageLoader();
+        _tableTextMeasurer = tableTextMeasurer;
         _bodyFontFamily = config.BodyFontFamily;
         _codeFontFamily = config.CodeFontFamily;
         _mathFontFamily = config.MathFontFamily;
@@ -41,9 +56,19 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
         _baseFontSize = config.BaseFontSize;
         _lineSpacing = config.LineSpacing;
         _paraSpacing = config.ParaSpacing;
+        _codeBlockPadding = config.CodeBlockPadding;
+        _blockInnerPadding = config.BlockInnerPadding;
+        _blockquotePadding = config.BlockquotePadding;
+        _blockquoteIndent = config.BlockquoteIndent;
+        _listItemIndent = config.ListItemIndent;
+        _listBlockMarginTop = config.ListBlockMarginTop;
+        _listBlockMarginBottom = config.ListBlockMarginBottom;
+        _listItemGap = config.ListItemGap;
+        _footnoteTopMargin = config.FootnoteTopMargin;
+        _definitionListIndent = config.DefinitionListIndent;
     }
 
-    public SkiaLayoutEngine(SKTypeface? typeface, float baseFontSize = 16, float lineSpacing = 1.4f, float paraSpacing = 8f)
+    public SkiaLayoutEngine(SKTypeface? typeface, float baseFontSize = 16, float lineSpacing = 1.35f, float paraSpacing = 8f)
         : this(new EngineConfig { BaseFontSize = baseFontSize, LineSpacing = lineSpacing, ParaSpacing = paraSpacing })
     {
         if (typeface != null)
@@ -136,9 +161,8 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
         return _fontCache ??= new SKFont(body, _baseFontSize);
     }
 
-    public LayoutBlock Layout(MarkdownNode node, float width, int blockIndex, int startLine, int endLine, IReadOnlyList<string>? footnoteRefOrder = null)
+    public LayoutBlock Layout(MarkdownNode node, float width, int blockIndex, int startLine, int endLine)
     {
-        _currentFootnoteRefOrder = footnoteRefOrder;
         var block = new LayoutBlock { BlockIndex = blockIndex, StartLine = startLine, EndLine = endLine };
         float x = 0, y = 0;
 
@@ -155,6 +179,7 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
                 LayoutCodeBlock(block, c, width, ref x, ref y);
                 break;
             case HorizontalRuleNode:
+                block.Kind = BlockKind.HorizontalRule;
                 LayoutHorizontalRule(block, width, ref x, ref y);
                 break;
             case MathBlockNode m:
@@ -181,8 +206,14 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
                 break;
             case FootnoteDefNode:
                 break;
+            case FootnoteSectionNode fs:
+                block.Kind = BlockKind.Footnotes;
+                LayoutFootnoteSectionBlock(block, fs, width, blockIndex, ref x, ref y);
+                break;
             case EmptyLineNode el:
-                y += _baseFontSize * _lineSpacing * Math.Max(1, el.LineCount - 1);
+                // 多空行最多显示 2 个
+                int emptyLines = Math.Min(el.LineCount, 2);
+                y += _baseFontSize * _lineSpacing * emptyLines;
                 break;
             default:
                 block.Bounds = new SKRect(0, 0, width, _baseFontSize * _lineSpacing);
@@ -193,39 +224,36 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
         return block;
     }
 
-    public LayoutBlock LayoutFootnoteSection(IReadOnlyList<string> refOrder, IReadOnlyDictionary<string, FootnoteDefNode> defs, IReadOnlyDictionary<string, List<(int blockIndex, int charOffset)>> refPositionsById, float width, int blockIndex)
+    private void LayoutFootnoteSectionBlock(LayoutBlock block, FootnoteSectionNode section, float width, int blockIndex, ref float x, ref float y)
     {
-        var block = new LayoutBlock { BlockIndex = blockIndex, Kind = BlockKind.Footnotes };
-        if (refOrder.Count == 0)
-        {
-            block.Bounds = new SKRect(0, 0, width, 0);
-            return block;
-        }
         var lineH = _baseFontSize * _lineSpacing;
-        var font = GetFont(false, false, false);
-        using var paint = new SKPaint { Typeface = font.Typeface, TextSize = font.Size };
-        var spaceWidth = paint.MeasureText(" ");
+        // 使用与正文一致的字体/字号测量，避免箭头 run 宽度偏大导致可点击区域覆盖到左侧文字
+        var paint = _measurePaint;
+        paint.Typeface = GetBodyTypeface();
+        paint.TextSize = _baseFontSize;
+        var spaceW = paint.MeasureText(" ");
+        // 与旧实现保持一致：脚注区前留出一段间距，使其与正文分隔更明显（分隔线仍在 y=0 绘制）。
+        y += _footnoteTopMargin;
         // 顶部留白（分隔线由 DrawFootnotesStyle 在 y=0 绘制），然后开始列表
-        float y = lineH * 0.8f;
+        y += lineH * 0.8f;
         int charOffset = 0;
-        var fnIndent = BlockInnerPadding + 24f;
-        const string backArrow = " \u2191 "; // ↑ 回顶，带间距避免过窄；↩ 在部分字体下为方框故改用 ↑
-        for (int i = 0; i < refOrder.Count; i++)
+        var fnIndent = _blockInnerPadding + _definitionListIndent;
+        const string backArrow = "\u2191"; // ↑ 回顶符号，作为特殊符号放在本条脚注文末（多引用时每条脚注一个 ↑）
+        for (int i = 0; i < section.Items.Count; i++)
         {
-            var id = refOrder[i];
-            if (!defs.TryGetValue(id, out var fn))
-                continue;
-            var num = (i + 1).ToString();
+            var item = section.Items[i];
+            var id = item.Id;
+            var num = item.Number.ToString();
             var prefix = num + ". ";
             int lineCountBefore = block.Lines.Count;
-            foreach (var child in fn.Content)
+            foreach (var child in item.Content)
             {
                 if (child is ParagraphNode p)
                 {
                     var content = FlattenInlinesForFootnote(p.Content);
                     var fullText = prefix + content;
                     prefix = "";
-                    var segments = BreakTextWithWrap(fullText, width - fnIndent - BlockInnerPadding, paint);
+                    var segments = BreakTextWithWrap(fullText, width - fnIndent - _blockInnerPadding, paint);
                     foreach (var seg in segments)
                     {
                         var textW = paint.MeasureText(seg);
@@ -237,37 +265,29 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
                     }
                 }
             }
-            if (refPositionsById != null && refPositionsById.TryGetValue(id, out var positions) && positions.Count > 0)
+            if (lineCountBefore != block.Lines.Count)
             {
-                LayoutLine targetLine;
-                float x;
-                if (block.Lines.Count > lineCountBefore)
-                {
-                    targetLine = block.Lines[^1];
-                    x = targetLine.Runs.Count > 0
-                        ? targetLine.Runs[^1].Bounds.Right + spaceWidth
-                        : fnIndent;
-                }
-                else
-                {
-                    targetLine = new LayoutLine { Y = y, Height = lineH };
-                    block.Lines.Add(targetLine);
-                    x = fnIndent;
-                    y += lineH;
-                }
+                // “↑”作为文末特殊符号追加在最后一行尾部，不单独占行；多引用时每条脚注仍只放一个 ↑（点后回正文首次引用处）。
+                var lastLine = block.Lines[^1];
                 var arrowW = paint.MeasureText(backArrow);
-                foreach (var (bi, co) in positions)
-                {
-                    var linkUrl = "footnote-back:" + bi + ":" + co;
-                    targetLine.Runs.Add(new LayoutRun(backArrow, new SKRect(x, targetLine.Y, x + arrowW, targetLine.Y + lineH), RunStyle.Link, blockIndex, charOffset, linkUrl));
-                    x += arrowW + spaceWidth * 0.5f;
-                    charOffset += backArrow.Length;
-                }
+                float runX = lastLine.Runs.Count > 0
+                    ? lastLine.Runs[^1].Bounds.Right + spaceW
+                    : fnIndent;
+                var linkUrl = "footnote-back:" + id;
+                lastLine.Runs.Add(
+                    new LayoutRun(
+                        backArrow,
+                        new SKRect(runX, lastLine.Y, runX + arrowW, lastLine.Y + lineH),
+                        RunStyle.Link,
+                        blockIndex,
+                        charOffset,
+                        linkUrl
+                    )
+                );
+                charOffset += backArrow.Length;
             }
             y += lineH * 0.6f;
         }
-        block.Bounds = new SKRect(0, 0, width, y);
-        return block;
     }
 
     private static string FlattenInlinesForFootnote(List<InlineNode> content)
@@ -282,6 +302,7 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
             else if (n is LinkNode ln) sb.Append(ln.Text);
             else if (n is StrikethroughNode sn) sb.Append(FlattenInlinesForFootnote(sn.Content));
             else if (n is FootnoteRefNode fn) sb.Append("[^" + fn.Id + "]");
+            else if (n is FootnoteMarkerNode fm) sb.Append("[" + fm.Number + "]");
         }
         return sb.ToString();
     }
@@ -291,15 +312,17 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
         var fontSize = h.Level switch { 1 => 28, 2 => 24, 3 => 20, 4 => 18, 5 => 16, _ => 14 };
         var plain = FlattenInlines(h.Content);
         var font = new SKFont(SKTypeface.FromFamilyName(GetBodyTypeface().FamilyName, SKFontStyle.Bold), fontSize);
-        using var paint = new SKPaint { Typeface = font.Typeface, TextSize = font.Size };
+        var paint = _measurePaint;
+        paint.Typeface = font.Typeface;
+        paint.TextSize = font.Size;
         var lineH = fontSize * _lineSpacing;
-        var innerW = width - BlockInnerPadding * 2;
+        var innerW = width - _blockInnerPadding * 2;
         var segments = BreakTextWithWrap(plain, innerW, paint);
         foreach (var seg in segments)
         {
             var line = new LayoutLine { Y = y, Height = lineH };
             var headingStyle = (RunStyle)((int)RunStyle.Heading1 + Math.Clamp(h.Level, 1, 6) - 1);
-            line.Runs.Add(new LayoutRun(seg, new SKRect(BlockInnerPadding, y, width - BlockInnerPadding, y + lineH), headingStyle, block.BlockIndex, 0));
+            line.Runs.Add(new LayoutRun(seg, new SKRect(_blockInnerPadding, y, width - _blockInnerPadding, y + lineH), headingStyle, block.BlockIndex, 0));
             block.Lines.Add(line);
             y += lineH;
         }
@@ -308,8 +331,8 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
 
     private void LayoutParagraph(LayoutBlock block, ParagraphNode p, float width, ref float x, ref float y, float leftMargin = 0f)
     {
-        var innerLeft = leftMargin > 0 ? leftMargin : BlockInnerPadding;
-        var innerWidth = width - innerLeft - (leftMargin > 0 ? 0 : BlockInnerPadding);
+        var innerLeft = leftMargin > 0 ? leftMargin : _blockInnerPadding;
+        var innerWidth = width - innerLeft - (leftMargin > 0 ? 0 : _blockInnerPadding);
 
         // 仅包含单个图片的段落：单独一行、本身尺寸
         if (p.Content.Count == 1 && p.Content[0] is ImageNode imgNode)
@@ -349,29 +372,12 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
             y += _paraSpacing;
             return;
         }
-        var fullText = string.Concat(runs.Select(r => r.text));
-        var font = GetFont(false, false, false);
-        using var paint = new SKPaint { Typeface = font.Typeface, TextSize = font.Size };
-        var lineSegments = BreakTextIntoLinesWithOffsets(fullText, innerWidth, paint);
-        foreach (var (lineStr, lineStart, lineEnd) in lineSegments)
+
+        var paint = _measurePaint;
+        var wrappedLines = BreakInlineRunsIntoLines(runs, innerWidth, paint);
+        foreach (var lineRuns in wrappedLines)
         {
-            var lineRuns = new List<(string text, RunStyle style, string? linkUrl, string? footnoteRefId)>();
-            int runOffset = 0;
-            foreach (var (text, style, linkUrl, footnoteRefId) in runs)
-            {
-                int runEnd = runOffset + text.Length;
-                if (runEnd <= lineStart) { runOffset = runEnd; continue; }
-                if (runOffset >= lineEnd) break;
-                int oStart = Math.Max(runOffset, lineStart);
-                int oEnd = Math.Min(runEnd, lineEnd);
-                var seg = text[(oStart - runOffset)..(oEnd - runOffset)];
-                lineRuns.Add((seg, style, linkUrl, footnoteRefId));
-                runOffset = runEnd;
-                if (runOffset >= lineEnd) break;
-            }
-            int offset = totalCharOffset + lineStart;
-            FlushParagraphLine(block, lineRuns, lineH, ref y, block.BlockIndex, ref offset, innerLeft);
-            totalCharOffset = offset;
+            FlushParagraphLine(block, lineRuns, lineH, ref y, block.BlockIndex, ref totalCharOffset, innerLeft);
         }
         y += _paraSpacing;
     }
@@ -386,7 +392,9 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
         {
             float w;
             var font = GetFont(style == RunStyle.Bold, style == RunStyle.Italic, style == RunStyle.Code);
-            using var paint = new SKPaint { Typeface = font.Typeface, TextSize = font.Size };
+            var paint = _measurePaint;
+            paint.Typeface = font.Typeface;
+            paint.TextSize = font.Size;
             w = paint.MeasureText(text);
             line.Runs.Add(new LayoutRun(text, new SKRect(x, y, x + w, y + lineH), style, blockIndex, offset, linkUrl, null, footnoteRefId));
             offset += text.Length;
@@ -428,14 +436,21 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
             else if (style == RunStyle.Image)
             {
                 var font = GetFont(false, false, false);
-                using var paint = new SKPaint { Typeface = font.Typeface, TextSize = font.Size };
+                var paint = _measurePaint;
+                paint.Typeface = font.Typeface;
+                paint.TextSize = font.Size;
                 w = Math.Max(120, Math.Min(400, paint.MeasureText(text) + 24));
             }
             else
             {
                 var font = GetFont(style == RunStyle.Bold, style == RunStyle.Italic, style == RunStyle.Code);
-                using var paint = new SKPaint { Typeface = font.Typeface, TextSize = font.Size };
+                var paint = _measurePaint;
+                paint.Typeface = font.Typeface;
+                paint.TextSize = font.Size;
                 w = paint.MeasureText(text);
+                // 待办复选框 run 保证最小命中宽度，与绘制的小方框一致，避免误触到右侧链接
+                if (linkUrl != null && linkUrl.StartsWith("todo-toggle:", StringComparison.Ordinal))
+                    w = Math.Max(w, 22f);
             }
             line.Runs.Add(new LayoutRun(text, new SKRect(x, y, x + w, y + actualLineH), style, blockIndex, offset, linkUrl, null, footnoteRefId));
             offset += text.Length;
@@ -447,9 +462,9 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
 
     private void LayoutImageBlock(LayoutBlock block, ImageNode img, float width, ref float x, ref float y, float leftMargin = 0f)
     {
-        var availW = width - (leftMargin > 0 ? leftMargin : BlockInnerPadding) - BlockInnerPadding - 8f;
+        var availW = width - (leftMargin > 0 ? leftMargin : _blockInnerPadding) - _blockInnerPadding - 8f;
         var (targetWidth, targetHeight) = GetImageIntrinsicSize(img.Url ?? "", Math.Max(80f, availW));
-        var left = leftMargin > 0 ? leftMargin : BlockInnerPadding;
+        var left = leftMargin > 0 ? leftMargin : _blockInnerPadding;
         var line = new LayoutLine { Y = y, Height = targetHeight };
         var rect = new SKRect(left, y, left + targetWidth, y + targetHeight);
         line.Runs.Add(new LayoutRun(img.Alt ?? "", rect, RunStyle.Image, block.BlockIndex, 0, img.Url));
@@ -478,7 +493,7 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
     }
 
     /// <summary>
-    /// Markdown 换行规则：单个 \n 不换行（当空格）；行尾两空格+换行 "  \n" 为硬换行；空行在块级已处理。
+    /// Markdown 换行规则：单个 \n 渲染为换行；连续多个 \n 最多显示 2 个（即最多 1 个空行）；"  \n" 与 "\" + 换行为硬换行。
     /// 支持 CJK 的断行，西文优先在空格处断。
     /// 返回 (行内容, 在原文中的起始索引, 在原文中的结束索引)
     /// </summary>
@@ -488,8 +503,7 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
         var result = new List<(string, int, int)>();
         var effectiveMaxWidth = maxWidth <= 0 ? float.MaxValue : maxWidth;
 
-        // 按 Markdown 规则切分逻辑行：
-        // 1) "  \n" 行尾两空格+换行 = 硬换行  2) "\" + 换行 = 硬换行  3) 单个 \n = 软换行，当空格
+        // 按 Markdown 规则切分逻辑行：单 \n = 换行；连续 \n 最多 2 个（1 个空行）；"  \n" / "\" + \n = 硬换行
         var logicalLines = new List<(string content, int origStart, int origEnd)>();
         var sb = new StringBuilder();
         int origStart = 0;
@@ -512,8 +526,19 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
             }
             else if (text[i] == '\n')
             {
-                sb.Append(' ');
+                logicalLines.Add((sb.ToString().TrimEnd(), origStart, i));
+                sb.Clear();
+                origStart = i + 1;
                 i++;
+                // 连续 \n 最多显示 2 个（即最多 1 个空行）
+                if (i < text.Length && text[i] == '\n')
+                {
+                    int runStart = i;
+                    while (i < text.Length && text[i] == '\n')
+                        i++;
+                    logicalLines.Add(("", runStart - 1, i));
+                    origStart = i;
+                }
             }
             else
             {
@@ -548,7 +573,11 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
 
     private static List<string> BreakTextWithWrap(string text, float maxWidth, SKPaint paint)
     {
-        return BreakTextIntoLinesWithOffsets(text, maxWidth, paint).Select(t => t.line).ToList();
+        var withOffsets = BreakTextIntoLinesWithOffsets(text, maxWidth, paint);
+        var list = new List<string>(withOffsets.Count);
+        for (int i = 0; i < withOffsets.Count; i++)
+            list.Add(withOffsets[i].line);
+        return list;
     }
 
     private static int FindBreakEnd(string text, int start, float maxWidth, SKPaint paint)
@@ -579,7 +608,18 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
     }
 
     /// <summary>``` 代码块：内部文字与框边缘留出间隙，不贴边。</summary>
-    private const float CodeBlockPadding = 16f;
+
+    private static RunStyle TokenKindToRunStyle(CodeTokenKind kind)
+    {
+        return kind switch
+        {
+            CodeTokenKind.Keyword => RunStyle.CodeKeyword,
+            CodeTokenKind.String => RunStyle.CodeString,
+            CodeTokenKind.Comment => RunStyle.CodeComment,
+            CodeTokenKind.Number => RunStyle.CodeNumber,
+            _ => RunStyle.CodeDefault,
+        };
+    }
 
     private void LayoutCodeBlock(LayoutBlock block, CodeBlockNode c, float width, ref float x, ref float y)
     {
@@ -587,22 +627,49 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
         var lineHeight = _baseFontSize * 0.95f * _lineSpacing;
         var lines = c.Code.Split('\n');
         int charOffset = 0;
+        var language = c.Language ?? "";
 
-        y += CodeBlockPadding;
-        var left = CodeBlockPadding;
-        var right = width - CodeBlockPadding;
+        y += _codeBlockPadding;
+        var left = _codeBlockPadding;
+        var right = width - _codeBlockPadding;
 
         foreach (var codeLine in lines)
         {
-            var run = new LayoutRun(codeLine, new SKRect(left, y, right, y + lineHeight), RunStyle.Code, block.BlockIndex, charOffset);
             var layoutLine = new LayoutLine { Y = y, Height = lineHeight };
-            layoutLine.Runs.Add(run);
+            var spansRaw = CodeTokenizer.TokenizeLine(language, codeLine);
+            IReadOnlyList<CodeTokenizer.TokenSpan> spans = (spansRaw.Count == 0 && codeLine.Length > 0)
+                ? new List<CodeTokenizer.TokenSpan> { new CodeTokenizer.TokenSpan(0, codeLine.Length, CodeTokenKind.Default) }
+                : spansRaw;
+            float runX = left;
+
+            foreach (var span in spans)
+            {
+                var tokenText = span.Length > 0 && span.Start + span.Length <= codeLine.Length
+                    ? codeLine.Substring(span.Start, span.Length)
+                    : "";
+                if (string.IsNullOrEmpty(tokenText)) continue;
+
+                using var measurePaint = new SKPaint { Typeface = font.Typeface, TextSize = font.Size };
+                var tokenWidth = measurePaint.MeasureText(tokenText);
+                var runBounds = new SKRect(runX, y, runX + tokenWidth, y + lineHeight);
+                var runStyle = TokenKindToRunStyle(span.Kind);
+                layoutLine.Runs.Add(new LayoutRun(tokenText, runBounds, runStyle, block.BlockIndex, charOffset));
+                runX += tokenWidth;
+                charOffset += span.Length;
+            }
+
             block.Lines.Add(layoutLine);
             y += lineHeight;
-            charOffset += codeLine.Length + 1; // +1 for \n
+            charOffset += 1; // \n
         }
 
-        y += CodeBlockPadding;
+        float blockContentWidth = left;
+        foreach (var line in block.Lines)
+            foreach (var run in line.Runs)
+                if (run.Bounds.Right > blockContentWidth) blockContentWidth = run.Bounds.Right;
+        block.ContentWidth = blockContentWidth + _codeBlockPadding;
+
+        y += _codeBlockPadding;
         y += _paraSpacing;
     }
 
@@ -650,13 +717,16 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
         var lines = raw.Split('\n');
         int charOffset = 0;
 
-        y += CodeBlockPadding;
-        var left = CodeBlockPadding;
-        var right = width - CodeBlockPadding;
+        y += _codeBlockPadding;
+        var left = _codeBlockPadding;
+        var right = width - _codeBlockPadding;
 
         foreach (var codeLine in lines)
         {
-            var run = new LayoutRun(codeLine, new SKRect(left, y, right, y + lineHeight), RunStyle.Code, block.BlockIndex, charOffset);
+            using var measurePaint = new SKPaint { Typeface = font.Typeface, TextSize = font.Size };
+            float lineW = measurePaint.MeasureText(codeLine);
+            float runRight = left + lineW;
+            var run = new LayoutRun(codeLine, new SKRect(left, y, runRight, y + lineHeight), RunStyle.Code, block.BlockIndex, charOffset);
             var layoutLine = new LayoutLine { Y = y, Height = lineHeight };
             layoutLine.Runs.Add(run);
             block.Lines.Add(layoutLine);
@@ -664,7 +734,13 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
             charOffset += codeLine.Length + 1;
         }
 
-        y += CodeBlockPadding;
+        float htmlContentWidth = left;
+        foreach (var line in block.Lines)
+            foreach (var run in line.Runs)
+                if (run.Bounds.Right > htmlContentWidth) htmlContentWidth = run.Bounds.Right;
+        block.ContentWidth = htmlContentWidth + _codeBlockPadding;
+
+        y += _codeBlockPadding;
         y += _paraSpacing;
     }
 
@@ -695,6 +771,7 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
             else if (n is ImageNode img) sb.Append("[" + img.Alt + "]");
             else if (n is MathInlineNode math) sb.Append(math.LaTeX ?? "");
             else if (n is FootnoteRefNode fn) sb.Append("[^" + fn.Id + "]");
+            else if (n is FootnoteMarkerNode fm) sb.Append("[" + fm.Number + "]");
         }
         return sb.ToString();
     }
@@ -702,42 +779,82 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
     private void LayoutTable(LayoutBlock block, TableNode t, float width, ref float x, ref float y)
     {
         const float cellPaddingV = 4f;
+        const float cellPaddingH = 8f;
+        const float cellPaddingHRight = 12f; // 右侧留出更大边距，避免文字贴线
         var lineHeight = _baseFontSize * _lineSpacing;
         var colCount = Math.Max(1, t.Headers.Count);
-        var tableWidth = width - BlockInnerPadding * 2;
-        var colWidth = (tableWidth - 1f) / colCount;
+        var tableWidth = Math.Max(1, width - _blockInnerPadding * 2);
 
         var allRows = new List<List<string>> { t.Headers };
         allRows.AddRange(t.Rows);
         var rowCount = allRows.Count;
 
-        var colWidths = new float[colCount];
-        for (int c = 0; c < colCount; c++)
-            colWidths[c] = colWidth;
-        var rowHeights = new float[rowCount];
+        var paint = _measurePaint;
 
-        // 先根据每一行中是否包含数学公式，预估每行所需的高度，避免表格内公式被裁切。
+        // 1) 按内容计算列宽：每列取该列所有单元格内容宽度上限（封顶、保底），再归一化到 tableWidth
+        const float minColWidth = 32f;
+        var maxColWidth = tableWidth * 0.55f;
+        var desiredWidths = new float[colCount];
+        for (int c = 0; c < colCount; c++)
+            desiredWidths[c] = minColWidth;
         for (int r = 0; r < rowCount; r++)
         {
-            float rowHeight = lineHeight + cellPaddingV * 2;
             var row = allRows[r];
-            foreach (var cell in row)
+            for (int c = 0; c < colCount; c++)
             {
-                if (string.IsNullOrWhiteSpace(cell))
-                    continue;
-                var inlinesForHeight = MarkdownParser.ParseInline(cell);
-                foreach (var n in inlinesForHeight)
+                var cellText = c < row.Count ? (row[c] ?? "") : "";
+                var runs = GetCellRuns(cellText);
+                float w = 0;
+                bool isHeader = r == 0;
+                foreach (var (text, style, _) in runs)
+                {
+                    if (string.IsNullOrEmpty(text)) continue;
+                    var effectiveStyle = GetEffectiveTableRunStyleForMeasure(style, isHeader);
+                    w += MeasureTableRun(text, effectiveStyle, paint);
+                }
+                // 列宽需包含左右 padding，避免归一化后 innerW 不足导致文字超出右边界
+                w = Math.Min(maxColWidth, Math.Max(w + cellPaddingH + cellPaddingHRight, minColWidth));
+                if (w > desiredWidths[c]) desiredWidths[c] = w;
+            }
+        }
+        float sumDesired = 0;
+        for (int c = 0; c < colCount; c++) sumDesired += desiredWidths[c];
+        var colWidths = new float[colCount];
+        if (sumDesired > 0)
+        {
+            for (int c = 0; c < colCount; c++)
+                colWidths[c] = desiredWidths[c] * (tableWidth / sumDesired);
+        }
+        else
+        {
+            for (int c = 0; c < colCount; c++)
+                colWidths[c] = (tableWidth - 1f) / colCount;
+        }
+
+        // 2) 按换行后的行数计算每行高度（含公式额外高度）
+        var rowHeights = new float[rowCount];
+        for (int r = 0; r < rowCount; r++)
+        {
+            var row = allRows[r];
+            float rowH = lineHeight + cellPaddingV * 2;
+            for (int c = 0; c < colCount; c++)
+            {
+                var cellText = c < row.Count ? (row[c] ?? "") : "";
+                var innerW = Math.Max(0, colWidths[c] - cellPaddingH - cellPaddingHRight);
+                var runs = GetCellRuns(cellText);
+                var lines = BreakRunsIntoLines(runs, innerW, paint, r == 0, _tableTextMeasurer);
+                float cellH = cellPaddingV * 2 + lines.Count * lineHeight;
+                foreach (var n in MarkdownParser.ParseInline(cellText))
                 {
                     if (n is MathInlineNode math && !string.IsNullOrWhiteSpace(math.LaTeX))
                     {
                         var (_, h, d) = MeasureMathMetrics(math.LaTeX);
-                        var needed = (h + d) + cellPaddingV * 2;
-                        if (needed > rowHeight)
-                            rowHeight = needed;
+                        cellH = Math.Max(cellH, (h + d) + cellPaddingV * 2);
                     }
                 }
+                if (cellH > rowH) rowH = cellH;
             }
-            rowHeights[r] = rowHeight;
+            rowHeights[r] = rowH;
         }
 
         block.TableInfo = new TableLayoutInfo
@@ -748,12 +865,8 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
             RowCount = rowCount
         };
 
-        const float cellPaddingH = 8f;
         int charOffset = 0;
-        var left = BlockInnerPadding;
-        var font = GetFont(false, false, false);
-        using var paint = new SKPaint { Typeface = font.Typeface, TextSize = font.Size };
-
+        var left = _blockInnerPadding;
         for (int r = 0; r < rowCount; r++)
         {
             var row = allRows[r];
@@ -769,56 +882,51 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
                 var cellW = colWidths[c];
                 var cellRight = cellX + cellW;
                 var innerLeft = cellLeft + cellPaddingH;
-                var innerRight = cellRight - cellPaddingH;
+                var innerRight = cellRight - cellPaddingHRight;
                 var innerW = Math.Max(0, innerRight - innerLeft);
 
-                var inlines = MarkdownParser.ParseInline(cellText);
-                var runs = new List<(string text, RunStyle style, string? linkUrl)>();
-                foreach (var n in inlines)
-                {
-                    var (text, style, linkUrl, _) = FlattenInline(n);
-                    if (string.IsNullOrEmpty(text)) continue;
-                    if (style == RunStyle.Image) continue;
-                    if (style == RunStyle.Math)
-                        runs.Add((text, RunStyle.Math, null));
-                    else
-                        runs.Add((text, style == RunStyle.Bold ? RunStyle.Bold : style == RunStyle.Italic ? RunStyle.Italic : style == RunStyle.Link ? RunStyle.Link : RunStyle.Normal, linkUrl));
-                }
-                if (runs.Count == 0)
+                var runs = GetCellRuns(cellText);
+                var wrappedLines = BreakRunsIntoLines(runs, innerW, paint, isHeader, _tableTextMeasurer);
+                if (wrappedLines.Count == 0)
                 {
                     line.Runs.Add(new LayoutRun("", new SKRect(cellLeft, y, cellRight, y + rowHeight), isHeader ? RunStyle.TableHeaderCell : RunStyle.TableCell, block.BlockIndex, charOffset, null, align));
                     charOffset += 1;
                 }
                 else
                 {
-                    float runX = innerLeft;
-                    float totalW = 0;
-                    foreach (var (text, style, linkUrl) in runs)
+                    for (int lineIndex = 0; lineIndex < wrappedLines.Count; lineIndex++)
                     {
-                        float w = style == RunStyle.Math ? MeasureMathInline(text) : paint.MeasureText(text);
-                        totalW += w;
-                    }
-                    if (align == TableCellAlign.Center)
-                        runX = innerLeft + Math.Max(0, (innerW - totalW) / 2f);
-                    else if (align == TableCellAlign.Right)
-                        runX = innerRight - totalW;
-
-                    foreach (var (text, style, linkUrl) in runs)
-                    {
-                        float w = style == RunStyle.Math ? MeasureMathInline(text) : paint.MeasureText(text);
-                        var runStyle = isHeader ? RunStyle.TableHeaderCell : RunStyle.TableCell;
-                        if (style == RunStyle.Math)
-                            runStyle = RunStyle.Math;
-                        else if (style == RunStyle.Link)
-                            runStyle = RunStyle.Link;
-                        else if (style == RunStyle.Bold)
-                            runStyle = RunStyle.Bold;
-                        else if (style == RunStyle.Italic)
-                            runStyle = RunStyle.Italic;
-                        var rect = new SKRect(runX, y + cellPaddingV, runX + w, y + rowHeight - cellPaddingV);
-                        line.Runs.Add(new LayoutRun(text, rect, runStyle, block.BlockIndex, charOffset, linkUrl, align));
-                        runX += w;
-                        charOffset += text.Length;
+                        var runList = wrappedLines[lineIndex];
+                        float lineY = y + cellPaddingV + lineIndex * lineHeight;
+                        float totalLineW = 0;
+                        foreach (var (text, style, _) in runList)
+                        {
+                            if (string.IsNullOrEmpty(text)) continue;
+                            var effectiveStyle = GetEffectiveTableRunStyleForMeasure(style, isHeader);
+                            totalLineW += MeasureTableRun(text, effectiveStyle, paint);
+                        }
+                        float runX = align == TableCellAlign.Center
+                            ? innerLeft + Math.Max(0, (innerW - totalLineW) / 2f)
+                            : align == TableCellAlign.Right
+                                ? innerRight - totalLineW
+                                : innerLeft;
+                        foreach (var (text, style, linkUrl) in runList)
+                        {
+                            if (string.IsNullOrEmpty(text)) continue;
+                            var effectiveStyle = GetEffectiveTableRunStyleForMeasure(style, isHeader);
+                            float w = MeasureTableRun(text, effectiveStyle, paint);
+                            var runStyle = isHeader ? RunStyle.TableHeaderCell : RunStyle.TableCell;
+                            if (style == RunStyle.Math) runStyle = RunStyle.Math;
+                            else if (style == RunStyle.Link) runStyle = RunStyle.Link;
+                            else if (style == RunStyle.Bold) runStyle = RunStyle.Bold;
+                            else if (style == RunStyle.Italic) runStyle = RunStyle.Italic;
+                            // 将 run 右边界钳位到单元格内边界，防止舍入误差导致文字超出右边线
+                            var runRight = Math.Min(runX + w, innerRight);
+                            var rect = new SKRect(runX, lineY, runRight, lineY + lineHeight);
+                            line.Runs.Add(new LayoutRun(text, rect, runStyle, block.BlockIndex, charOffset, linkUrl, align));
+                            runX += w;
+                            charOffset += text.Length;
+                        }
                     }
                     charOffset += 1;
                 }
@@ -828,6 +936,338 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
             y += rowHeight;
         }
         y += _paraSpacing;
+    }
+
+    private static List<(string text, RunStyle style, string? linkUrl)> GetCellRuns(string cellText)
+    {
+        var runs = new List<(string text, RunStyle style, string? linkUrl)>();
+        foreach (var n in MarkdownParser.ParseInline(cellText))
+        {
+            var (text, style, linkUrl, _) = FlattenInlineStatic(n);
+            if (string.IsNullOrEmpty(text)) continue;
+            if (style == RunStyle.Image) continue;
+            if (style == RunStyle.Math)
+                runs.Add((text, RunStyle.Math, null));
+            else
+                runs.Add((text, style == RunStyle.Bold ? RunStyle.Bold : style == RunStyle.Italic ? RunStyle.Italic : style == RunStyle.Link ? RunStyle.Link : RunStyle.Normal, linkUrl));
+        }
+        return runs;
+    }
+
+    private static (string text, RunStyle style, string? linkUrl, bool _) FlattenInlineStatic(InlineNode n)
+    {
+        if (n is TextNode t) return (t.Content ?? "", RunStyle.Normal, null, false);
+        if (n is BoldNode b)
+        {
+            var sb = new StringBuilder();
+            foreach (var child in b.Content) { var (txt, _, _, _) = FlattenInlineStatic(child); sb.Append(txt); }
+            return (sb.ToString(), RunStyle.Bold, null, false);
+        }
+        if (n is ItalicNode i)
+        {
+            var sb = new StringBuilder();
+            foreach (var child in i.Content) { var (txt, _, _, _) = FlattenInlineStatic(child); sb.Append(txt); }
+            return (sb.ToString(), RunStyle.Italic, null, false);
+        }
+        if (n is StrikethroughNode s)
+        {
+            var sb = new StringBuilder();
+            foreach (var child in s.Content) { var (txt, _, _, _) = FlattenInlineStatic(child); sb.Append(txt); }
+            return (sb.ToString(), RunStyle.Strikethrough, null, false);
+        }
+        if (n is CodeNode cn) return (cn.Content ?? "", RunStyle.Code, null, false);
+        if (n is LinkNode ln) return (ln.Text ?? "", RunStyle.Link, ln.Url, false);
+        if (n is ImageNode img) return (img.Alt ?? "", RunStyle.Image, null, false);
+        if (n is MathInlineNode m) return (m.LaTeX ?? "", RunStyle.Math, null, false);
+        if (n is FootnoteRefNode fn) return (fn.Id ?? "", RunStyle.Normal, null, false);
+        return ("", RunStyle.Normal, null, false);
+    }
+
+    /// <summary>
+    /// 根据表格单元格所在行是否为表头，推导该段文本在实际渲染中应使用的样式：
+    /// - 表头行中普通文本按 TableHeaderCell（加粗）测量；
+    /// - 其他样式（如显式加粗/斜体/链接/公式）保持自身样式。
+    /// </summary>
+    private static RunStyle GetEffectiveTableRunStyleForMeasure(RunStyle originalStyle, bool isHeaderRow)
+    {
+        if (!isHeaderRow)
+            return originalStyle;
+        if (originalStyle is RunStyle.Normal or RunStyle.TableCell or RunStyle.TableHeaderCell)
+            return RunStyle.TableHeaderCell;
+        return originalStyle;
+    }
+
+    /// <summary>为指定样式配置测量用的 SKPaint（字号、字体一致）。</summary>
+    private void ConfigurePaintForStyle(RunStyle style, SKPaint paint)
+    {
+        bool bold =
+            style is RunStyle.Bold
+            or RunStyle.Heading1
+            or RunStyle.Heading2
+            or RunStyle.Heading3
+            or RunStyle.Heading4
+            or RunStyle.Heading5
+            or RunStyle.Heading6
+            or RunStyle.TableHeaderCell;
+        bool italic = style is RunStyle.Italic or RunStyle.Math;
+        bool code = style is RunStyle.Code;
+        var font = GetFont(bold, italic, code);
+        paint.Typeface = font.Typeface;
+        paint.TextSize = font.Size;
+    }
+
+    /// <summary>使用与渲染阶段完全一致的字体参数来测量指定样式的文本宽度。</summary>
+    private float MeasureTextForStyle(string text, RunStyle style, SKPaint paint)
+    {
+        ConfigurePaintForStyle(style, paint);
+        return paint.MeasureText(text);
+    }
+
+    /// <summary>按 \n 切分并合并连续空行为最多 1 个空段（多换行最多显示 2 个）。</summary>
+    private static List<string> SplitByNewlinesWithCollapse(string text)
+    {
+        var parts = text.Split('\n');
+        var segments = new List<string>();
+        int i = 0;
+        while (i < parts.Length)
+        {
+            if (parts[i].Length > 0)
+            {
+                segments.Add(parts[i]);
+                i++;
+            }
+            else
+            {
+                segments.Add("");
+                while (i < parts.Length && parts[i].Length == 0)
+                    i++;
+            }
+        }
+        return segments;
+    }
+
+    /// <summary>
+    /// 将段落/列表中的 inline runs 按 innerW 自动换行；单 \n 为换行，多 \n 最多 2 个（1 个空行）。
+    /// 充分考虑不同 RunStyle（普通、粗体、行内代码、公式等）的真实宽度。
+    /// </summary>
+    private List<List<(string text, RunStyle style, string? linkUrl, string? footnoteRefId)>> BreakInlineRunsIntoLines(
+        List<(string text, RunStyle style, string? linkUrl, string? footnoteRefId)> runs,
+        float innerW,
+        SKPaint paint)
+    {
+        var result = new List<List<(string text, RunStyle style, string? linkUrl, string? footnoteRefId)>>();
+        var currentLine = new List<(string text, RunStyle style, string? linkUrl, string? footnoteRefId)>();
+        float currentLineW = 0;
+
+        foreach (var (text, style, linkUrl, footnoteRefId) in runs)
+        {
+            if (string.IsNullOrEmpty(text))
+                continue;
+
+            var effectiveStyle = style;
+
+            if (effectiveStyle == RunStyle.Math)
+            {
+                float w = MeasureMathInline(text);
+                if (currentLineW + w > innerW && currentLine.Count > 0)
+                {
+                    result.Add(currentLine);
+                    currentLine = new List<(string text, RunStyle style, string? linkUrl, string? footnoteRefId)>();
+                    currentLineW = 0;
+                }
+                currentLine.Add((text, style, linkUrl, footnoteRefId));
+                currentLineW += w;
+                continue;
+            }
+
+            var segments = SplitByNewlinesWithCollapse(text);
+            for (int si = 0; si < segments.Count; si++)
+            {
+                var segment = segments[si];
+                if (segment.Length == 0)
+                {
+                    if (currentLine.Count > 0)
+                    {
+                        result.Add(currentLine);
+                        currentLine = new List<(string text, RunStyle style, string? linkUrl, string? footnoteRefId)>();
+                        currentLineW = 0;
+                    }
+                    result.Add(new List<(string text, RunStyle style, string? linkUrl, string? footnoteRefId)>());
+                    continue;
+                }
+
+                string remaining = segment;
+                while (remaining.Length > 0)
+                {
+                    float spaceLeft = innerW - currentLineW;
+                    var (prefix, suffix) = BreakTextToFit(remaining, spaceLeft, paint, effectiveStyle);
+                    if (string.IsNullOrEmpty(prefix) && currentLine.Count > 0)
+                    {
+                        result.Add(currentLine);
+                        currentLine = new List<(string text, RunStyle style, string? linkUrl, string? footnoteRefId)>();
+                        currentLineW = 0;
+                        continue;
+                    }
+                    if (string.IsNullOrEmpty(prefix))
+                    {
+                        prefix = remaining.Length > 1 ? remaining.Substring(0, 1) : remaining;
+                        suffix = remaining.Length > 1 ? remaining.Substring(1) : "";
+                    }
+
+                    currentLine.Add((prefix, style, linkUrl, footnoteRefId));
+                    currentLineW += MeasureTextForStyle(prefix, effectiveStyle, paint);
+                    remaining = suffix;
+
+                    if (remaining.Length > 0)
+                    {
+                        result.Add(currentLine);
+                        currentLine = new List<(string text, RunStyle style, string? linkUrl, string? footnoteRefId)>();
+                        currentLineW = 0;
+                    }
+                }
+
+                if (si < segments.Count - 1)
+                {
+                    result.Add(currentLine);
+                    currentLine = new List<(string text, RunStyle style, string? linkUrl, string? footnoteRefId)>();
+                    currentLineW = 0;
+                }
+            }
+        }
+
+        if (currentLine.Count > 0)
+            result.Add(currentLine);
+
+        return result;
+    }
+
+    /// <summary>将单元格内 runs 按 innerW 自动换行，返回多行，每行为 (text, style, linkUrl) 列表。tableMeasurer 非空时用其测量以与渲染一致。</summary>
+    private List<List<(string text, RunStyle style, string? linkUrl)>> BreakRunsIntoLines(
+        List<(string text, RunStyle style, string? linkUrl)> runs,
+        float innerW,
+        SKPaint paint,
+        bool isHeaderRow,
+        ITextMeasurer? tableMeasurer = null)
+    {
+        var result = new List<List<(string text, RunStyle style, string? linkUrl)>>();
+        var currentLine = new List<(string text, RunStyle style, string? linkUrl)>();
+        float currentLineW = 0;
+        foreach (var (text, style, linkUrl) in runs)
+        {
+            if (string.IsNullOrEmpty(text))
+                continue;
+
+            var effectiveStyle = GetEffectiveTableRunStyleForMeasure(style, isHeaderRow);
+            float Measure(string s) => tableMeasurer != null ? tableMeasurer.MeasureText(s, effectiveStyle) : (effectiveStyle == RunStyle.Math ? MeasureMathInline(s) : MeasureTextForStyle(s, effectiveStyle, paint));
+
+            if (effectiveStyle == RunStyle.Math)
+            {
+                float w = Measure(text);
+                if (currentLineW + w > innerW && currentLine.Count > 0)
+                {
+                    result.Add(currentLine);
+                    currentLine = new List<(string text, RunStyle style, string? linkUrl)>();
+                    currentLineW = 0;
+                }
+                currentLine.Add((text, style, linkUrl));
+                currentLineW += w;
+                continue;
+            }
+
+            string remaining = text;
+            while (remaining.Length > 0)
+            {
+                float spaceLeft = innerW - currentLineW;
+                var (prefix, suffix) = BreakTextToFit(remaining, spaceLeft, paint, effectiveStyle, tableMeasurer);
+                if (string.IsNullOrEmpty(prefix) && currentLine.Count > 0)
+                {
+                    result.Add(currentLine);
+                    currentLine = new List<(string text, RunStyle style, string? linkUrl)>();
+                    currentLineW = 0;
+                    continue;
+                }
+                if (string.IsNullOrEmpty(prefix))
+                {
+                    prefix = remaining.Length > 1 ? remaining.Substring(0, 1) : remaining;
+                    suffix = remaining.Length > 1 ? remaining.Substring(1) : "";
+                }
+                currentLine.Add((prefix, style, linkUrl));
+                currentLineW += Measure(prefix);
+                remaining = suffix;
+                if (remaining.Length > 0)
+                {
+                    result.Add(currentLine);
+                    currentLine = new List<(string text, RunStyle style, string? linkUrl)>();
+                    currentLineW = 0;
+                }
+            }
+        }
+        if (currentLine.Count > 0)
+            result.Add(currentLine);
+        return result;
+    }
+
+    /// <summary>
+    /// 将 text 在 maxWidth 内截断为可绘制的前缀与剩余部分。tableMeasurer 非空时用其测量以与渲染一致。
+    /// 优先按“词”断行（空格/Tab 处），若一整个单词都放不下，则退化为字符级断行。
+    /// </summary>
+    private (string prefix, string suffix) BreakTextToFit(string text, float maxWidth, SKPaint paint, RunStyle style, ITextMeasurer? tableMeasurer = null)
+    {
+        if (string.IsNullOrEmpty(text) || maxWidth <= 0)
+            return ("", text ?? "");
+
+        if (tableMeasurer != null)
+        {
+            var limit = Math.Max(0, maxWidth - 0.5f);
+            if (limit <= 0)
+                return ("", text);
+            if (tableMeasurer.MeasureText(text, style) <= limit)
+                return (text, "");
+            int lastGood = 0;
+            int lastSpace = -1;
+            for (int i = 1; i <= text.Length; i++)
+            {
+                float w = tableMeasurer.MeasureText(text.Substring(0, i), style);
+                if (w <= limit)
+                {
+                    lastGood = i;
+                    if (i > 0 && (text[i - 1] == ' ' || text[i - 1] == '\t'))
+                        lastSpace = i;
+                }
+                else
+                    break;
+            }
+            if (lastGood == 0)
+                return (text.Substring(0, 1), text.Substring(1));
+            int breakPos = lastSpace > 0 ? lastSpace : lastGood;
+            return (text.Substring(0, breakPos), text.Substring(breakPos));
+        }
+
+        ConfigurePaintForStyle(style, paint);
+        var limitPaint = Math.Max(0, maxWidth - 2f);
+        if (limitPaint <= 0)
+            return ("", text);
+        if (paint.MeasureText(text) <= limitPaint)
+            return (text, "");
+        int lastGoodP = 0;
+        int lastSpaceP = -1;
+        for (int i = 1; i <= text.Length; i++)
+        {
+            float w = paint.MeasureText(text.AsSpan(0, i));
+            if (w <= limitPaint)
+            {
+                lastGoodP = i;
+                char ch = text[i - 1];
+                if (ch == ' ' || ch == '\t')
+                    lastSpaceP = i;
+            }
+            else
+                break;
+        }
+        if (lastGoodP == 0)
+            return (text.Substring(0, 1), text.Substring(1));
+        int breakPosP = lastSpaceP > 0 ? lastSpaceP : lastGoodP;
+        return (text.Substring(0, breakPosP), text.Substring(breakPosP));
     }
 
     private (float width, float height, float depth) MeasureMathMetrics(string latex)
@@ -847,6 +1287,14 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
         return w + 8f;
     }
 
+    /// <summary>表格内 run 宽度：有 Measurer 时与渲染一致，避免裁切；否则用布局自身测量。</summary>
+    private float MeasureTableRun(string text, RunStyle effectiveStyle, SKPaint paint)
+    {
+        if (_tableTextMeasurer != null)
+            return _tableTextMeasurer.MeasureText(text, effectiveStyle);
+        return effectiveStyle == RunStyle.Math ? MeasureMathInline(text) : MeasureTextForStyle(text, effectiveStyle, paint);
+    }
+
     private static TableCellAlign? GetTableCellAlign(TableNode t, int c)
     {
         if (t.ColumnAlignments == null || c >= t.ColumnAlignments.Count) return null;
@@ -862,10 +1310,8 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
     private void LayoutBlockquote(LayoutBlock block, BlockquoteNode bq, float width, ref float x, ref float y)
     {
         block.Kind = BlockKind.Blockquote;
-        const float BlockquotePadding = 8f;
-        const float BlockquoteIndent = 14f;
-        y += BlockquotePadding;
-        var indent = BlockInnerPadding + BlockquoteIndent;
+        y += _blockquotePadding;
+        var indent = _blockInnerPadding + _blockquoteIndent;
         foreach (var child in bq.Children)
         {
             switch (child)
@@ -888,24 +1334,26 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
                     break;
             }
         }
-        y += BlockquotePadding;
+        y += _blockquotePadding;
         y += _paraSpacing;
     }
 
     private void LayoutDefinitionList(LayoutBlock block, DefinitionListNode dl, float width, ref float x, ref float y)
     {
         var lineH = _baseFontSize * _lineSpacing;
-        var defIndent = BlockInnerPadding + 24f;
+        var defIndent = _blockInnerPadding + _definitionListIndent;
         var font = GetFont(false, false, false);
-        using var paint = new SKPaint { Typeface = font.Typeface, TextSize = font.Size };
+        var paint = _measurePaint;
+        paint.Typeface = font.Typeface;
+        paint.TextSize = font.Size;
         int charOffset = 0;
 
-        y += BlockInnerPadding;
+        y += _blockInnerPadding;
         foreach (var item in dl.Items)
         {
             var termText = FlattenInlines(item.Term);
             var termLine = new LayoutLine { Y = y, Height = lineH };
-            termLine.Runs.Add(new LayoutRun(termText, new SKRect(BlockInnerPadding, y, width - BlockInnerPadding, y + lineH), RunStyle.Bold, block.BlockIndex, charOffset));
+            termLine.Runs.Add(new LayoutRun(termText, new SKRect(_blockInnerPadding, y, width - _blockInnerPadding, y + lineH), RunStyle.Bold, block.BlockIndex, charOffset));
             block.Lines.Add(termLine);
             y += lineH;
             charOffset += termText.Length + 1;
@@ -921,18 +1369,20 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
                         if (!string.IsNullOrEmpty(text))
                             runs.Add((text, style, linkUrl, null));
                     }
-                    var fullText = string.Concat(runs.Select(r => r.text));
-                    var segments = BreakTextWithWrap(fullText, width - defIndent - BlockInnerPadding, paint);
+                    var fullTextSb = new StringBuilder();
+                    for (int ri = 0; ri < runs.Count; ri++)
+                        fullTextSb.Append(runs[ri].text);
+                    var segments = BreakTextWithWrap(fullTextSb.ToString(), width - defIndent - _blockInnerPadding, paint);
                     int off = 0;
                     foreach (var seg in segments)
                     {
                         var line = new LayoutLine { Y = y, Height = lineH };
-                        line.Runs.Add(new LayoutRun(seg, new SKRect(defIndent, y, width - BlockInnerPadding, y + lineH), RunStyle.Normal, block.BlockIndex, charOffset + off));
+                        line.Runs.Add(new LayoutRun(seg, new SKRect(defIndent, y, width - _blockInnerPadding, y + lineH), RunStyle.Normal, block.BlockIndex, charOffset + off));
                         block.Lines.Add(line);
                         y += lineH;
                         off += seg.Length + 1;
                     }
-                    charOffset += fullText.Length + 1;
+                    charOffset += fullTextSb.Length + 1;
                 }
                 else if (def is CodeBlockNode c)
                 {
@@ -940,109 +1390,98 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
                 }
             }
         }
-        y += BlockInnerPadding;
+        y += _blockInnerPadding;
         y += _paraSpacing;
     }
 
-    private void LayoutFootnoteDef(LayoutBlock block, FootnoteDefNode fn, float width, ref float x, ref float y)
-    {
-        var lineH = _baseFontSize * _lineSpacing;
-        var prefix = "[^" + fn.Id + "]: ";
-        var font = GetFont(false, false, false);
-        using var paint = new SKPaint { Typeface = font.Typeface, TextSize = font.Size };
-        int charOffset = 0;
-
-        foreach (var child in fn.Content)
-        {
-            if (child is ParagraphNode p)
-            {
-                var content = FlattenInlines(p.Content);
-                var fullText = prefix + content;
-                prefix = "";
-                var segments = BreakTextWithWrap(fullText, width, paint);
-                foreach (var seg in segments)
-                {
-                    var line = new LayoutLine { Y = y, Height = lineH };
-                    line.Runs.Add(new LayoutRun(seg, new SKRect(0, y, width, y + lineH), RunStyle.Normal, block.BlockIndex, charOffset));
-                    block.Lines.Add(line);
-                    y += lineH;
-                    charOffset += seg.Length + 1;
-                }
-            }
-        }
-        y += _paraSpacing;
-    }
-
-    /// <summary>列表项内容相对左侧的缩进（约 2 字符宽），与引用/嵌套区分开。</summary>
-    private const float ListItemIndent = 20f;
-
-    /// <summary>所有块内部左右留白，避免内容贴边。</summary>
-    private const float BlockInnerPadding = 12f;
-
+    /// <summary>列表项悬挂缩进：符号/序号单独在左侧，多行内容左侧对齐。</summary>
     private void LayoutList(LayoutBlock block, MarkdownNode node, float width, ref float x, ref float y, float leftMargin = 0f)
     {
-        var items = node is BulletListNode bl ? bl.Items : ((OrderedListNode)node).Items;
+        y += _listBlockMarginTop;
+        var bullet = node as BulletListNode;
+        var ordered = node as OrderedListNode;
+        var items = bullet is not null ? bullet.Items : ordered!.Items;
         var lineHeight = _baseFontSize * _lineSpacing;
-        var contentLeft = leftMargin + BlockInnerPadding + ListItemIndent;
-        var availW = width - contentLeft - BlockInnerPadding;
-        if (availW <= 0) availW = width - leftMargin;
+        var contentLeft = leftMargin + _blockInnerPadding + _listItemIndent;
         var font = GetFont(false, false, false);
-        using var paint = new SKPaint { Typeface = font.Typeface, TextSize = font.Size };
+        var paint = _measurePaint;
+        paint.Typeface = font.Typeface;
+        paint.TextSize = font.Size;
         int charOffset = 0;
-        foreach (var item in items)
+        int number = ordered?.StartNumber ?? 1;
+        for (int itemIndex = 0; itemIndex < items.Count; itemIndex++)
         {
-            var runs = new List<(string text, RunStyle style, string? linkUrl, string? footnoteRefId)>();
-            runs.Add(("• ", RunStyle.Normal, null, null));
+            var item = items[itemIndex];
+            // 1) 前缀 run（• / 1. / [ ] 或组合）及宽度，用于悬挂缩进
+            var prefixRuns = new List<(string text, RunStyle style, string? linkUrl, string? footnoteRefId)>();
+            if (ordered is not null)
+            {
+                prefixRuns.Add((number.ToString() + ". ", RunStyle.Normal, null, null));
+                number++;
+            }
+            else if (!item.IsTask)
+            {
+                prefixRuns.Add(("• ", RunStyle.Normal, null, null));
+            }
+            if (item.IsTask)
+            {
+                prefixRuns.Add((item.IsChecked ? "[x] " : "[ ] ", RunStyle.Normal, "todo-toggle:", null));
+            }
+
+            float prefixW = 0;
+            foreach (var pr in prefixRuns)
+                prefixW += paint.MeasureText(pr.text);
+            var contentStart = contentLeft + prefixW;
+            var availW = width - contentStart - _blockInnerPadding;
+            if (availW <= 0) availW = width - contentLeft;
+
+            // 2) 仅内容 runs（不含前缀），按剩余宽度换行
+            var contentRuns = new List<(string text, RunStyle style, string? linkUrl, string? footnoteRefId)>();
             if (item.Content.Count > 0 && item.Content[0] is ParagraphNode p)
             {
                 foreach (var n in p.Content)
                 {
                     var (text, style, linkUrl, footnoteRefId) = FlattenInline(n);
                     if (!string.IsNullOrEmpty(text))
-                        runs.Add((text, style, linkUrl, footnoteRefId));
+                        contentRuns.Add((text, style, linkUrl, footnoteRefId));
                 }
             }
-            if (runs.Count == 0)
+
+            if (contentRuns.Count == 0)
                 continue;
-            var fullText = string.Concat(runs.Select(r => r.text));
-            var lineSegments = BreakTextIntoLinesWithOffsets(fullText, availW, paint);
-            foreach (var (_, lineStart, lineEnd) in lineSegments)
+
+            var wrappedLines = BreakInlineRunsIntoLines(contentRuns, availW, paint);
+
+            for (int i = 0; i < wrappedLines.Count; i++)
             {
-                var lineRuns = new List<(string text, RunStyle style, string? linkUrl, string? footnoteRefId)>();
-                int runOffset = 0;
-                foreach (var (text, style, linkUrl, footnoteRefId) in runs)
+                List<(string text, RunStyle style, string? linkUrl, string? footnoteRefId)> lineRuns;
+                float lineLeft = contentLeft;
+                if (i == 0)
                 {
-                    int runEnd = runOffset + text.Length;
-                    if (runEnd <= lineStart) { runOffset = runEnd; continue; }
-                    if (runOffset >= lineEnd) break;
-                    int oStart = Math.Max(runOffset, lineStart);
-                    int oEnd = Math.Min(runEnd, lineEnd);
-                    var seg = text[(oStart - runOffset)..(oEnd - runOffset)];
-                    lineRuns.Add((seg, style, linkUrl, footnoteRefId));
-                    runOffset = runEnd;
-                    if (runOffset >= lineEnd) break;
+                    // 首行：左侧画前缀，再画内容，整体从左边界 contentLeft 开始
+                    lineRuns = new List<(string, RunStyle, string?, string?)>(prefixRuns);
+                    lineRuns.AddRange(wrappedLines[i]);
                 }
-                FlushParagraphLine(block, lineRuns, lineHeight, ref y, block.BlockIndex, ref charOffset, contentLeft);
+                else
+                {
+                    // 续行：悬挂缩进，与首行文字左对齐（从 contentStart 开始）
+                    lineLeft = contentStart;
+                    lineRuns = wrappedLines[i];
+                }
+                FlushParagraphLine(block, lineRuns, lineHeight, ref y, block.BlockIndex, ref charOffset, lineLeft);
             }
+            if (itemIndex < items.Count - 1)
+                y += _listItemGap;
         }
-        y += _paraSpacing;
+        y += _paraSpacing + _listBlockMarginBottom;
     }
 
     private (string text, RunStyle style, string? linkUrl, string? footnoteRefId) FlattenInline(InlineNode n)
     {
-        if (n is FootnoteRefNode fn)
+        if (n is FootnoteMarkerNode fm)
         {
-            if (_currentFootnoteRefOrder != null)
-            {
-                int idx = -1;
-                for (int i = 0; i < _currentFootnoteRefOrder.Count; i++)
-                {
-                    if (_currentFootnoteRefOrder[i] == fn.Id) { idx = i; break; }
-                }
-                var num = (idx >= 0 ? idx + 1 : 0).ToString();
-                return ("[" + num + "]", RunStyle.FootnoteRef, "footnote:" + num, fn.Id);
-            }
-            return ("[^" + fn.Id + "]", RunStyle.Normal, null, null);
+            var num = fm.Number.ToString();
+            return ("[" + num + "]", RunStyle.FootnoteRef, "footnote:" + num, fm.Id);
         }
         return n switch
         {
@@ -1074,7 +1513,9 @@ public sealed class SkiaLayoutEngine : ILayoutEngine
                 RunStyle.Heading6 => 14,
                 _ => 20
             });
-        using var paint = new SKPaint { Typeface = font.Typeface, TextSize = font.Size };
+        var paint = _measurePaint;
+        paint.Typeface = font.Typeface;
+        paint.TextSize = font.Size;
         for (int i = 1; i <= text.Length; i++)
         {
             if (paint.MeasureText(text.AsSpan(0, i)) >= x) return i - 1;

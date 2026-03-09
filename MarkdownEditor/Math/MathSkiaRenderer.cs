@@ -12,6 +12,79 @@ namespace MarkdownEditor.Latex;
 /// </summary>
 internal static partial class MathSkiaRenderer
 {
+    private static readonly object _parseCacheLock = new();
+    private static readonly Dictionary<string, MathNode> _parseCache = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// 将 LaTeX 源码做轻量归一化：
+    /// - 始终去掉首尾空白、统一换行符；
+    /// - 若仅包含一行非空内容（如 "$\n+123\n$"），则将内部换行压缩为空格，按单行公式处理；
+    /// - 若包含多行非空内容（eqnarray、cases 等），则保留内部换行，不再压缩为单行。
+    /// </summary>
+    private static string NormalizeFormulaSource(string latex)
+    {
+        if (string.IsNullOrWhiteSpace(latex))
+            return string.Empty;
+
+        var s = latex.Replace("\r\n", "\n").Replace('\r', '\n').Trim();
+        if (!s.Contains('\n'))
+            return s;
+
+        var lines = s.Split('\n');
+        int nonEmpty = 0;
+        foreach (var line in lines)
+        {
+            if (!string.IsNullOrWhiteSpace(line))
+                nonEmpty++;
+        }
+
+        // 仅一行非空内容时，按单行公式处理，压缩所有空白为单个空格。
+        if (nonEmpty <= 1)
+        {
+            var sbSingle = new System.Text.StringBuilder(s.Length);
+            bool lastIsSpaceSingle = false;
+            foreach (var ch in s)
+            {
+                if (char.IsWhiteSpace(ch))
+                {
+                    if (!lastIsSpaceSingle)
+                    {
+                        sbSingle.Append(' ');
+                        lastIsSpaceSingle = true;
+                    }
+                }
+                else
+                {
+                    sbSingle.Append(ch);
+                    lastIsSpaceSingle = false;
+                }
+            }
+            return sbSingle.ToString().Trim();
+        }
+
+        var sb = new System.Text.StringBuilder(s.Length);
+        for (int i = 0; i < lines.Length; i++)
+        {
+            if (i > 0)
+                sb.Append('\n');
+            sb.Append(lines[i].TrimEnd());
+        }
+        return sb.ToString().Trim();
+    }
+
+    private static MathNode GetOrParseRoot(string latex)
+    {
+        lock (_parseCacheLock)
+        {
+            if (_parseCache.TryGetValue(latex, out var cached))
+                return cached;
+            var formula = MathParser.Parse(latex);
+            var root = formula.Root;
+            _parseCache[latex] = root;
+            return root;
+        }
+    }
+
     /// <summary>
     /// 在给定矩形区域内绘制 LaTeX 数学公式。
     /// bodyTypeface：用于 \text{} 等普通文本和 CJK 回退；
@@ -29,8 +102,11 @@ internal static partial class MathSkiaRenderer
         if (canvas == null || string.IsNullOrWhiteSpace(latex))
             return;
 
-        var formula = MathParser.Parse(latex);
-        var root = formula.Root;
+        var normalized = NormalizeFormulaSource(latex);
+        if (string.IsNullOrEmpty(normalized))
+            return;
+
+        var root = GetOrParseRoot(normalized);
 
         var ctx = new RenderContext(bodyTypeface, mathTypeface, baseFontSize);
         // 块级数学统一按 Display 样式处理；后续可根据内联/块级具体区分
@@ -77,8 +153,11 @@ internal static partial class MathSkiaRenderer
         if (string.IsNullOrWhiteSpace(latex))
             return (0, 0, 0);
 
-        var formula = MathParser.Parse(latex);
-        var root = formula.Root;
+        var normalized = NormalizeFormulaSource(latex);
+        if (string.IsNullOrEmpty(normalized))
+            return (0, 0, 0);
+
+        var root = GetOrParseRoot(normalized);
 
         var ctx = new RenderContext(bodyTypeface, mathTypeface, baseFontSize);
         var box = BuildBox(root, ctx, MathStyle.Display, 1.0f);
@@ -454,13 +533,15 @@ internal static partial class MathSkiaRenderer
         private readonly float[] _colWidths;
         private readonly float _colGap;
         private readonly float _rowGap;
+        private readonly HashSet<int> _verticalRuleBeforeColumn;
 
-        public EnvironmentBox(List<List<Box>> rows, float[] colWidths, float colGap, float rowGap)
+        public EnvironmentBox(List<List<Box>> rows, float[] colWidths, float colGap, float rowGap, int[]? verticalRuleBeforeColumn = null)
         {
             _rows = rows;
             _colWidths = colWidths;
             _colGap = colGap;
             _rowGap = rowGap;
+            _verticalRuleBeforeColumn = verticalRuleBeforeColumn != null ? new HashSet<int>(verticalRuleBeforeColumn) : [];
 
             Width = 0;
             foreach (var w in _colWidths)
@@ -482,13 +563,22 @@ internal static partial class MathSkiaRenderer
                 totalBelow += d + _rowGap;
             }
 
-            // 简化：整体高度按所有行的 max 高度/深度之和估算
             Height = totalAbove;
             Depth = totalBelow;
         }
 
         public override void Draw(SKCanvas canvas, float xStart, float baselineY)
         {
+            using var linePaint = new SKPaint
+            {
+                Style = SKPaintStyle.Stroke,
+                StrokeWidth = 1f,
+                IsAntialias = true,
+                Color = new SKColor(0xD4, 0xD4, 0xD4)
+            };
+
+            float matrixTop = baselineY - Height;
+            float matrixBottom = baselineY + Depth;
             var currentBaseline = baselineY - Height + _rowGap;
 
             foreach (var row in _rows)
@@ -508,14 +598,30 @@ internal static partial class MathSkiaRenderer
                     Box? cell = c < row.Count ? row[c] : null;
                     if (cell != null)
                     {
-                        // 左对齐单元格，留少量左右边距
                         var cellX = x;
                         cell.Draw(canvas, cellX, rowBaseline);
                     }
-                    x += _colWidths[c] + _colGap;
+                    x += _colWidths[c];
+                    x += _colGap;
                 }
 
                 currentBaseline = rowBaseline + rowDepth + _rowGap;
+            }
+
+            // 增广矩阵：竖线贯穿整矩阵高度，在指定列右侧画一整条竖线
+            if (_verticalRuleBeforeColumn.Count > 0)
+            {
+                float x = xStart;
+                for (int c = 0; c < _colWidths.Length; c++)
+                {
+                    x += _colWidths[c];
+                    if (_verticalRuleBeforeColumn.Contains(c + 1))
+                    {
+                        float lineX = x + _colGap * 0.5f;
+                        canvas.DrawLine(lineX, matrixTop, lineX, matrixBottom, linePaint);
+                    }
+                    x += _colGap;
+                }
             }
         }
     }
@@ -543,18 +649,19 @@ internal static partial class MathSkiaRenderer
 
         public override void Draw(SKCanvas canvas, float xStart, float baselineY)
         {
-            using var paint = new SKPaint
-            {
-                Color = _color,
-                StrokeWidth = _strokeWidth,
-                IsAntialias = true,
-                Style = SKPaintStyle.Stroke
-            };
-
             float top = baselineY - Height;
             float bottom = baselineY + Depth;
             float x0 = xStart;
             float x1 = xStart + Width;
+            // 花括号用更粗线宽，使轮廓清晰（Bmatrix、cases 等）
+            float strokeW = (_kind is "{" or "}") ? Math.Max(_strokeWidth * 2.2f, 1.8f) : _strokeWidth;
+            using var paint = new SKPaint
+            {
+                Color = _color,
+                StrokeWidth = strokeW,
+                IsAntialias = true,
+                Style = SKPaintStyle.Stroke
+            };
 
             switch (_kind)
             {
@@ -603,6 +710,44 @@ internal static partial class MathSkiaRenderer
                     canvas.DrawLine(mid, top, mid, bottom, paint);
                     break;
                 }
+                case "{":
+                {
+                    // 左花括号：参考 SVG 五段贝塞尔，尖头在 x0 指向内容侧，无渐变/点缀
+                    using var path = new SKPath();
+                    float midY = (top + bottom) / 2f;
+                    float h = bottom - top;
+                    float xBulge = x0 + Width / 3f;
+                    float y1 = top + 60f / 260f * h;
+                    float y2 = midY + 40f / 260f * h;
+                    float y3 = bottom - 40f / 260f * h;
+                    path.MoveTo(x1, top);
+                    path.CubicTo(xBulge, top, xBulge, top + 40f / 260f * h, xBulge, y1);
+                    path.CubicTo(xBulge, top + 100f / 260f * h, xBulge, top + 110f / 260f * h, x0, midY);
+                    path.CubicTo(xBulge, midY + 10f / 260f * h, xBulge, midY + 20f / 260f * h, xBulge, y2);
+                    path.CubicTo(xBulge, bottom - 60f / 260f * h, xBulge, bottom - 40f / 260f * h, xBulge, y3);
+                    path.CubicTo(xBulge, bottom - 20f / 260f * h, xBulge, bottom, x1, bottom);
+                    canvas.DrawPath(path, paint);
+                    break;
+                }
+                case "}":
+                {
+                    // 右花括号：与 { 对称，尖头在 x1 指向内容侧
+                    using var path = new SKPath();
+                    float midY = (top + bottom) / 2f;
+                    float h = bottom - top;
+                    float xBulge = x1 - Width / 3f;
+                    float y1 = top + 60f / 260f * h;
+                    float y2 = midY + 40f / 260f * h;
+                    float y3 = bottom - 40f / 260f * h;
+                    path.MoveTo(x0, top);
+                    path.CubicTo(xBulge, top, xBulge, top + 40f / 260f * h, xBulge, y1);
+                    path.CubicTo(xBulge, top + 100f / 260f * h, xBulge, top + 110f / 260f * h, x1, midY);
+                    path.CubicTo(xBulge, midY + 10f / 260f * h, xBulge, midY + 20f / 260f * h, xBulge, y2);
+                    path.CubicTo(xBulge, bottom - 60f / 260f * h, xBulge, bottom - 40f / 260f * h, xBulge, y3);
+                    path.CubicTo(xBulge, bottom - 20f / 260f * h, xBulge, bottom, x0, bottom);
+                    canvas.DrawPath(path, paint);
+                    break;
+                }
                 default:
                 {
                     // "‖" 或其他：画双竖线
@@ -646,6 +791,25 @@ internal static partial class MathSkiaRenderer
             }
             case MathSequence seq:
             {
+                // \left / \right 解析为空 MathSequence，故实际为 [ 空, "[", array, 空, "]" ]。找序列中首次 "["、末次 "]" 且中间恰有一个带 | 的 array 时只画 array，避免最外侧多两个符号。
+                var arrWithBar = seq.Children.OfType<MathEnvironment>()
+                    .FirstOrDefault(e => e.Name == "array" && !string.IsNullOrEmpty(e.ColumnSpec) && e.ColumnSpec.Contains('|'));
+                if (arrWithBar != null)
+                {
+                    int firstBracket = -1, lastBracket = -1;
+                    for (int i = 0; i < seq.Children.Count; i++)
+                    {
+                        if (seq.Children[i] is MathSymbol s && s.Text == "[") { firstBracket = i; break; }
+                    }
+                    for (int i = seq.Children.Count - 1; i >= 0; i--)
+                    {
+                        if (seq.Children[i] is MathSymbol s && s.Text == "]") { lastBracket = i; break; }
+                    }
+                    if (firstBracket >= 0 && lastBracket > firstBracket)
+                    {
+                        return BuildBox(arrWithBar, ctx, style, scale);
+                    }
+                }
                 var children = new List<Box>();
                 foreach (var child in seq.Children)
                 {
@@ -744,7 +908,20 @@ internal static partial class MathSkiaRenderer
 
                 var colGap = ctx.BaseFontSize * scale * 1.0f;
                 var rowGap = ctx.BaseFontSize * scale * 0.4f;
-                var core = new EnvironmentBox(allRows, colWidths, colGap, rowGap);
+                int[]? verticalRuleBeforeColumn = null;
+                if (env.Name == "array" && !string.IsNullOrEmpty(env.ColumnSpec) && env.ColumnSpec.Contains('|'))
+                {
+                    var list = new List<int>();
+                    int col = 0;
+                    foreach (var part in env.ColumnSpec.Split('|'))
+                    {
+                        if (col > 0)
+                            list.Add(col);
+                        col += part.Length;
+                    }
+                    verticalRuleBeforeColumn = list.ToArray();
+                }
+                var core = new EnvironmentBox(allRows, colWidths, colGap, rowGap, verticalRuleBeforeColumn);
 
                 // 矩阵类环境：在左右加上括号/中括号/竖线
                 string? leftDelim = null,
@@ -771,17 +948,31 @@ internal static partial class MathSkiaRenderer
                         leftDelim = "‖";
                         rightDelim = "‖";
                         break;
+                    case "cases":
+                        leftDelim = "{";
+                        rightDelim = ""; // 仅左侧花括号
+                        break;
+                    case "array":
+                        // 增广矩阵：列格式含 | 时与 bmatrix 一致，用同一套 DelimiterBox 画两侧方括号
+                        if (!string.IsNullOrEmpty(env.ColumnSpec) && env.ColumnSpec.Contains('|'))
+                        {
+                            leftDelim = "[";
+                            rightDelim = "]";
+                        }
+                        break;
                 }
 
-                if (leftDelim is null || rightDelim is null)
+                if (leftDelim is null)
                     return core;
 
                 var boxes = new List<Box>();
                 var em = ctx.BaseFontSize * scale;
                 // 定界符的高度直接复用核心环境的高度/深度，以达到“伸缩括号”的效果。
-                boxes.Add(new DelimiterBox(leftDelim, core.Height, core.Depth, em, textPaint.Color));
+                if (!string.IsNullOrEmpty(leftDelim))
+                    boxes.Add(new DelimiterBox(leftDelim, core.Height, core.Depth, em, textPaint.Color));
                 boxes.Add(core);
-                boxes.Add(new DelimiterBox(rightDelim, core.Height, core.Depth, em, textPaint.Color));
+                if (!string.IsNullOrEmpty(rightDelim))
+                    boxes.Add(new DelimiterBox(rightDelim, core.Height, core.Depth, em, textPaint.Color));
 
                 var outerGap = ctx.BaseFontSize * scale * 0.2f;
                 return new HorizontalBox(boxes, outerGap);

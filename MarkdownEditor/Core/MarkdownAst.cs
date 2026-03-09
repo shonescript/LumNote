@@ -154,6 +154,30 @@ public sealed class FootnoteDefNode : MarkdownNode
 }
 
 /// <summary>
+/// 归一化后的脚注引用标记（已编号），用于渲染为上标并跳转到文末脚注区。
+/// </summary>
+public sealed class FootnoteMarkerNode : InlineNode
+{
+    public required string Id { get; init; }
+    public required int Number { get; init; }
+}
+
+/// <summary>
+/// 归一化后的文末脚注区（由渲染引擎在解析后拼装插入）。
+/// </summary>
+public sealed class FootnoteSectionNode : MarkdownNode
+{
+    public required List<FootnoteEntry> Items { get; init; }
+}
+
+public sealed class FootnoteEntry
+{
+    public required string Id { get; init; }
+    public required int Number { get; init; }
+    public required List<MarkdownNode> Content { get; init; }
+}
+
+/// <summary>
 /// 行内元素基类
 /// </summary>
 public abstract class InlineNode;

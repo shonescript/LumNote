@@ -51,6 +51,16 @@ public enum RunStyle
     Italic,
     Strikethrough,
     Code,
+    /// <summary>代码块内：关键字（语法高亮）</summary>
+    CodeKeyword,
+    /// <summary>代码块内：字符串</summary>
+    CodeString,
+    /// <summary>代码块内：注释</summary>
+    CodeComment,
+    /// <summary>代码块内：数字</summary>
+    CodeNumber,
+    /// <summary>代码块内：默认/其他</summary>
+    CodeDefault,
     Link,
     Image,
     Heading1,

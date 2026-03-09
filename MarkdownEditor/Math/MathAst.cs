@@ -67,7 +67,7 @@ public sealed class MathRow : MathNode
     public required List<MathNode> Cells { get; init; }
 }
 
-/// <summary>多行环境（如 eqnarray、align 等）。</summary>
+/// <summary>多行环境（如 eqnarray、align、array 等）。</summary>
 public sealed class MathEnvironment : MathNode
 {
     /// <summary>环境名，如 "eqnarray"。</summary>
@@ -75,6 +75,9 @@ public sealed class MathEnvironment : MathNode
 
     /// <summary>环境中的所有行。</summary>
     public required List<MathRow> Rows { get; init; }
+
+    /// <summary>array 环境的列格式，如 "ccc|c"（含 | 时在对应列前画竖线，用于增广矩阵）。</summary>
+    public string? ColumnSpec { get; init; }
 }
 
 /// <summary>重音节点，如 \hat{x}、\vec{v}、\widehat{\gamma}。</summary>
