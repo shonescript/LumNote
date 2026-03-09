@@ -24,21 +24,11 @@ public partial class MainWindow : Window
     private ScrollViewer? _editorScroll;
     private ScrollViewer? _previewScroll;
     private bool _isSyncingScroll;
-    private string _currentEditorPath = "";
-    private int _pendingGoToLine = -1;
     private bool _isClosingProgrammatically;
-    private readonly DispatcherTimer _highlightTimer;
     private readonly DispatcherTimer _searchDebounceTimer;
     private DispatcherTimer? _fileCheckTimer;
-    private int _highlightVersion;
-    private int _appliedHighlightVersion;
-    private readonly MarkdownHighlightingService _highlightService = new();
-    private readonly MarkdownColorizer _markdownColorizer = new(MarkdownHighlightTheme.DarkTheme);
-    private SearchPanel? _editorSearchPanel;
     /// <summary>标记当前是否需要拦截下一次 Alt 键抬起事件，避免 Alt 组合键操作后激活菜单访问键。</summary>
     private bool _suppressNextAltKeyUp;
-    /// <summary>标记当前 CurrentMarkdown 的变更是否来自编辑器 TextChanged。为 true 时 PropertyChanged 不写回 editor.Text，避免 Replace→TextChanged→VM 规范化→写回 导致的二次文档修改与撤销组异常。</summary>
-    private bool _currentMarkdownChangeFromEditor;
     /// <summary>侧栏分隔条是否正在拖动（仅显示蓝色预览线，松手后应用布局）。</summary>
     private bool _sidebarSplitterDragging;
     /// <summary>编辑/预览分隔条是否正在拖动。</summary>
@@ -51,14 +41,17 @@ public partial class MainWindow : Window
         new DocxExporter()
     ]);
 
+    private readonly EditorController _editorController;
+
     public MainWindow()
     {
         InitializeComponent();
         var vm = new MainViewModel();
         DataContext = vm;
 
-        // 初始化编辑器语法高亮
-        SetupEditorHighlighting();
+        if (EditorTextBox is null)
+            throw new InvalidOperationException("EditorTextBox not initialized.");
+        _editorController = new EditorController(EditorTextBox, vm);
 
         Opened += (_, _) =>
         {
@@ -164,23 +157,6 @@ public partial class MainWindow : Window
             }
         };
 
-        _highlightTimer = new DispatcherTimer
-        {
-            Interval = TimeSpan.FromMilliseconds(200)
-        };
-        _highlightTimer.Tick += (_, _) =>
-        {
-            try
-            {
-                _highlightTimer.Stop();
-                UpdateEditorHighlight();
-            }
-            catch
-            {
-                _highlightTimer.Stop();
-            }
-        };
-
         _searchDebounceTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(400) };
         _searchDebounceTimer.Tick += (_, _) =>
         {
@@ -248,46 +224,6 @@ public partial class MainWindow : Window
         AddHandler(PointerPressedEvent, OnWindowPointerPressed, RoutingStrategies.Tunnel);
 
         SetupDeferredSplitters();
-    }
-
-    /// <summary>
-    /// 根据当前文本长度动态调整语法高亮的防抖间隔：文档越大，间隔越长，避免频繁全量分析。
-    /// </summary>
-    private static TimeSpan GetHighlightInterval(string text)
-    {
-        var length = text?.Length ?? 0;
-        if (length <= 5_000)
-            return TimeSpan.FromMilliseconds(180);
-        if (length <= 50_000)
-            return TimeSpan.FromMilliseconds(320);
-        return TimeSpan.FromMilliseconds(650);
-    }
-
-    /// <summary>
-    /// 获取当前编辑视图的大致可见行范围（0-based，含），并在顶部/底部各扩展一段缓冲区。
-    /// 若视图尚未生成可视行，则返回 null，表示分析整篇文档。
-    /// </summary>
-    private static (int startLine, int endLine)? GetVisibleLineRange(TextEditor editor, int extraLines = 40)
-    {
-        var textView = editor.TextArea?.TextView;
-        if (textView == null)
-            return null;
-        var visualLines = textView.VisualLines;
-        if (visualLines == null || visualLines.Count == 0)
-            return null;
-
-        int first = visualLines.Min(v => v.FirstDocumentLine.LineNumber) - 1;
-        int last = visualLines.Max(v => v.LastDocumentLine.LineNumber) - 1;
-
-        if (editor.Document == null)
-            return (Math.Max(0, first), Math.Max(first, last));
-
-        int maxIndex = Math.Max(0, editor.Document.LineCount - 1);
-        int start = Math.Max(0, first - extraLines);
-        int end = Math.Min(maxIndex, last + extraLines);
-        if (end < start)
-            end = start;
-        return (start, end);
     }
 
     /// <summary>VS 风格分隔条：拖动时只显示蓝色预览线，松手后再应用布局。</summary>
@@ -394,141 +330,20 @@ public partial class MainWindow : Window
     /// <summary>窗口关闭时停止所有定时器，避免 Tick 在析构后触发导致异常。</summary>
     private void StopAllTimers()
     {
-        try
-        {
-            _highlightTimer.Stop();
-            _searchDebounceTimer.Stop();
-            _fileCheckTimer?.Stop();
-        }
+            try
+            {
+                _searchDebounceTimer.Stop();
+                _fileCheckTimer?.Stop();
+            }
         catch { }
     }
 
     private void SetupEditorHighlighting()
     {
-        if (EditorTextBox is TextEditor editor)
+        if (EditorTextBox is TextEditor editor && DataContext is MainViewModel vm)
         {
-            _editorSearchPanel = SearchPanel.Install(editor);
-            editor.Options.EnableHyperlinks = false;
-            editor.Options.EnableEmailHyperlinks = false;
-            if (editor.Options is { } opts && opts.GetType().GetProperty("EnableRectangularSelection") != null)
-                opts.GetType().GetProperty("EnableRectangularSelection")!.SetValue(opts, true);
-            editor.TextArea.TextView.LineTransformers.Add(_markdownColorizer);
-
-            if (DataContext is MainViewModel vm)
-            {
-                editor.FontSize = 14.0 * vm.EditorZoomLevel;
-                vm.PropertyChanged += (_, e) =>
-                {
-                    if (e.PropertyName == nameof(MainViewModel.CurrentMarkdown))
-                    {
-                        if (_currentMarkdownChangeFromEditor)
-                        {
-                            _currentMarkdownChangeFromEditor = false;
-                            return;
-                        }
-                        var target = vm.CurrentMarkdown ?? string.Empty;
-                        if (!string.Equals(editor.Text, target, StringComparison.Ordinal))
-                        {
-                            if (!string.IsNullOrEmpty(_currentEditorPath) && _currentEditorPath != (vm.CurrentFilePath ?? ""))
-                                vm.PushBack(_currentEditorPath, editor.TextArea.Caret.Offset);
-                            var caret = editor.TextArea.Caret.Offset;
-                            editor.Text = target;
-                            editor.TextArea.Caret.Offset = System.Math.Min(caret, editor.Text.Length);
-                            _currentEditorPath = vm.CurrentFilePath ?? "";
-                            if (_pendingGoToLine > 0 && editor.Document != null)
-                            {
-                                var lineNum = Math.Clamp(_pendingGoToLine, 1, editor.Document.LineCount);
-                                var line = editor.Document.GetLineByNumber(lineNum);
-                                editor.TextArea.Caret.Offset = line.Offset;
-                                editor.TextArea.Caret.BringCaretToView();
-                                _pendingGoToLine = -1;
-                            }
-                        }
-                    }
-                };
-                editor.Text = vm.CurrentMarkdown ?? string.Empty;
-                _currentEditorPath = vm.CurrentFilePath ?? "";
-
-                editor.TextChanged += (_, _) =>
-                {
-                    var text = editor.Text ?? string.Empty;
-                    if (!string.Equals(vm.CurrentMarkdown, text, StringComparison.Ordinal))
-                    {
-                        _currentMarkdownChangeFromEditor = true;
-                        vm.CurrentMarkdown = text;
-                    }
-
-                    _highlightTimer.Stop();
-                    _highlightTimer.Interval = GetHighlightInterval(text);
-                    _highlightTimer.Start();
-                };
-
-                editor.TextArea.Caret.PositionChanged += (_, _) =>
-                {
-                    vm.CaretLine = editor.TextArea.Caret.Line;
-                    vm.CaretColumn = editor.TextArea.Caret.Column;
-                    if (vm.ActiveDocument != null)
-                        vm.ActiveDocument.LastCaretOffset = editor.TextArea.Caret.Offset;
-                };
-                vm.CaretLine = editor.TextArea.Caret.Line;
-                vm.CaretColumn = editor.TextArea.Caret.Column;
-                if (vm.ActiveDocument != null)
-                    vm.ActiveDocument.LastCaretOffset = editor.TextArea.Caret.Offset;
-            }
-            else
-            {
-                editor.TextChanged += (_, _) =>
-                {
-                    _highlightTimer.Stop();
-                    _highlightTimer.Start();
-                };
-            }
+            editor.FontSize = 14.0 * vm.EditorZoomLevel;
         }
-    }
-
-    private void UpdateEditorHighlight()
-    {
-        if (EditorTextBox is not TextEditor editor)
-            return;
-        var text = editor.Text ?? string.Empty;
-        var version = ++_highlightVersion;
-        int? visibleStart = null;
-        int? visibleEnd = null;
-        var range = GetVisibleLineRange(editor);
-        if (range.HasValue)
-        {
-            visibleStart = range.Value.startLine;
-            visibleEnd = range.Value.endLine;
-        }
-
-        Task.Run(() =>
-        {
-            try
-            {
-                var tokens = _highlightService.Analyze(text, visibleStart, visibleEnd);
-                Dispatcher.UIThread.Post(() =>
-                {
-                    try
-                    {
-                        if (version <= _appliedHighlightVersion)
-                            return;
-                        if (EditorTextBox is not TextEditor ed || ed.TextArea?.TextView == null)
-                            return;
-                        _appliedHighlightVersion = version;
-                        _markdownColorizer.UpdateTokens(tokens);
-                        ed.TextArea.TextView.Redraw();
-                    }
-                    catch
-                    {
-                        // 控件已销毁或断开视觉树时忽略，不影响使用
-                    }
-                }, DispatcherPriority.Background);
-            }
-            catch
-            {
-                // 高亮分析异常不影响编辑
-            }
-        });
     }
 
     private void SetupScrollSync()
@@ -915,14 +730,7 @@ public partial class MainWindow : Window
     }
 
     /// <summary>聚焦编辑区并打开内置查找面板（Ctrl+F 文件内查找，与侧栏跨文件搜索分离）。</summary>
-    private void FocusEditorFind(MainViewModel vm)
-    {
-        if (EditorTextBox is TextEditor editor)
-        {
-            editor.Focus();
-            _editorSearchPanel?.Open();
-        }
-    }
+    private void FocusEditorFind(MainViewModel vm) => _editorController.FocusFind();
 
     /// <summary>
     /// 统一拦截 Alt 组合键后的“裸 Alt 抬起”事件，避免菜单栏被激活。
@@ -1004,7 +812,7 @@ public partial class MainWindow : Window
             editor.TextArea.Caret.BringCaretToView();
             return;
         }
-        _pendingGoToLine = result.LineNumber;
+        _editorController.RequestGoToLine(result.LineNumber);
         vm.OpenDocument(result.FilePath);
     }
 
