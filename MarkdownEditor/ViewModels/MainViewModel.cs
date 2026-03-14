@@ -1,14 +1,16 @@
-using System.Collections.ObjectModel;
+using Avalonia.Threading;
+using LumConfig;
+using MarkdownEditor.Controls;
+using System.Collections;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
-using System.Text.Json;
-using System.Windows.Input;
 using System.Threading;
 using System.Threading.Tasks;
-using Avalonia.Threading;
+using System.Windows.Input;
 
 namespace MarkdownEditor.ViewModels;
 
@@ -30,14 +32,27 @@ public sealed class MainViewModel : ViewModelBase
 
     public MainViewModel()
     {
-        LoadRecentFilesFromDisk();
+        // 根据配置恢复布局模式（默认 Both）
+        if (!string.IsNullOrEmpty(Config.Ui.LayoutMode))
+        {
+            try
+            {
+                if (Enum.TryParse<EditorLayoutMode>(Config.Ui.LayoutMode, out var mode))
+                    _layoutMode = mode;
+            }
+            catch
+            {
+                _layoutMode = EditorLayoutMode.Both;
+            }
+        }
         LoadRecentFoldersFromDisk(_recentFolderPaths);
-        TryRestoreLastSession();
+        _ = InitializeRecentFilesAsync();
     }
 
     /// <summary>退出时由视图调用，确保最近列表已持久化。</summary>
     public void SaveRecentState()
     {
+        _saveRecentFilesTimer?.Stop();
         SaveRecentFilesToDisk();
     }
 
@@ -64,14 +79,18 @@ public sealed class MainViewModel : ViewModelBase
     private bool _isGitActive;
 
     private DocumentItem? _activeDocument;
+    private readonly Dictionary<string, double> _previewScrollRatiosByPath = new(StringComparer.OrdinalIgnoreCase);
+    private double _currentPreviewScrollRatio;
+    private double? _pendingPreviewScrollRatio;
     private readonly Stack<(string path, int offset)> _focusBackStack = new();
     private readonly Stack<(string path, int offset)> _focusForwardStack = new();
-    private const int MaxRecentFiles = 20;
+    private const int MaxRecentFiles = 100;
     private const int MaxRecentFolders = 10;
     private readonly ObservableCollection<RecentFileItem> _recentFileItems = [];
     private readonly ObservableCollection<string> _recentFolderPaths = [];
     private CancellationTokenSource? _searchCts;
     private Task? _searchTask;
+    private DispatcherTimer? _saveRecentFilesTimer;
 
     /// <summary>无文档时编辑区默认缩放。</summary>
     private double _editorZoomLevel = 1.0;
@@ -261,6 +280,20 @@ public sealed class MainViewModel : ViewModelBase
     /// <summary>当前已打开的文档选项卡集合。</summary>
     public ObservableCollection<DocumentItem> OpenDocuments => _openDocuments;
 
+    /// <summary>预览区当前滚动比例 [0,1]，由 MarkdownEngineView 在滚动时更新。</summary>
+    public double CurrentPreviewScrollRatio
+    {
+        get => _currentPreviewScrollRatio;
+        set => SetProperty(ref _currentPreviewScrollRatio, value);
+    }
+
+    /// <summary>切换回某文档时待恢复的滚动比例，由 MarkdownEngineView 读取后清除。</summary>
+    public double? PendingPreviewScrollRatio
+    {
+        get => _pendingPreviewScrollRatio;
+        set => SetProperty(ref _pendingPreviewScrollRatio, value);
+    }
+
     /// <summary>当前活动的文档（与选项卡选中项保持一致）。</summary>
     public DocumentItem? ActiveDocument
     {
@@ -271,9 +304,14 @@ public sealed class MainViewModel : ViewModelBase
 
             if (_isModified && !string.IsNullOrEmpty(_currentFilePath))
             {
-                // 保持原有行为：切换前尝试保存当前文档
                 TrySaveCurrent();
             }
+
+            var pathToSave = string.IsNullOrEmpty(_currentFilePath)
+                ? (_activeDocument != null ? "untitled:" + _activeDocument.DisplayName : null)
+                : _currentFilePath;
+            if (!string.IsNullOrEmpty(pathToSave))
+                _previewScrollRatiosByPath[pathToSave] = _currentPreviewScrollRatio;
 
             _activeDocument = value;
             OnPropertyChanged();
@@ -292,6 +330,7 @@ public sealed class MainViewModel : ViewModelBase
                 OnPropertyChanged(nameof(PreviewZoomLevel));
                 OnPropertyChanged(nameof(ActivePaneZoomLevel));
                 OnPropertyChanged(nameof(CurrentEncodingName));
+                
             }
         }
     }
@@ -524,62 +563,69 @@ public sealed class MainViewModel : ViewModelBase
             LoadFolder(path);
     });
 
-    /// <summary>持久化用 DTO：路径 + 最后打开时间（UTC）。</summary>
-    private sealed class RecentFileEntryDto
+    private async Task InitializeRecentFilesAsync()
     {
-        public string Path { get; set; } = "";
-        public string LastOpenTimeUtc { get; set; } = ""; // ISO 8601
+        var items = await Task.Run(() => LoadRecentFilesFromDiskCore());
+        Dispatcher.UIThread.Post(() =>
+        {
+            _recentFileItems.Clear();
+            foreach (var item in items)
+                _recentFileItems.Add(item);
+            OnPropertyChanged(nameof(RecentFileItems));
+        });
     }
 
-    private void LoadRecentFilesFromDisk()
+    /// <summary>在后台线程读取并解析最近文件列表（LumConfig 持久化，AOT 友好）。</summary>
+    private static List<RecentFileItem> LoadRecentFilesFromDiskCore()
     {
+        var result = new List<RecentFileItem>();
         try
         {
             var path = Core.AppConfig.RecentFilesPath;
             var dir = Path.GetDirectoryName(path);
             if (!string.IsNullOrEmpty(dir))
                 Directory.CreateDirectory(dir);
-            _recentFileItems.Clear();
-            if (!File.Exists(path)) return;
-            var json = File.ReadAllText(path);
-            // 新格式：[{ "Path": "...", "LastOpenTimeUtc": "..." }]
-            var list = JsonSerializer.Deserialize<List<RecentFileEntryDto>>(json);
-            if (list != null && list.Count > 0)
+            if (!File.Exists(path)) return result;
+            var cfg = new LumConfigManager(path);
+            var pathsObj = cfg.Get("paths");
+            var timesObj = cfg.Get("times");
+            if (pathsObj is IList pathList && pathList.Count > 0)
             {
-                var items = new List<RecentFileItem>();
-                foreach (var e in list)
+                IList? timeList = timesObj as IList;
+                for (int i = 0; i < pathList.Count; i++)
                 {
-                    if (string.IsNullOrWhiteSpace(e.Path)) continue;
-                    var fullPath = Path.GetFullPath(e.Path);
+                    var p = pathList[i]?.ToString();
+                    if (string.IsNullOrWhiteSpace(p)) continue;
+                    var fullPath = Path.GetFullPath(p);
                     var time = DateTime.UtcNow;
-                    if (!string.IsNullOrEmpty(e.LastOpenTimeUtc) && DateTime.TryParse(e.LastOpenTimeUtc, null, System.Globalization.DateTimeStyles.RoundtripKind, out var parsed))
+                    var timeStr = timeList != null && i < timeList.Count ? timeList[i]?.ToString() : null;
+                    if (!string.IsNullOrEmpty(timeStr) &&
+                        DateTime.TryParse(timeStr, null, System.Globalization.DateTimeStyles.RoundtripKind, out var parsed))
                         time = parsed.Kind == DateTimeKind.Unspecified ? DateTime.SpecifyKind(parsed, DateTimeKind.Utc) : parsed.ToUniversalTime();
                     long? size = null;
                     try { if (File.Exists(fullPath)) size = new FileInfo(fullPath).Length; } catch { }
-                    items.Add(new RecentFileItem(fullPath, time, size));
+                    result.Add(new RecentFileItem(fullPath, time, size));
                 }
-                foreach (var item in items.OrderByDescending(x => x.LastOpenTimeUtc).Take(MaxRecentFiles))
-                    _recentFileItems.Add(item);
-                OnPropertyChanged(nameof(RecentFileItems));
-                return;
+                result = result.OrderByDescending(x => x.LastOpenTimeUtc).Take(MaxRecentFiles).ToList();
+                return result;
             }
-            // 旧格式：["path1", "path2"]
-            var legacy = JsonSerializer.Deserialize<List<string>>(json);
-            if (legacy == null) return;
-            var legacyItems = new List<RecentFileItem>();
-            foreach (var p in legacy)
+            var legacyObj = cfg.Get("list");
+            if (legacyObj is IList legacyList)
             {
-                if (string.IsNullOrWhiteSpace(p)) continue;
-                var fullPath = Path.GetFullPath(p);
-                long? size = null;
-                try { if (File.Exists(fullPath)) size = new FileInfo(fullPath).Length; } catch { }
-                legacyItems.Add(new RecentFileItem(fullPath, DateTime.UtcNow, size));
+                foreach (var item in legacyList)
+                {
+                    var p = item?.ToString();
+                    if (string.IsNullOrWhiteSpace(p)) continue;
+                    var fullPath = Path.GetFullPath(p);
+                    long? size = null;
+                    try { if (File.Exists(fullPath)) size = new FileInfo(fullPath).Length; } catch { }
+                    result.Add(new RecentFileItem(fullPath, DateTime.UtcNow, size));
+                }
+                result = result.Take(MaxRecentFiles).ToList();
             }
-            foreach (var item in legacyItems.Take(MaxRecentFiles))
-                _recentFileItems.Add(item);
-            OnPropertyChanged(nameof(RecentFileItems));
         }
         catch { }
+        return result;
     }
 
     private void SaveRecentFilesToDisk()
@@ -589,14 +635,29 @@ public sealed class MainViewModel : ViewModelBase
             var dir = Path.GetDirectoryName(Core.AppConfig.RecentFilesPath);
             if (!string.IsNullOrEmpty(dir))
                 Directory.CreateDirectory(dir);
-            var list = _recentFileItems
-                .Take(MaxRecentFiles)
-                .Select(x => new RecentFileEntryDto { Path = x.FullPath, LastOpenTimeUtc = x.LastOpenTimeUtc.ToString("O") })
-                .ToList();
-            var json = JsonSerializer.Serialize(list);
-            File.WriteAllText(Core.AppConfig.RecentFilesPath, json);
+            var items = _recentFileItems.Take(MaxRecentFiles).ToList();
+            var cfg = new LumConfigManager();
+            cfg.Set("paths", items.Select(x => x.FullPath).ToArray());
+            cfg.Set("times", items.Select(x => x.LastOpenTimeUtc.ToString("O")).ToArray());
+            cfg.Save(Core.AppConfig.RecentFilesPath);
         }
         catch { }
+    }
+
+    /// <summary>节流保存：延迟执行，短时间内多次调用只触发一次写入。</summary>
+    private void ScheduleSaveRecentFiles()
+    {
+        _saveRecentFilesTimer ??= new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+        _saveRecentFilesTimer.Stop();
+        _saveRecentFilesTimer.Tick -= OnSaveRecentFilesTimerTick;
+        _saveRecentFilesTimer.Tick += OnSaveRecentFilesTimerTick;
+        _saveRecentFilesTimer.Start();
+    }
+
+    private void OnSaveRecentFilesTimerTick(object? sender, EventArgs e)
+    {
+        _saveRecentFilesTimer?.Stop();
+        SaveRecentFilesToDisk();
     }
 
     private static void LoadRecentFoldersFromDisk(ObservableCollection<string> target)
@@ -608,15 +669,15 @@ public sealed class MainViewModel : ViewModelBase
             if (!string.IsNullOrEmpty(dir))
                 Directory.CreateDirectory(dir);
             if (!File.Exists(path)) return;
-            var json = File.ReadAllText(path);
-            var list = JsonSerializer.Deserialize<List<string>>(json);
-            if (list == null) return;
+            var cfg = new LumConfigManager(path);
+            var listObj = cfg.Get("list");
+            if (listObj is not IList list) return;
             target.Clear();
-            foreach (var p in list)
+            foreach (var item in list)
             {
+                var p = item?.ToString();
                 if (string.IsNullOrWhiteSpace(p)) continue;
-                var full = Path.GetFullPath(p);
-                target.Add(full);
+                target.Add(Path.GetFullPath(p));
             }
         }
         catch { }
@@ -629,9 +690,9 @@ public sealed class MainViewModel : ViewModelBase
             var dir = Path.GetDirectoryName(Core.AppConfig.RecentFoldersPath);
             if (!string.IsNullOrEmpty(dir))
                 Directory.CreateDirectory(dir);
-            var list = paths.Take(MaxRecentFolders).ToList();
-            var json = JsonSerializer.Serialize(list);
-            File.WriteAllText(Core.AppConfig.RecentFoldersPath, json);
+            var cfg = new LumConfigManager();
+            cfg.Set("list", paths.Take(MaxRecentFolders).ToArray());
+            cfg.Save(Core.AppConfig.RecentFoldersPath);
         }
         catch { }
     }
@@ -677,7 +738,7 @@ public sealed class MainViewModel : ViewModelBase
             {
                 _recentFileItems.RemoveAt(i);
                 _recentFileItems.Insert(0, new RecentFileItem(normalized, now, size));
-                SaveRecentFilesToDisk();
+                ScheduleSaveRecentFiles();
                 OnPropertyChanged(nameof(RecentFileItems));
                 return;
             }
@@ -685,15 +746,19 @@ public sealed class MainViewModel : ViewModelBase
         _recentFileItems.Insert(0, new RecentFileItem(normalized, now, size));
         while (_recentFileItems.Count > MaxRecentFiles)
             _recentFileItems.RemoveAt(_recentFileItems.Count - 1);
-        SaveRecentFilesToDisk();
+        ScheduleSaveRecentFiles();
         OnPropertyChanged(nameof(RecentFileItems));
     }
 
-    /// <summary>在跳转或切换文档前调用，将当前 (path, caret) 压入后退栈。</summary>
-    public void PushBack(string path, int offset)
+    /// <summary>
+    /// 统一入口：记录一次“手动焦点跳转”，将当前位置压入后退栈，并清空前进栈。
+    /// 所有非 Alt+Left/Right 的导航（点击标签、搜索结果、编辑器内大跳转等）都应通过此方法写入历史。
+    /// </summary>
+    public void RecordLocation(string path, int offset)
     {
         if (string.IsNullOrEmpty(path)) return;
         _focusBackStack.Push((path, offset));
+        _focusForwardStack.Clear();
     }
 
     /// <summary>Alt+Left：后退到上一焦点。返回 (目标 path, 目标 offset)，若无法后退则 path 为 null。</summary>
@@ -721,8 +786,10 @@ public sealed class MainViewModel : ViewModelBase
         {
             if (SetProperty(ref _layoutMode, value))
             {
+                // 将当前布局模式写回配置，供下次启动时恢复
+                Config.Ui.LayoutMode = value.ToString();
                 OnPropertyChanged(nameof(ShowEditor));
-                OnPropertyChanged(nameof(ShowPreview));
+                OnPropertyChanged(nameof(ShowPreview));                
             }
         }
     }
@@ -1022,7 +1089,7 @@ public sealed class MainViewModel : ViewModelBase
     public void OpenDocument(string? path)
     {
         if (string.IsNullOrWhiteSpace(path)) return;
-        LoadDocument(path);
+        LoadDocument(path);        
     }
 
     /// <summary>在指定目录下新建子文件夹并刷新树。返回新文件夹路径，失败返回 null。</summary>
@@ -1260,7 +1327,7 @@ public sealed class MainViewModel : ViewModelBase
 
         if (File.Exists(path))
             doc.LastKnownWriteTimeUtc = File.GetLastWriteTimeUtc(path);
-        ActiveDocument = doc;
+        ActiveDocument = doc;        
     }
 
     /// <summary>由视图定时调用，检测当前文件是否在外部被修改（不占用文件）。</summary>
@@ -1299,6 +1366,9 @@ public sealed class MainViewModel : ViewModelBase
         _currentFilePath = doc.FullPath;
         _currentFileName = doc.DisplayName;
         _isModified = doc.IsModified;
+
+        var pathKey = string.IsNullOrEmpty(doc.FullPath) ? "untitled:" + doc.DisplayName : doc.FullPath;
+        PendingPreviewScrollRatio = _previewScrollRatiosByPath.TryGetValue(pathKey, out var r) ? r : null;
 
         OnPropertyChanged(nameof(CurrentMarkdown));
         OnPropertyChanged(nameof(CurrentFilePath));

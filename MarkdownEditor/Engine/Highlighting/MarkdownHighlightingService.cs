@@ -369,181 +369,81 @@ public sealed class MarkdownHighlightingService
     }
 
     /// <summary>
-    /// 对单行从 startCol 起扫描行内语法，与 MarkdownParser.ParseInline 顺序一致，输出精确 (line, col, len, kind)。
+    /// 对单行从 startCol 起扫描行内语法，完全委托给 MarkdownParser.ParseInline 生成的 AST，
+    /// 再根据各 InlineNode 的 SourceSpan 映射到 (line, col, len, kind)。
     /// </summary>
     private static void ScanLineInline(string line, int lineIndex, int startCol, List<HighlightToken> output)
     {
-        int pos = startCol;
-        while (pos < line.Length)
+        if (startCol >= line.Length)
+            return;
+
+        // 将 startCol 之前的前缀裁掉，让 parser 只看到我们关心的片段；
+        // 通过 baseOffset 告诉 parser：该片段在整行中的起始列号。
+        string slice = startCol == 0 ? line : line[startCol..];
+        var inlines = MarkdownParser.ParseInline(slice, baseOffset: startCol);
+
+        if (inlines.Count == 0)
+            return;
+
+        AddInlineNodeTokens(inlines, lineIndex, output);
+    }
+
+    /// <summary>
+    /// 将一组行内 AST 节点递归映射为 HighlightToken。
+    /// 这里把「语法」的判定完全交给 MarkdownParser，只负责类型到 HighlightKind 的映射和位置信息展开。
+    /// </summary>
+    private static void AddInlineNodeTokens(IReadOnlyList<InlineNode> nodes, int lineIndex, List<HighlightToken> output)
+    {
+        foreach (var node in nodes)
         {
-            int len = 0;
-            HighlightKind? kind = null;
+            switch (node)
+            {
+                case ImageNode img:
+                    AddToken(img, HighlightKind.Image);
+                    break;
 
-            // ![alt](url)
-            if (pos + 2 < line.Length && line[pos] == '!' && line[pos + 1] == '[')
-            {
-                int endAlt = pos + 2;
-                while (endAlt < line.Length && line[endAlt] != ']') endAlt++;
-                if (endAlt < line.Length && endAlt + 2 < line.Length && line[endAlt + 1] == '(')
-                {
-                    int endUrl = endAlt + 2;
-                    while (endUrl < line.Length && line[endUrl] != ')' && line[endUrl] != ' ') endUrl++;
-                    if (endUrl < line.Length && line[endUrl] == ')')
-                    {
-                        len = endUrl - pos + 1;
-                        kind = HighlightKind.Image;
-                    }
-                }
-            }
+                case FootnoteRefNode fn:
+                    AddToken(fn, HighlightKind.FootnoteRef);
+                    break;
 
-            // [^id]
-            if (kind == null && pos + 3 <= line.Length && line[pos] == '[' && line[pos + 1] == '^')
-            {
-                int end = pos + 2;
-                while (end < line.Length && line[end] != ']') end++;
-                if (end < line.Length)
-                {
-                    len = end - pos + 1;
-                    kind = HighlightKind.FootnoteRef;
-                }
-            }
+                case LinkNode link:
+                    AddToken(link, HighlightKind.Link);
+                    break;
 
-            // [text](url)
-            if (kind == null && pos + 1 < line.Length && line[pos] == '[')
-            {
-                int endText = pos + 1;
-                while (endText < line.Length && line[endText] != ']') endText++;
-                if (endText < line.Length && endText + 2 < line.Length && line[endText + 1] == '(')
-                {
-                    int endUrl = endText + 2;
-                    while (endUrl < line.Length && line[endUrl] != ')' && line[endUrl] != ' ') endUrl++;
-                    if (endUrl < line.Length && line[endUrl] == ')')
-                    {
-                        len = endUrl - pos + 1;
-                        kind = HighlightKind.Link;
-                    }
-                }
-            }
+                case MathInlineNode math:
+                    AddToken(math, HighlightKind.MathInline);
+                    break;
 
-            // $...$ 行内公式（非 $$）
-            if (kind == null && pos < line.Length && line[pos] == '$' && (pos + 1 >= line.Length || line[pos + 1] != '$'))
-            {
-                int end = pos + 1;
-                while (end < line.Length && line[end] != '\n')
-                {
-                    if (line[end] == '$' && (end + 1 >= line.Length || line[end + 1] != '$'))
-                    {
-                        len = end - pos + 1;
-                        kind = HighlightKind.MathInline;
-                        break;
-                    }
-                    end++;
-                }
-            }
+                case CodeNode code:
+                    AddToken(code, HighlightKind.CodeInline);
+                    break;
 
-            // `...`
-            if (kind == null && pos < line.Length && line[pos] == '`')
-            {
-                int end = pos + 1;
-                while (end < line.Length && line[end] != '`') end++;
-                if (end < line.Length)
-                {
-                    len = end - pos + 1;
-                    kind = HighlightKind.CodeInline;
-                }
-            }
+                case BoldNode bold:
+                    AddToken(bold, HighlightKind.Strong);
+                    // 嵌套内容暂不递归，以免未携带绝对列号的 Span 造成偏移错误。
+                    break;
 
-            // **...**
-            if (kind == null && pos + 4 <= line.Length && line[pos] == '*' && line[pos + 1] == '*')
-            {
-                int inner = pos + 2;
-                while (inner + 2 <= line.Length)
-                {
-                    if (line[inner] == '*' && line[inner + 1] == '*')
-                    {
-                        len = inner + 2 - pos;
-                        kind = HighlightKind.Strong;
-                        break;
-                    }
-                    inner++;
-                }
-            }
+                case ItalicNode em:
+                    AddToken(em, HighlightKind.Emphasis);
+                    break;
 
-            // __...__
-            if (kind == null && pos + 4 <= line.Length && line[pos] == '_' && line[pos + 1] == '_')
-            {
-                int inner = pos + 2;
-                while (inner + 2 <= line.Length)
-                {
-                    if (line[inner] == '_' && line[inner + 1] == '_')
-                    {
-                        len = inner + 2 - pos;
-                        kind = HighlightKind.Strong;
-                        break;
-                    }
-                    inner++;
-                }
-            }
+                case StrikethroughNode strike:
+                    AddToken(strike, HighlightKind.Strikethrough);
+                    break;
 
-            // ~~...~~
-            if (kind == null && pos + 4 <= line.Length && line[pos] == '~' && line[pos + 1] == '~')
-            {
-                int inner = pos + 2;
-                while (inner + 2 <= line.Length)
-                {
-                    if (line[inner] == '~' && line[inner + 1] == '~')
-                    {
-                        len = inner + 2 - pos;
-                        kind = HighlightKind.Strikethrough;
-                        break;
-                    }
-                    inner++;
-                }
+                default:
+                    // TextNode 等纯文本节点不单独产生 token
+                    break;
             }
+        }
 
-            // *...* 斜体（单字符，且不能是 **）
-            if (kind == null && pos + 2 < line.Length && line[pos] == '*' && line[pos + 1] != '*')
-            {
-                int inner = pos + 1;
-                while (inner < line.Length)
-                {
-                    if (line[inner] == '\n') break;
-                    if (line[inner] == '*')
-                    {
-                        len = inner - pos + 1;
-                        kind = HighlightKind.Emphasis;
-                        break;
-                    }
-                    inner++;
-                }
-            }
+        void AddToken(InlineNode node, HighlightKind kind)
+        {
+            var span = node.Span;
+            if (span.Length <= 0)
+                return;
 
-            // _..._ 斜体（单字符，且不能是 __）
-            if (kind == null && pos + 2 < line.Length && line[pos] == '_' && line[pos + 1] != '_')
-            {
-                int inner = pos + 1;
-                while (inner < line.Length)
-                {
-                    if (line[inner] == '\n') break;
-                    if (line[inner] == '_')
-                    {
-                        len = inner - pos + 1;
-                        kind = HighlightKind.Emphasis;
-                        break;
-                    }
-                    inner++;
-                }
-            }
-
-            if (kind != null && len > 0)
-            {
-                output.Add(new HighlightToken(lineIndex, pos, len, kind.Value));
-                pos += len;
-            }
-            else
-            {
-                pos++;
-            }
+            output.Add(new HighlightToken(lineIndex, span.Start, span.Length, kind));
         }
     }
 

@@ -317,6 +317,7 @@
                 </Style>
                 <Style Selector="TreeViewItem:pointerover">
                   <Setter Property="Background" Value="#2a2d2e"/>
+                  <Setter Property="Cursor" Value="Hand"/>
                 </Style>
                 <!-- 树内箭头按钮不单独高亮，保持透明，由行高亮统一体现 -->
                 <Style Selector="TreeView TreeViewItem Button">
@@ -577,7 +578,7 @@
                   <ItemsControl.ItemTemplate>
                     <DataTemplate x:DataType="vm:RecentFileItem">
                       <Button Background="Transparent"
-                              Foreground="#cccccc"
+                              Foreground="#3794ff"
                               FontSize="13"
                               Padding="8,6"
                               HorizontalContentAlignment="Left"
@@ -777,18 +778,18 @@
           <TextBlock Text="布局:"
                      Foreground="White"
                      FontSize="10"/>
-          <Button x:Name="LayoutBothButton"
+          <Button x:Name="LayoutModeButton"
                   Content="编辑+预览"
                   FontSize="10"
-                  Padding="6,0"/>
-          <Button x:Name="LayoutEditorOnlyButton"
-                  Content="仅编辑"
-                  FontSize="10"
-                  Padding="6,0"/>
-          <Button x:Name="LayoutPreviewOnlyButton"
-                  Content="仅预览"
-                  FontSize="10"
-                  Padding="6,0"/>
+                  Padding="6,0">
+            <Button.Flyout>
+              <MenuFlyout Placement="Top">
+                <MenuItem x:Name="LayoutBothMenuItem" Header="编辑+预览"/>
+                <MenuItem x:Name="LayoutEditorOnlyMenuItem" Header="仅编辑"/>
+                <MenuItem x:Name="LayoutPreviewOnlyMenuItem" Header="仅预览"/>
+              </MenuFlyout>
+            </Button.Flyout>
+          </Button>
         </StackPanel>
 
         <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">

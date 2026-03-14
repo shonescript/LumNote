@@ -8,31 +8,10 @@ namespace MarkdownEditor.Engine;
 
 /// <summary>
 /// 渲染引擎 - 统一入口
-/// 文档 → 块扫描 → 解析（含缓存）→ 块级增量布局 → 渲染
+/// 文档 → 块扫描 → 解析（含缓存）→ 布局快照 → 渲染
 /// </summary>
 public sealed class RenderEngine
 {
-    /// <summary>块级缓存项：内容哈希用于变更检测，高度与可选完整布局用于局部更新。</summary>
-    private sealed class BlockCacheEntry
-    {
-        public ulong ContentHash;
-        public float CachedHeight = float.NaN;
-        public LayoutBlock? CachedLayout;
-    }
-
-    /// <summary>FNV-1a 64 位哈希，用于块内容变更检测。</summary>
-    private static ulong HashBlockContent(ReadOnlySpan<char> text)
-    {
-        const ulong FnvPrime = 1099511628211;
-        const ulong FnvOffset = 14695981039346656037;
-        ulong h = FnvOffset;
-        foreach (char c in text)
-        {
-            h ^= c;
-            h *= FnvPrime;
-        }
-        return h;
-    }
     private readonly EngineConfig _config;
     private readonly ILayoutEngine _layout;
     private readonly SkiaRenderer _renderer;
@@ -51,8 +30,6 @@ public sealed class RenderEngine
     private float _cachedTotalHeight;
     /// <summary>布局后内容的实际最大宽度（含代码块等长行），用于横向滚动。</summary>
     private float _cachedContentWidth;
-    /// <summary>块级缓存：与 _cachedBlocks 一一对应，用于变更检测与局部布局。</summary>
-    private List<BlockCacheEntry> _blockCache = [];
     /// <summary>累积 Y[i] = 块 0..i-1 的高度和，Y[0]=0，用于可见区间与 HitTest。</summary>
     private float[] _cumulativeY = [];
     /// <summary>当前增量布局窗口 [Start, End)，用于判断是否需重新构建 _cachedLayouts。</summary>
@@ -67,8 +44,68 @@ public sealed class RenderEngine
         _layout = layout ?? new SkiaLayoutEngine(_config, _imageLoader, _renderer);
     }
 
+    /// <summary>
+    /// 使用解析得到的块列表快照更新当前块缓存。
+    /// 内部会做脚注归一化。可由后台解析任务完成后在 UI 线程调用。
+    /// </summary>
+    public void ApplyBlocksSnapshot(BlockListSnapshot snapshot, IDocumentSource doc)
+    {
+        if (snapshot == null || doc == null)
+            return;
+
+        var (normalizedBlocks, normalizedRanges) = NormalizeFootnotes(snapshot.Blocks, snapshot.Ranges);
+        _cachedDoc = doc;
+        _cachedDocVersion = doc is IVersionedDocumentSource vds ? vds.Version : 0;
+        _cachedBlocks = normalizedBlocks;
+        _cachedBlockRanges = normalizedRanges;
+        _cachedLayouts = null;
+        _cachedTotalHeight = 0;
+        _cachedContentWidth = 0;
+        _layoutWindow = (-1, -1);
+        _cumulativeY = [];
+
+    }
+
+    /// <summary>
+    /// 使用外部计算好的布局快照替换当前缓存。
+    /// 该方法本身不做任何重计算，可由后台任务完成 LayoutBlocksSnapshot 计算后在 UI 线程调用。
+    /// </summary>
+    public void ApplyLayoutSnapshot(LayoutBlocksSnapshot snapshot)
+    {
+        if (snapshot == null)
+            return;
+
+        // 将快照中的只读集合转换为内部可变结构，便于后续同步路径继续沿用。
+        _cachedLayouts = new List<LayoutBlock>(snapshot.Blocks);
+
+        // 累积高度数组与聚合信息直接替换。
+        _cumulativeY = snapshot.CumulativeY is float[] arr
+            ? arr
+            : snapshot.CumulativeY.ToArray();
+        _cachedTotalHeight = snapshot.TotalHeight;
+        _cachedContentWidth = snapshot.ContentWidth;
+        _layoutWindow = snapshot.LayoutWindow;
+    }
+
     /// <summary>获取当前使用的图片加载器，可用于订阅 ImageLoaded 以在图片加载完成后重绘。</summary>
     public IImageLoader? GetImageLoader() => _imageLoader;
+
+    /// <summary>获取累积高度数组的副本，供布局任务复用以保持 cum 一致性。若尚未布局则返回 null。</summary>
+    internal float[]? GetCumulativeYSnapshot()
+    {
+        var cum = _cumulativeY;
+        if (cum == null || cum.Length < 2)
+            return null;
+        var copy = new float[cum.Length];
+        Array.Copy(cum, copy, cum.Length);
+        return copy;
+    }
+
+    /// <summary>获取布局引擎，供后台布局任务使用。</summary>
+    internal ILayoutEngine GetLayoutEngine() => _layout;
+
+    /// <summary>获取引擎配置，供后台布局任务使用。</summary>
+    internal EngineConfig GetConfig() => _config;
 
     public void SetWidth(float width)
     {
@@ -78,11 +115,6 @@ public sealed class RenderEngine
             _width = w;
             _cachedLayouts = null;
             _layoutWindow = (-1, -1);
-            for (int i = 0; i < _blockCache.Count; i++)
-            {
-                _blockCache[i].CachedHeight = float.NaN;
-                _blockCache[i].CachedLayout = null;
-            }
             _cumulativeY = [];
             _cachedTotalHeight = 0;
         }
@@ -90,22 +122,21 @@ public sealed class RenderEngine
 
     /// <summary>
     /// 获取视口内需渲染的块区间（基于真实布局高度）。可多渲染一屏作为缓存。
+    /// 使用 _cumulativeY 二分查找，O(log n) 替代 O(n) 线性遍历。
+    /// 当 _layoutWindow 为部分布局时，将块索引转换为 _cachedLayouts 内的局部索引。
     /// </summary>
     public (int startBlock, int endBlock) GetVisibleBlockRange(IDocumentSource doc, float scrollY, float viewportHeight)
     {
         if (_cachedLayouts == null || _cachedLayouts.Count == 0)
             return (0, 0);
-        var blocks = _cachedLayouts;
-        int start = FindFirstVisibleBlockIndex(blocks, scrollY);
+        var cum = _cumulativeY;
+        if (cum == null || cum.Length < 2)
+            return (0, 0);
+        int n = cum.Length - 1;
+        int start = FindFirstVisibleBlockIndexBinary(cum, n, scrollY);
         float limit = scrollY + viewportHeight * 2;
-        int end = start;
-        for (int i = start; i < blocks.Count; i++)
-        {
-            end = i + 1;
-            if (blocks[i].Bounds.Top >= limit)
-                break;
-        }
-        return (start, Math.Min(end, blocks.Count));
+        int end = FindFirstBlockIndexAtOrAboveY(cum, n, limit);
+        return ToLayoutIndices(start, end);
     }
 
     /// <summary>
@@ -115,29 +146,64 @@ public sealed class RenderEngine
     {
         if (_cachedLayouts == null || _cachedLayouts.Count == 0)
             return (0, 0);
-        var blocks = _cachedLayouts;
-        int start = FindFirstVisibleBlockIndex(blocks, scrollY);
+        var cum = _cumulativeY;
+        if (cum == null || cum.Length < 2)
+            return (0, 0);
+        int n = cum.Length - 1;
+        int start = FindFirstVisibleBlockIndexBinary(cum, n, scrollY);
         float pageBottom = scrollY + viewportHeight;
         int end = start;
-        for (int i = start; i < blocks.Count; i++)
+        for (int i = start; i < n; i++)
         {
-            if (blocks[i].Bounds.Top >= pageBottom)
+            if (cum[i] >= pageBottom)
                 break;
-            if (blocks[i].Bounds.Bottom <= pageBottom)
+            if (cum[i + 1] <= pageBottom)
                 end = i + 1;
         }
-        return (start, end);
+        return ToLayoutIndices(start, end);
     }
 
-    /// <summary>第一个满足 Bounds.Bottom >= scrollY 的块索引；若均在上方则返回 0。</summary>
-    private static int FindFirstVisibleBlockIndex(List<LayoutBlock> blocks, float scrollY)
+    /// <summary>将块索引转为 _cachedLayouts 内的索引；若为部分布局则按 _layoutWindow 裁剪并偏移。</summary>
+    private (int start, int end) ToLayoutIndices(int blockStart, int blockEnd)
     {
-        for (int i = 0; i < blocks.Count; i++)
+        var (winStart, winEnd) = _layoutWindow;
+        if (winStart < 0 || winEnd <= winStart)
+            return (blockStart, Math.Min(blockEnd, _cachedLayouts!.Count));
+        int start = Math.Max(blockStart, winStart);
+        int end = Math.Min(blockEnd, winEnd);
+        if (start >= end)
+            return (0, 0);
+        return (start - winStart, end - winStart);
+    }
+
+    /// <summary>二分查找：第一个满足 cum[i+1] >= scrollY 的块索引 i；若均在上方则返回 0。</summary>
+    private static int FindFirstVisibleBlockIndexBinary(float[] cum, int blockCount, float scrollY)
+    {
+        int left = 0, right = blockCount - 1;
+        while (left < right)
         {
-            if (blocks[i].Bounds.Bottom >= scrollY)
-                return i;
+            int mid = (left + right) >> 1;
+            if (cum[mid + 1] >= scrollY)
+                right = mid;
+            else
+                left = mid + 1;
         }
-        return 0;
+        return left;
+    }
+
+    /// <summary>二分查找：最小的 i 使得 cum[i] >= y；若均小于 y 则返回 blockCount。</summary>
+    private static int FindFirstBlockIndexAtOrAboveY(float[] cum, int blockCount, float y)
+    {
+        int left = 0, right = blockCount;
+        while (left < right)
+        {
+            int mid = (left + right) >> 1;
+            if (cum[mid] >= y)
+                right = mid;
+            else
+                left = mid + 1;
+        }
+        return left;
     }
 
     /// <summary>
@@ -156,11 +222,7 @@ public sealed class RenderEngine
         SelectionRange? selection, out float nextScrollY, bool fullBlocksOnly = false)
     {
         nextScrollY = scrollY + viewportHeight;
-        if (_blockCache.Count == 0)
-            return;
-        // 按需布局：增量时只布局可见窗口，全量时在 HitTest/导出 等路径已做
-        if (_layoutWindow.start >= 0 || _cachedLayouts == null)
-            EnsureLayout(doc, scrollY, viewportHeight);
+        // 仅消费布局快照，不再在 UI 线程调用 EnsureLayout
         var layouts = _cachedLayouts;
         if (layouts == null || layouts.Count == 0)
             return;
@@ -180,58 +242,12 @@ public sealed class RenderEngine
         ctx.Canvas.Restore();
     }
 
-    private void ParseFullDocument(IDocumentSource doc)
-    {
-        var rawBlocks = new List<MarkdownNode?>();
-        var rawRanges = new List<(int startLine, int endLine)>();
-        int line = 0;
-        while (line < doc.LineCount)
-        {
-            var span = BlockScanner.ScanNextBlock(doc, line);
-            if (span.LineCount <= 0) break;
-            var text = GetSpanText(doc, span);
-            var fullDoc = MarkdownParser.Parse(text);
-            foreach (var child in fullDoc.Children)
-            {
-                rawBlocks.Add(child);
-                rawRanges.Add((span.StartLine, span.EndLine));
-            }
-            line = span.EndLine;
-        }
-
-        var (normalizedBlocks, normalizedRanges) = NormalizeFootnotes(rawBlocks, rawRanges);
-        _cachedBlocks = normalizedBlocks;
-        _cachedBlockRanges = normalizedRanges;
-    }
-
-    private static string GetSpanText(IDocumentSource doc, BlockSpan span)
-    {
-        var sb = new System.Text.StringBuilder();
-        for (int i = span.StartLine; i < span.EndLine; i++)
-        {
-            if (i > span.StartLine) sb.Append('\n');
-            sb.Append(doc.GetLine(i).ToString());
-        }
-        return sb.ToString();
-    }
-
-    /// <summary>取块 i 的源码文本，用于内容哈希。</summary>
-    private string GetBlockText(IDocumentSource doc, int blockIndex)
-    {
-        if (blockIndex < 0 || blockIndex >= _cachedBlockRanges.Count)
-            return string.Empty;
-        var (startLine, endLine) = _cachedBlockRanges[blockIndex];
-        var span = new BlockSpan(startLine, endLine, BlockKind.Paragraph);
-        return GetSpanText(doc, span);
-    }
-
     /// <summary>
     /// 命中测试 - 将文档坐标转为 (blockIndex, charOffset, isSelectable, linkUrl, lineIndexInBlock)
     /// lineIndexInBlock: 命中的布局行在该块内的索引（用于 todo 等按行定位）
     /// </summary>
     public (int blockIndex, int charOffset, bool isSelectable, string? linkUrl, int lineIndexInBlock)? HitTest(IDocumentSource doc, float contentX, float contentY)
     {
-        EnsureLayout(doc);
         if (_cachedLayouts == null)
             return null;
 
@@ -294,249 +310,6 @@ public sealed class RenderEngine
         return null;
     }
 
-    private void EnsureParsed(IDocumentSource doc)
-    {
-        int version = 0;
-        if (doc is MarkdownEditor.Engine.Document.IVersionedDocumentSource vds)
-            version = vds.Version;
-
-        if (ReferenceEquals(doc, _cachedDoc) && version == _cachedDocVersion)
-            return;
-
-        var oldCache = _blockCache;
-        _cachedDoc = doc;
-        _cachedDocVersion = version;
-        ParseFullDocument(doc);
-        _cachedLayouts = null;
-        _cachedTotalHeight = 0;
-        _cachedContentWidth = 0;
-        _layoutWindow = (-1, -1);
-        _cumulativeY = [];
-
-        // 切换文档后不得复用上一文档的 CachedLayout：其中的 LayoutRun.Text 来自旧 AST，会导致渲染区混入上一文档内容。
-        // 仅复用 CachedHeight（同块文本时可减少高度跳动）。
-        var newCache = new List<BlockCacheEntry>(_cachedBlocks.Count);
-        for (int i = 0; i < _cachedBlocks.Count; i++)
-        {
-            string blockText = GetBlockText(doc, i);
-            ulong newHash = HashBlockContent(blockText.AsSpan());
-            if (i < oldCache.Count && oldCache[i].ContentHash == newHash)
-            {
-                newCache.Add(new BlockCacheEntry
-                {
-                    ContentHash = newHash,
-                    CachedHeight = oldCache[i].CachedHeight,
-                    CachedLayout = null
-                });
-            }
-            else
-            {
-                newCache.Add(new BlockCacheEntry { ContentHash = newHash });
-            }
-        }
-        _blockCache = newCache;
-    }
-
-    /// <summary>确保所有块均有缓存高度（缺失则布局取高），并更新 _cumulativeY 与 _cachedTotalHeight。</summary>
-    private void EnsureBlockHeights(IDocumentSource doc)
-    {
-        if (_blockCache.Count == 0) return;
-
-        float blockIndent = _config.BlockIndent;
-        var contentWidth = Math.Max(1, _width - blockIndent);
-        bool anyDirty = false;
-        for (int i = 0; i < _blockCache.Count; i++)
-        {
-            if (float.IsNaN(_blockCache[i].CachedHeight))
-            {
-                var ast = _cachedBlocks[i];
-                if (ast == null) continue;
-                var (startLine, endLine) = i < _cachedBlockRanges.Count ? _cachedBlockRanges[i] : (0, 0);
-                var layoutBlock = _layout.Layout(ast, contentWidth, i, startLine, endLine);
-                _blockCache[i].CachedHeight = layoutBlock.Bounds.Height;
-                anyDirty = true;
-            }
-        }
-        if (anyDirty || _cumulativeY.Length != _blockCache.Count + 1)
-            UpdateCumulativeY();
-    }
-
-    /// <summary>根据各块 CachedHeight 更新 _cumulativeY 与 _cachedTotalHeight。</summary>
-    private void UpdateCumulativeY()
-    {
-        int n = _blockCache.Count;
-        if (n == 0)
-        {
-            _cumulativeY = [0];
-            _cachedTotalHeight = _config.ExtraBottomPadding;
-            return;
-        }
-        var cum = new float[n + 1];
-        cum[0] = 0;
-        for (int i = 0; i < n; i++)
-        {
-            float h = float.IsNaN(_blockCache[i].CachedHeight) ? 0 : _blockCache[i].CachedHeight;
-            cum[i + 1] = cum[i] + h;
-        }
-        _cumulativeY = cum;
-        _cachedTotalHeight = cum[n] + _config.ExtraBottomPadding;
-    }
-
-    /// <summary>
-    /// 确保当前文档在指定宽度下完成布局。可传入 (scrollY, viewportHeight) 仅布局视口窗口，否则全量布局。
-    /// </summary>
-    private void EnsureLayout(IDocumentSource doc, float? scrollY = null, float? viewportHeight = null)
-    {
-        EnsureParsed(doc);
-        if (_blockCache.Count == 0) return;
-
-        bool incremental = scrollY.HasValue && viewportHeight.HasValue;
-        if (incremental)
-        {
-            EnsureBlockHeights(doc);
-            EnsureLayoutIncremental(doc, scrollY!.Value, viewportHeight!.Value);
-        }
-        else
-        {
-            EnsureLayoutFull(doc);
-        }
-    }
-
-    /// <summary>仅布局与视口相交的块区间（含前后各一屏边距），基于块级缓存与累积 Y。</summary>
-    private void EnsureLayoutIncremental(IDocumentSource doc, float scrollY, float viewportHeight)
-    {
-        int blockCount = _blockCache.Count;
-        int maxIndex = _cumulativeY.Length > 0 ? _cumulativeY.Length - 1 : 0;
-        if (maxIndex <= 0 || blockCount == 0) return;
-        // 保证所有数组长度一致，防止边栏缩放等导致 _cumulativeY / _blockCache / _cachedBlocks / _cachedBlockRanges 不同步
-        int safeCount = Math.Min(blockCount, Math.Min(_cachedBlocks.Count, Math.Min(_cachedBlockRanges.Count, maxIndex)));
-        if (safeCount <= 0) return;
-
-        const float margin = 800f;
-        float yStart = Math.Max(0, scrollY - margin);
-        float yEnd = scrollY + viewportHeight + margin;
-
-        int start = 0;
-        for (; start < _cumulativeY.Length - 1 && _cumulativeY[start + 1] <= yStart; start++) { }
-        int end = start;
-        for (; end < _cumulativeY.Length - 1 && _cumulativeY[end] < yEnd; end++) { }
-        end = Math.Min(end + 1, safeCount);
-
-        if (start >= end) { start = 0; end = Math.Max(1, safeCount); }
-
-        if (_cachedLayouts != null && _layoutWindow.start == start && _layoutWindow.end == end)
-            return;
-
-        _layoutWindow = (start, end);
-        float blockIndent = _config.BlockIndent;
-        var contentWidth = Math.Max(1, _width - blockIndent);
-        float maxRight = contentWidth;
-        var layouts = new List<LayoutBlock>();
-
-        for (int blockIndex = start; blockIndex < end; blockIndex++)
-        {
-            if (blockIndex >= _blockCache.Count || blockIndex >= _cumulativeY.Length
-                || blockIndex >= _cachedBlocks.Count || blockIndex >= _cachedBlockRanges.Count)
-                continue;
-            float topY = _cumulativeY[blockIndex];
-            float h = float.IsNaN(_blockCache[blockIndex].CachedHeight) ? 0 : _blockCache[blockIndex].CachedHeight;
-            LayoutBlock? layoutBlock = _blockCache[blockIndex].CachedLayout;
-            if (layoutBlock == null)
-            {
-                var ast = _cachedBlocks[blockIndex];
-                if (ast == null) continue;
-                var (startLine, endLine) = _cachedBlockRanges[blockIndex];
-                layoutBlock = _layout.Layout(ast, contentWidth, blockIndex, startLine, endLine);
-                _blockCache[blockIndex].CachedLayout = layoutBlock;
-                h = layoutBlock.Bounds.Height;
-            }
-            layoutBlock!.SetGlobalBounds(blockIndent, topY, _width, topY + h);
-            layouts.Add(layoutBlock);
-            if (layoutBlock.Lines != null)
-            {
-                foreach (var line in layoutBlock.Lines)
-                {
-                    foreach (var run in line.Runs)
-                    {
-                        if (run.Bounds.Right > maxRight) maxRight = run.Bounds.Right;
-                    }
-                }
-            }
-        }
-
-        _cachedContentWidth = Math.Max(contentWidth, maxRight);
-        _cachedLayouts = layouts;
-    }
-
-    /// <summary>全量布局，用于命中测试、导出等需要完整布局的场景。基于块级缓存，全部块均做布局并写入缓存。</summary>
-    private void EnsureLayoutFull(IDocumentSource doc)
-    {
-        EnsureBlockHeights(doc);
-        if (_blockCache.Count == 0) return;
-
-        if (_layoutWindow.start < 0 && _cachedLayouts != null && _cachedLayouts.Count > 0)
-            return;
-
-        _layoutWindow = (-1, -1);
-        float blockIndent = _config.BlockIndent;
-        var contentWidth = Math.Max(1, _width - blockIndent);
-        float maxRight = contentWidth;
-        var layouts = new List<LayoutBlock>(_blockCache.Count);
-
-        for (int blockIndex = 0; blockIndex < _cachedBlocks.Count; blockIndex++)
-        {
-            var ast = _cachedBlocks[blockIndex];
-            if (ast == null) continue;
-
-            float topY = _cumulativeY.Length > blockIndex ? _cumulativeY[blockIndex] : 0;
-            float h = float.IsNaN(_blockCache[blockIndex].CachedHeight) ? 0 : _blockCache[blockIndex].CachedHeight;
-
-            LayoutBlock? layoutBlock = _blockCache[blockIndex].CachedLayout;
-            if (layoutBlock == null)
-            {
-                var (startLine, endLine) = blockIndex < _cachedBlockRanges.Count ? _cachedBlockRanges[blockIndex] : (0, 0);
-                layoutBlock = _layout.Layout(ast, contentWidth, blockIndex, startLine, endLine);
-                _blockCache[blockIndex].CachedHeight = layoutBlock.Bounds.Height;
-                _blockCache[blockIndex].CachedLayout = layoutBlock;
-                h = layoutBlock.Bounds.Height;
-            }
-
-            layoutBlock!.SetGlobalBounds(blockIndent, topY, _width, topY + h);
-            layouts.Add(layoutBlock);
-            if (layoutBlock.Lines != null)
-            {
-                foreach (var line in layoutBlock.Lines)
-                {
-                    foreach (var run in line.Runs)
-                    {
-                        if (run.Bounds.Right > maxRight)
-                            maxRight = run.Bounds.Right;
-                    }
-                }
-            }
-        }
-
-        // 在末尾裁掉所有“完全没有可见行”的尾随块
-        float y = _cumulativeY.Length > 0 ? _cumulativeY[_cumulativeY.Length - 1] : 0;
-        for (int i = layouts.Count - 1; i >= 0; i--)
-        {
-            var b = layouts[i];
-            if (b.Lines == null || b.Lines.Count == 0)
-            {
-                y -= b.Bounds.Height;
-                layouts.RemoveAt(i);
-            }
-            else
-            {
-                break;
-            }
-        }
-
-        _cachedContentWidth = Math.Max(contentWidth, maxRight);
-        _cachedLayouts = layouts;
-        _cachedTotalHeight = y + _config.ExtraBottomPadding;
-    }
-
     /// <summary>
     /// 基于 doc.FullText 构建行起始索引，便于从 (line, column) 或块内偏移转换到全局字符偏移。
     /// 仅在文档变更时重建一次。
@@ -565,9 +338,17 @@ public sealed class RenderEngine
         _fullTextLineStarts = list.ToArray();
     }
 
+    /// <summary>将原始块快照做脚注归一化，供布局计算使用。</summary>
+    public static (IReadOnlyList<MarkdownNode?> blocks, IReadOnlyList<(int startLine, int endLine)> ranges) NormalizeBlockSnapshot(BlockListSnapshot raw)
+    {
+        if (raw == null || raw.Count == 0)
+            return ([], []);
+        return NormalizeFootnotes(raw.Blocks, raw.Ranges);
+    }
+
     private static (List<MarkdownNode?> blocks, List<(int startLine, int endLine)> ranges) NormalizeFootnotes(
-        List<MarkdownNode?> blocks,
-        List<(int startLine, int endLine)> ranges)
+        IReadOnlyList<MarkdownNode?> blocks,
+        IReadOnlyList<(int startLine, int endLine)> ranges)
     {
         var defs = new Dictionary<string, FootnoteDefNode>(StringComparer.Ordinal);
         var refOrder = new List<string>();
@@ -587,7 +368,7 @@ public sealed class RenderEngine
         }
 
         if (refOrder.Count == 0)
-            return (blocks, ranges);
+            return (new List<MarkdownNode?>(blocks), new List<(int startLine, int endLine)>(ranges));
 
         var numberById = new Dictionary<string, int>(StringComparer.Ordinal);
         for (int i = 0; i < refOrder.Count; i++)
@@ -676,7 +457,6 @@ public sealed class RenderEngine
     /// </summary>
     public int? GetDocumentOffsetForBlockPosition(IDocumentSource doc, int blockIndex, int charOffsetInBlock)
     {
-        EnsureLayout(doc);
         EnsureLineIndex(doc);
         if (_cachedLayouts == null || _cachedBlockRanges.Count == 0 || _fullTextLineStarts == null)
             return null;
@@ -692,12 +472,46 @@ public sealed class RenderEngine
     }
 
     /// <summary>
+    /// 根据全局字符偏移反查所属块索引（顶层 Block 列表中的下标）。
+    /// 利用全文行起始索引与每块的行范围实现 offset → Block 的快速映射。
+    /// </summary>
+    public int? GetBlockIndexForDocumentOffset(IDocumentSource doc, int documentOffset)
+    {
+        EnsureLineIndex(doc);
+        if (_cachedBlockRanges.Count == 0 || _fullTextLineStarts == null)
+            return null;
+        if (documentOffset < 0 || documentOffset > doc.FullText.Length)
+            return null;
+
+        // 1) 通过行起始索引二分查找出所在行号
+        var starts = _fullTextLineStarts;
+        int line = Array.BinarySearch(starts, documentOffset);
+        if (line < 0)
+        {
+            line = ~line - 1;
+            if (line < 0)
+                line = 0;
+        }
+        if (line >= doc.LineCount)
+            line = doc.LineCount - 1;
+
+        // 2) 在线号所属的块范围中查找第一个满足 startLine <= line < endLine 的块
+        for (int i = 0; i < _cachedBlockRanges.Count; i++)
+        {
+            var (startLine, endLine) = _cachedBlockRanges[i];
+            if (line >= startLine && line < endLine)
+                return i;
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// 根据列表块索引与块内布局行号，解析出该行在文档中的真实行号（0-based）。
     /// 按「列表行」计数（含 - / * / + 与 [ ] 任务行），与布局一行一项一致，避免与普通列表相连时偏移。
     /// </summary>
     public int? GetTodoSourceLineForListBlock(IDocumentSource doc, int blockIndex, int lineIndexInBlock)
     {
-        EnsureParsed(doc);
         if (blockIndex < 0 || blockIndex >= _cachedBlockRanges.Count)
             return null;
         var ast = _cachedBlocks[blockIndex];
@@ -852,16 +666,13 @@ public sealed class RenderEngine
     public string GetSelectedText(IDocumentSource doc, SelectionRange sel)
     {
         if (sel.IsEmpty) return "";
-        EnsureLayout(doc);
+        if (_cachedLayouts == null) return "";
         var (startBlock, startOff, endBlock, endOff) = (sel.StartBlock, sel.StartOffset, sel.EndBlock, sel.EndOffset);
         if (startBlock > endBlock || (startBlock == endBlock && startOff > endOff))
             (startBlock, startOff, endBlock, endOff) = (endBlock, endOff, startBlock, startOff);
 
         var sb = new System.Text.StringBuilder();
         bool firstBlock = true;
-
-        if (_cachedLayouts == null)
-            return "";
 
         foreach (var layoutBlock in _cachedLayouts)
         {
@@ -896,28 +707,43 @@ public sealed class RenderEngine
         return sb.ToString();
     }
 
-    /// <summary>文档总高度（ScrollViewer 内容高度）。由各块实际高度聚合，无估计/实际切换。</summary>
+    /// <summary>文档总高度（ScrollViewer 内容高度）。由布局快照提供，无快照时返回占位高度。</summary>
     public float MeasureTotalHeight(IDocumentSource doc)
     {
-        EnsureParsed(doc);
-        if (_blockCache.Count == 0)
+        if (_cachedLayouts == null || _cachedLayouts.Count == 0)
             return _config.ExtraBottomPadding;
-        EnsureBlockHeights(doc);
         return _cachedTotalHeight;
     }
 
-    /// <summary>强制全量布局（导出、命中测试等需要完整布局时由调用方显式调用）。</summary>
+    /// <summary>
+    /// 同步执行全量解析与布局，供导出等阻塞场景使用。
+    /// 预览区日常渲染由后台 LayoutTaskScheduler 驱动，不调用此方法。
+    /// </summary>
     public void EnsureFullLayout(IDocumentSource doc)
     {
-        EnsureLayout(doc);
+        if (doc == null)
+            return;
+
+        var parseManager = new IncrementalParseManager();
+        var blockSnapshot = parseManager.ReparseFull(doc);
+        ApplyBlocksSnapshot(blockSnapshot, doc);
+
+        var (blocks, ranges) = NormalizeBlockSnapshot(blockSnapshot);
+        var layoutSnapshot = LayoutComputeService.ComputeFull(
+            blocks,
+            ranges,
+            _width,
+            _layout,
+            _config);
+
+        ApplyLayoutSnapshot(layoutSnapshot);
     }
 
     /// <summary>
-    /// 计算内容实际需要的宽度（含代码块等长行）。有布局缓存时返回缓存值，否则返回当前宽度避免触发全量布局。
+    /// 计算内容实际需要的宽度（含代码块等长行）。有布局快照时返回缓存值，否则返回当前宽度。
     /// </summary>
     public float MeasureContentWidth(IDocumentSource doc)
     {
-        EnsureParsed(doc);
         if (_cachedLayouts != null && _cachedContentWidth > 0)
             return _cachedContentWidth;
         return Math.Max(1, _width - _config.BlockIndent) + _config.BlockIndent;
@@ -926,7 +752,6 @@ public sealed class RenderEngine
     /// <summary>脚注区顶部在内容坐标系中的 Y，用于点击脚注上标后滚动。无脚注时返回 null。</summary>
     public float? GetContentYForFootnoteSection(IDocumentSource doc)
     {
-        EnsureLayout(doc);
         if (_cachedLayouts == null) return null;
         foreach (var b in _cachedLayouts)
         {
@@ -940,7 +765,6 @@ public sealed class RenderEngine
     public float? GetContentYForFirstFootnoteRefId(IDocumentSource doc, string id)
     {
         if (string.IsNullOrEmpty(id)) return null;
-        EnsureLayout(doc);
         if (_cachedLayouts == null) return null;
         foreach (var block in _cachedLayouts)
         {
@@ -959,7 +783,6 @@ public sealed class RenderEngine
     /// <summary>指定块内字符偏移对应的内容 Y（用于 ↩︎ 回链滚动）。</summary>
     public float? GetContentYForBlockOffset(IDocumentSource doc, int blockIndex, int charOffset)
     {
-        EnsureLayout(doc);
         if (_cachedLayouts == null) return null;
         foreach (var block in _cachedLayouts)
         {

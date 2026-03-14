@@ -1,6 +1,28 @@
 namespace MarkdownEditor.Core;
 
 /// <summary>
+/// 源码中的一段连续区间，使用相对于所属文本（如一行、一个块文本等）的起始偏移和长度表示。
+/// 对于编辑区高亮而言，常用的是“相对于当前行字符串的列号”。
+/// </summary>
+public readonly struct SourceSpan
+{
+    public int Start { get; init; }
+    public int Length { get; init; }
+
+    public int End => Start + Length;
+
+    public SourceSpan(int start, int length)
+    {
+        Start = start;
+        Length = length;
+    }
+
+    public static readonly SourceSpan Empty = new(0, 0);
+
+    public bool IsEmpty => Length <= 0;
+}
+
+/// <summary>
 /// Markdown 抽象语法树节点基类
 /// </summary>
 public abstract class MarkdownNode;
@@ -180,7 +202,15 @@ public sealed class FootnoteEntry
 /// <summary>
 /// 行内元素基类
 /// </summary>
-public abstract class InlineNode;
+public abstract class InlineNode
+{
+    /// <summary>
+    /// 该行内节点在其所属输入文本中的源码区间。
+    /// - 对于编辑区行级高亮，约定 Start 为列号，Length 为列数；
+    /// - 当为默认值或 Length &lt;= 0 时，表示“未绑定具体源码位置”。
+    /// </summary>
+    public SourceSpan Span { get; set; }
+}
 
 /// <summary>
 /// 纯文本

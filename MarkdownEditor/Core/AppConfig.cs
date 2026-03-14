@@ -1,31 +1,59 @@
-using System.Text.Json;
-using System.Text.Json.Serialization;
+using LumConfig;
 
 namespace MarkdownEditor.Core;
 
 /// <summary>
-/// 应用配置 - 界面与 Markdown 风格
+/// 应用配置 - 界面与 Markdown 风格（使用 LumConfig 持久化，AOT 友好）
 /// </summary>
 public sealed class AppConfig
 {
-    [JsonPropertyName("ui")]
     public UiConfig Ui { get; set; } = new();
-
-    [JsonPropertyName("markdown")]
     public MarkdownStyleConfig Markdown { get; set; } = new();
 
     public static AppConfig Load(string path)
     {
+        var result = new AppConfig();
         try
         {
-            if (File.Exists(path))
-            {
-                var json = File.ReadAllText(path);
-                return JsonSerializer.Deserialize<AppConfig>(json) ?? new AppConfig();
-            }
+            if (!File.Exists(path))
+                return result;
+            var cfg = new LumConfigManager(path);
+
+            // Ui
+            result.Ui.DocumentListWidth = cfg.GetDouble("ui:documentListWidth") ?? result.Ui.DocumentListWidth;
+            result.Ui.EditorWidth = cfg.GetDouble("ui:editorWidth") ?? result.Ui.EditorWidth;
+            // 不再恢复窗口尺寸和状态，避免最大化/还原时尺寸异常
+            result.Ui.LayoutMode = cfg.GetString("ui:layoutMode") ?? result.Ui.LayoutMode;
+            result.Ui.BackgroundColor = cfg.GetString("ui:backgroundColor") ?? result.Ui.BackgroundColor;
+            result.Ui.SidebarBackground = cfg.GetString("ui:sidebarBackground") ?? result.Ui.SidebarBackground;
+            result.Ui.HeaderBackground = cfg.GetString("ui:headerBackground") ?? result.Ui.HeaderBackground;
+            result.Ui.LinkColor = cfg.GetString("ui:linkColor") ?? result.Ui.LinkColor;
+
+            // Markdown
+            result.Markdown.CodeBlockBackground = cfg.GetString("markdown:codeBlockBackground") ?? result.Markdown.CodeBlockBackground;
+            result.Markdown.CodeBlockTextColor = cfg.GetString("markdown:codeBlockTextColor") ?? result.Markdown.CodeBlockTextColor;
+            result.Markdown.CodeKeywordColor = cfg.GetString("markdown:codeKeywordColor") ?? result.Markdown.CodeKeywordColor;
+            result.Markdown.CodeStringColor = cfg.GetString("markdown:codeStringColor") ?? result.Markdown.CodeStringColor;
+            result.Markdown.CodeCommentColor = cfg.GetString("markdown:codeCommentColor") ?? result.Markdown.CodeCommentColor;
+            result.Markdown.CodeNumberColor = cfg.GetString("markdown:codeNumberColor") ?? result.Markdown.CodeNumberColor;
+            result.Markdown.CodeDefaultColor = cfg.GetString("markdown:codeDefaultColor") ?? result.Markdown.CodeDefaultColor;
+            result.Markdown.BlockquoteBorderColor = cfg.GetString("markdown:blockquoteBorderColor") ?? result.Markdown.BlockquoteBorderColor;
+            result.Markdown.TableBorderColor = cfg.GetString("markdown:tableBorderColor") ?? result.Markdown.TableBorderColor;
+            result.Markdown.TableHeaderBackground = cfg.GetString("markdown:tableHeaderBackground") ?? result.Markdown.TableHeaderBackground;
+            result.Markdown.Heading1Size = cfg.GetInt("markdown:heading1Size") ?? result.Markdown.Heading1Size;
+            result.Markdown.Heading2Size = cfg.GetInt("markdown:heading2Size") ?? result.Markdown.Heading2Size;
+            result.Markdown.CodeFontFamily = cfg.GetString("markdown:codeFontFamily") ?? result.Markdown.CodeFontFamily;
+            result.Markdown.BodyFontFamily = cfg.GetString("markdown:bodyFontFamily") ?? result.Markdown.BodyFontFamily;
+            result.Markdown.LinkColor = cfg.GetString("markdown:linkColor") ?? result.Markdown.LinkColor;
+            result.Markdown.TextColor = cfg.GetString("markdown:textColor") ?? result.Markdown.TextColor;
+            result.Markdown.BackgroundColor = cfg.GetString("markdown:backgroundColor") ?? result.Markdown.BackgroundColor;
+            result.Markdown.MathBackground = cfg.GetString("markdown:mathBackground") ?? result.Markdown.MathBackground;
+            result.Markdown.SelectionColor = cfg.GetString("markdown:selectionColor") ?? result.Markdown.SelectionColor;
+            result.Markdown.ImagePlaceholderColor = cfg.GetString("markdown:imagePlaceholderColor") ?? result.Markdown.ImagePlaceholderColor;
+            result.Markdown.ZoomLevel = cfg.GetDouble("markdown:zoomLevel") ?? result.Markdown.ZoomLevel;
         }
         catch { }
-        return new AppConfig();
+        return result;
     }
 
     public void Save(string path)
@@ -35,8 +63,42 @@ public sealed class AppConfig
             var dir = Path.GetDirectoryName(path);
             if (!string.IsNullOrEmpty(dir))
                 Directory.CreateDirectory(dir);
-            var json = JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(path, json);
+            var cfg = new LumConfigManager();
+
+            // Ui
+            cfg.Set("ui:documentListWidth", Ui.DocumentListWidth);
+            cfg.Set("ui:editorWidth", Ui.EditorWidth);
+            // 不再持久化窗口尺寸和状态，统一交由系统窗口管理负责
+            cfg.Set("ui:layoutMode", Ui.LayoutMode);
+            cfg.Set("ui:backgroundColor", Ui.BackgroundColor);
+            cfg.Set("ui:sidebarBackground", Ui.SidebarBackground);
+            cfg.Set("ui:headerBackground", Ui.HeaderBackground);
+            cfg.Set("ui:linkColor", Ui.LinkColor);
+
+            // Markdown
+            cfg.Set("markdown:codeBlockBackground", Markdown.CodeBlockBackground);
+            cfg.Set("markdown:codeBlockTextColor", Markdown.CodeBlockTextColor);
+            cfg.Set("markdown:codeKeywordColor", Markdown.CodeKeywordColor);
+            cfg.Set("markdown:codeStringColor", Markdown.CodeStringColor);
+            cfg.Set("markdown:codeCommentColor", Markdown.CodeCommentColor);
+            cfg.Set("markdown:codeNumberColor", Markdown.CodeNumberColor);
+            cfg.Set("markdown:codeDefaultColor", Markdown.CodeDefaultColor);
+            cfg.Set("markdown:blockquoteBorderColor", Markdown.BlockquoteBorderColor);
+            cfg.Set("markdown:tableBorderColor", Markdown.TableBorderColor);
+            cfg.Set("markdown:tableHeaderBackground", Markdown.TableHeaderBackground);
+            cfg.Set("markdown:heading1Size", Markdown.Heading1Size);
+            cfg.Set("markdown:heading2Size", Markdown.Heading2Size);
+            cfg.Set("markdown:codeFontFamily", Markdown.CodeFontFamily);
+            cfg.Set("markdown:bodyFontFamily", Markdown.BodyFontFamily);
+            cfg.Set("markdown:linkColor", Markdown.LinkColor);
+            cfg.Set("markdown:textColor", Markdown.TextColor);
+            cfg.Set("markdown:backgroundColor", Markdown.BackgroundColor);
+            cfg.Set("markdown:mathBackground", Markdown.MathBackground);
+            cfg.Set("markdown:selectionColor", Markdown.SelectionColor);
+            cfg.Set("markdown:imagePlaceholderColor", Markdown.ImagePlaceholderColor);
+            cfg.Set("markdown:zoomLevel", Markdown.ZoomLevel);
+
+            cfg.Save(path);
         }
         catch { }
     }
@@ -55,93 +117,38 @@ public sealed class AppConfig
 
 public sealed class UiConfig
 {
-    [JsonPropertyName("documentListWidth")]
     public double DocumentListWidth { get; set; } = 280;
-
-    [JsonPropertyName("editorWidth")]
-    public double EditorWidth { get; set; } = 1; // 比例
-
-    [JsonPropertyName("backgroundColor")]
+    public double EditorWidth { get; set; } = 1;
+    // 窗口尺寸与状态不再持久化，交由系统默认行为管理
+    /// <summary>编辑/预览布局模式（Both / EditorOnly / PreviewOnly）。</summary>
+    public string LayoutMode { get; set; } = "Both";
     public string BackgroundColor { get; set; } = "#f6f8fa";
-
-    [JsonPropertyName("sidebarBackground")]
     public string SidebarBackground { get; set; } = "#ffffff";
-
-    [JsonPropertyName("headerBackground")]
     public string HeaderBackground { get; set; } = "#24292f";
-
-    [JsonPropertyName("linkColor")]
     public string LinkColor { get; set; } = "#0566d2";
 }
 
 public sealed class MarkdownStyleConfig
 {
-    [JsonPropertyName("codeBlockBackground")]
     public string CodeBlockBackground { get; set; } = "#252526";
-
-    [JsonPropertyName("codeBlockTextColor")]
     public string CodeBlockTextColor { get; set; } = "#dcdcdc";
-
-    [JsonPropertyName("codeKeywordColor")]
     public string CodeKeywordColor { get; set; } = "#569cd6";
-
-    [JsonPropertyName("codeStringColor")]
     public string CodeStringColor { get; set; } = "#ce9178";
-
-    [JsonPropertyName("codeCommentColor")]
     public string CodeCommentColor { get; set; } = "#6a9955";
-
-    [JsonPropertyName("codeNumberColor")]
     public string CodeNumberColor { get; set; } = "#b5cea8";
-
-    [JsonPropertyName("codeDefaultColor")]
     public string CodeDefaultColor { get; set; } = "#d4d4d4";
-
-    [JsonPropertyName("blockquoteBorderColor")]
     public string BlockquoteBorderColor { get; set; } = "#3f3f46";
-
-    [JsonPropertyName("tableBorderColor")]
     public string TableBorderColor { get; set; } = "#3f3f46";
-
-    [JsonPropertyName("tableHeaderBackground")]
     public string TableHeaderBackground { get; set; } = "#2a2d2e";
-
-    [JsonPropertyName("heading1Size")]
     public int Heading1Size { get; set; } = 28;
-
-    [JsonPropertyName("heading2Size")]
     public int Heading2Size { get; set; } = 24;
-
-    [JsonPropertyName("codeFontFamily")]
     public string CodeFontFamily { get; set; } = "Cascadia Code,Consolas,Microsoft YaHei Mono,monospace";
-
-    [JsonPropertyName("bodyFontFamily")]
     public string BodyFontFamily { get; set; } = "Microsoft YaHei UI,Segoe UI,PingFang SC,sans-serif";
-
-    [JsonPropertyName("linkColor")]
     public string LinkColor { get; set; } = "#3794ff";
-
-    // 普通文本颜色
-    [JsonPropertyName("textColor")]
     public string TextColor { get; set; } = "#d4d4d4";
-
-    // 预览区整体背景（目前右侧为 #1e1e1e，可用作对比参考）
-    [JsonPropertyName("backgroundColor")]
     public string BackgroundColor { get; set; } = "#1e1e1e";
-
-    // 数学块背景
-    [JsonPropertyName("mathBackground")]
     public string MathBackground { get; set; } = "#252526";
-
-    // 选中文本高亮颜色（含 alpha，AARRGGBB）
-    [JsonPropertyName("selectionColor")]
     public string SelectionColor { get; set; } = "#503399ff";
-
-    // 图片占位符背景
-    [JsonPropertyName("imagePlaceholderColor")]
     public string ImagePlaceholderColor { get; set; } = "#404040";
-
-    /// <summary>预览区整体缩放，1.0 = 100%，作用于字号与间距。</summary>
-    [JsonPropertyName("zoomLevel")]
     public double ZoomLevel { get; set; } = 1.0;
 }

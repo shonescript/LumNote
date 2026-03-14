@@ -1,3 +1,5 @@
+using System;
+using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
@@ -6,9 +8,11 @@ using Avalonia.Media;
 using Avalonia.Platform;
 using Avalonia.Rendering.SceneGraph;
 using Avalonia.Skia;
+using Avalonia.Threading;
 using MarkdownEditor.Core;
 using MarkdownEditor.Engine;
 using MarkdownEditor.Engine.Document;
+using MarkdownEditor.Engine.Layout;
 using MarkdownEditor.Engine.Render;
 using MarkdownEditor.ViewModels;
 using SkiaSharp;
@@ -55,8 +59,16 @@ public class EngineRenderControl : Control
     private DateTime _lastSelectionInvalidate = DateTime.MinValue;
     private bool _selectionInvalidateScheduled;
 
+    private readonly LayoutTaskScheduler _layoutScheduler = new();
+    private readonly IncrementalParseManager _parseManager = new();
+    private DispatcherTimer? _scrollLayoutDebounce;
+    private DateTime _lastLayoutAppliedAt = DateTime.MinValue;
+
     /// <summary>上次测量时使用的有效宽度，避免 Document 变更触发的测量收到 0/NaN 导致宽度闪动。</summary>
     private double _lastValidMeasureWidth = 400;
+
+    /// <summary>上次 OnSizeChanged 时的宽度，仅当宽度变化时重置引擎，避免高度变化（内容布局完成）触发重置导致闪烁循环。</summary>
+    private double _lastSizeChangedWidth = -1;
 
     private EngineConfig? _cachedEffectiveConfig;
     private MarkdownStyleConfig? _cachedConfigStyleRef;
@@ -69,17 +81,42 @@ public class EngineRenderControl : Control
         {
             var style = StyleConfig;
             var zoom = style?.ZoomLevel ?? 1.0;
-            if (_cachedEffectiveConfig != null && ReferenceEquals(_cachedConfigStyleRef, style) && Math.Abs(_cachedConfigZoom - zoom) < 1e-6)
+            if (
+                _cachedEffectiveConfig != null
+                && ReferenceEquals(_cachedConfigStyleRef, style)
+                && Math.Abs(_cachedConfigZoom - zoom) < 1e-6
+            )
                 return _cachedEffectiveConfig;
             _cachedConfigStyleRef = style;
             _cachedConfigZoom = zoom;
-            _cachedEffectiveConfig = (EngineConfig.FromStyle(style) ?? new EngineConfig()).WithZoomApplied();
+            _cachedEffectiveConfig = (
+                EngineConfig.FromStyle(style) ?? new EngineConfig()
+            ).WithZoomApplied();
             return _cachedEffectiveConfig;
         }
     }
 
     /// <summary>请求滚动到内容坐标 contentY，用于脚注上标/↩︎ 跳转。</summary>
     public event Action<float>? RequestScrollToY;
+
+    /// <summary>布局快照应用完成后触发，供父级在刷新/窗口尺寸改变后按滚动百分比恢复位置。</summary>
+    public event Action? LayoutApplied;
+
+    /// <summary>视口高度（ScrollViewer 可见区域），用于 ComputeSlim 可见窗口计算。由父级 MarkdownEngineView 设置；未设置时用 Bounds.Height 可能误用内容总高。</summary>
+    public float ViewportHeight { get; set; }
+
+    /// <summary>下次 ScrollOffset 变化时暂不触发布局防抖（用于程序化恢复滚动时避免级联布局）。</summary>
+    public void SuppressNextScrollLayout() => _suppressNextScrollLayout = true;
+
+    private bool _suppressNextScrollLayout;
+
+    /// <summary>由父级设置：滚动触发布局前调用，用于清除待恢复的滚动比例，避免覆盖用户滚动位置。</summary>
+    public Action? ClearPendingScrollRestore { get; set; }
+
+    /// <summary>布局任务是否正在执行。为 true 时，脚注跳转、Todo 勾选等依赖布局的交互可被限制或提示“等待更新”。</summary>
+    public bool IsLayoutPending => _isLayoutPending;
+
+    private bool _isLayoutPending;
 
     public EngineRenderControl()
     {
@@ -96,9 +133,15 @@ public class EngineRenderControl : Control
         DocumentProperty.Changed.AddClassHandler<EngineRenderControl>(
             (c, _) =>
             {
+                Debug.WriteLine($"[Layout] DocumentProperty.Changed -> TriggerParseAndLayout");
                 c._selection = null;
                 c._anchor = null;
+                c.TriggerParseAndLayout(null, null);
             }
+        );
+        // 全量布局仅需重绘；长文档（ComputeSlim）滚动时需重新布局可见区域
+        ScrollOffsetProperty.Changed.AddClassHandler<EngineRenderControl>(
+            (c, _) => c.OnScrollOffsetChanged()
         );
         AddHandler(PointerPressedEvent, OnPointerPressed, RoutingStrategies.Tunnel);
         AddHandler(PointerMovedEvent, OnPointerMoved, RoutingStrategies.Tunnel);
@@ -126,12 +169,156 @@ public class EngineRenderControl : Control
         _engine = new RenderEngine(w, config);
         if (_engine.GetImageLoader() is DefaultImageLoader loader)
             loader.ImageLoaded += () =>
-                Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                Dispatcher.UIThread.Post(() =>
                 {
-                    try { InvalidateVisual(); }
+                    try
+                    {
+                        InvalidateVisual();
+                    }
                     catch { }
                 });
         return _engine;
+    }
+
+    /// <summary>请求重新解析与布局（文档或滚动变化时调用）。可由外部在文档内容变更后调用。</summary>
+    public void RequestParseAndLayout() => TriggerParseAndLayout(null, null);
+
+    /// <summary>请求增量解析与布局，指定受影响的源码行区间 [lineStart, lineEnd)。若区间无效则退化为全量解析。</summary>
+    public void RequestParseAndLayout(int? lineStart, int? lineEnd) =>
+        TriggerParseAndLayout(lineStart, lineEnd);
+
+    /// <summary>触发后台解析+布局任务，完成后在 UI 线程应用快照并刷新。</summary>
+    private void TriggerParseAndLayout(int? lineStart, int? lineEnd)
+    {
+        var doc = Document;
+        if (doc == null)
+        {
+            Debug.WriteLine($"[Layout] TriggerParseAndLayout SKIP: doc=null");
+            return;
+        }
+
+        var engine = GetOrCreateEngine();
+        if (engine == null)
+            return;
+        var config = EffectiveConfig;
+        var w = (float)
+            Math.Max(1, (Bounds.Width > 0 ? Bounds.Width : 400) - config.ContentPaddingX * 2);
+        engine.SetWidth(w);
+        var scrollY = ScrollOffset;
+        // 必须用视口高度，不能用 Bounds.Height（作为 ScrollViewer 内容时 Bounds.Height=文档总高）
+        var viewportH = ViewportHeight > 0 ? ViewportHeight : 800f;
+
+        BlockListSnapshot blockSnapshot;
+        if (
+            lineStart.HasValue
+            && lineEnd.HasValue
+            && lineStart.Value >= 0
+            && lineEnd.Value > lineStart.Value
+            && _parseManager.Blocks.Count > 0
+        )
+        {
+            blockSnapshot = _parseManager.ReparseRange(doc, lineStart.Value, lineEnd.Value);
+            Debug.WriteLine(
+                $"[Layout] TriggerParseAndLayout ReparseRange lineStart={lineStart} lineEnd={lineEnd} blocks={blockSnapshot.Count}"
+            );
+        }
+        else
+        {
+            blockSnapshot = _parseManager.ReparseFull(doc);
+            Debug.WriteLine(
+                $"[Layout] TriggerParseAndLayout ReparseFull blocks={blockSnapshot.Count} (lineStart={lineStart} lineEnd={lineEnd})"
+            );
+        }
+
+        // 在清空引擎前保存上一帧 cum，供 ComputeSlim 复用以保持布局一致性（ComputeSlim 会校验长度）
+        float[]? previousCum = engine.GetCumulativeYSnapshot();
+        engine.ApplyBlocksSnapshot(blockSnapshot, doc);
+
+        _isLayoutPending = true;
+        // 块数 > 500 时使用 ComputeSlim（仅布局可见区域），否则全量布局
+        float? scrollYArg = viewportH > 0 ? scrollY : null;
+        float? viewportArg = viewportH > 0 ? viewportH : null;
+        _layoutScheduler.EnqueueLayoutFromBlocks(
+            blockSnapshot,
+            w,
+            scrollYArg,
+            viewportArg,
+            engine.GetLayoutEngine(),
+            engine.GetConfig(),
+            previousCum,
+            (snapshot, version) =>
+            {
+                Dispatcher.UIThread.Post(() =>
+                {
+                    try
+                    {
+                        var curVer = _layoutScheduler.CurrentVersion;
+                        if (version != curVer)
+                        {
+                            Debug.WriteLine(
+                                $"[Layout] ApplyLayoutSnapshot SKIP: version={version} != CurrentVersion={curVer} (过时结果已忽略)"
+                            );
+                            return;
+                        }
+                        var targetEngine = GetOrCreateEngine();
+                        if (targetEngine != null)
+                        {
+                            targetEngine.ApplyBlocksSnapshot(blockSnapshot, doc);
+                            targetEngine.ApplyLayoutSnapshot(snapshot);
+                            Debug.WriteLine(
+                                $"[Layout] ApplyLayoutSnapshot OK: version={version} blocks={snapshot.Blocks.Count} totalH={snapshot.TotalHeight:F0}"
+                            );
+                        }
+                        _isLayoutPending = false;
+                        _lastLayoutAppliedAt = DateTime.UtcNow;
+                        ToolTip.SetTip(this, null);
+                        InvalidateMeasure();
+                        InvalidateVisual();
+                        LayoutApplied?.Invoke();
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"[Layout] ApplyLayoutSnapshot EXCEPTION: {ex.Message}");
+                        _isLayoutPending = false;
+                    }
+                });
+            }
+        );
+    }
+
+    private void OnScrollOffsetChanged()
+    {
+        InvalidateVisual();
+        if (_suppressNextScrollLayout)
+        {
+            _suppressNextScrollLayout = false;
+            return;
+        }
+        // 布局刚刚完成的一小段时间内不立即触发新的布局，避免“布局完成 → extent 变化 → ScrollChanged → 再次布局”的级联。
+        if ((DateTime.UtcNow - _lastLayoutAppliedAt).TotalMilliseconds < 200)
+            return;
+        _scrollLayoutDebounce ??= new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(120) };
+        _scrollLayoutDebounce.Stop();
+        _scrollLayoutDebounce.Tick -= OnScrollLayoutDebounceTick;
+        _scrollLayoutDebounce.Tick += OnScrollLayoutDebounceTick;
+        _scrollLayoutDebounce.Start();
+    }
+
+    private void OnScrollLayoutDebounceTick(object? sender, EventArgs e)
+    {
+        try
+        {
+            var t = _scrollLayoutDebounce;
+            if (t != null)
+            {
+                t.Stop();
+                t.Tick -= OnScrollLayoutDebounceTick;
+            }
+
+            ClearPendingScrollRestore?.Invoke();
+            TriggerParseAndLayout(null, null);
+        }
+        catch { }
     }
 
     /// <summary>与渲染时一致的滚动值（裁剪到有效范围），用于命中测试与光标对齐。</summary>
@@ -141,6 +328,8 @@ public class EngineRenderControl : Control
         if (doc == null)
             return 0;
         var engine = GetOrCreateEngine();
+        if (engine == null)
+            return 0;
         var totalHeight = engine.MeasureTotalHeight(doc);
         var viewportH = (float)Math.Max(0, Bounds.Height);
         var maxScroll = Math.Max(0, totalHeight - viewportH);
@@ -162,6 +351,19 @@ public class EngineRenderControl : Control
                 if (!string.IsNullOrEmpty(h.linkUrl))
                 {
                     var url = h.linkUrl;
+                    if (
+                        _isLayoutPending
+                        && (
+                            url.StartsWith("footnote:", StringComparison.Ordinal)
+                            || url.StartsWith("footnote-back:", StringComparison.Ordinal)
+                            || url.StartsWith("todo-toggle:", StringComparison.Ordinal)
+                        )
+                    )
+                    {
+                        ToolTip.SetTip(this, "等待更新…");
+                        e.Handled = true;
+                        return;
+                    }
                     if (url.StartsWith("footnote:", StringComparison.Ordinal))
                     {
                         var y = engine?.GetContentYForFootnoteSection(Document);
@@ -449,13 +651,29 @@ public class EngineRenderControl : Control
     {
         base.OnSizeChanged(e);
 
-        // 预览区域尺寸变化时，强制重置引擎与测量，
-        // 避免旧宽度下的布局缓存导致文档底部未重新布局而出现空白。
         if (double.IsFinite(e.NewSize.Width) && e.NewSize.Width > 0)
             _lastValidMeasureWidth = e.NewSize.Width;
 
-        ResetEngine();
-        InvalidateMeasure();
+        // 仅当宽度变化时重置引擎；高度变化通常由内容布局完成触发，若此时重置会导致闪烁循环
+        double newW = e.NewSize.Width;
+        double newH = e.NewSize.Height;
+        bool widthChanged =
+            _lastSizeChangedWidth >= 0 && Math.Abs(newW - _lastSizeChangedWidth) > 1;
+        double prevW = _lastSizeChangedWidth;
+        _lastSizeChangedWidth = newW;
+
+        Debug.WriteLine(
+            $"[Layout] OnSizeChanged: ({prevW:F0},{e.PreviousSize.Height:F0}) -> ({newW:F0},{newH:F0}) widthChanged={widthChanged}"
+        );
+
+        if (widthChanged)
+        {
+            Debug.WriteLine($"[Layout] OnSizeChanged -> ResetEngine + RequestParseAndLayout");
+            ResetEngine();
+            InvalidateMeasure();
+            if (Document != null)
+                RequestParseAndLayout();
+        }
     }
 
     protected override Size MeasureOverride(Size availableSize)
@@ -473,6 +691,8 @@ public class EngineRenderControl : Control
             _lastValidMeasureWidth = availableSize.Width;
 
         var engine = GetOrCreateEngine();
+        if (engine == null)
+            return ClampMeasureSize(availW, 100);
         var w = (float)Math.Max(1, availW - EffectiveConfig.ContentPaddingX * 2);
         engine.SetWidth(w);
         float h = engine.MeasureTotalHeight(doc);

@@ -34,6 +34,7 @@ public sealed class SkiaRenderer : ITextMeasurer
     private SKFont? _codeCjkFont; // 代码块中含中文等 CJK 时的回退字体，避免等宽字体无字形显示为方块
     private readonly Dictionary<RunStyle, SKFont> _fontCache = new();
     private readonly IImageLoader? _imageLoader;
+    private readonly IBlockPainter[] _blockPainters;
 
     public SkiaRenderer(EngineConfig? config = null, IImageLoader? imageLoader = null)
     {
@@ -78,6 +79,7 @@ public sealed class SkiaRenderer : ITextMeasurer
         _codeDefaultColor = config.CodeDefaultColor;
         _linkColor = config.LinkColor;
         _imageLoader = imageLoader ?? new DefaultImageLoader();
+        _blockPainters = BlockPainterRegistry.CreateDefault();
     }
 
     /// <summary>文本是否含 \r 或 \n，用于避免无谓的 Replace 分配。</summary>
@@ -298,93 +300,90 @@ public sealed class SkiaRenderer : ITextMeasurer
             canvas.Save();
             canvas.Translate(block.Bounds.Left, block.Bounds.Top);
 
-            if (block.Kind == BlockKind.Blockquote)
+            IBlockPainter? painter = null;
+            foreach (var p in _blockPainters)
             {
-                DrawBlockquoteStyle(canvas, block);
-            }
-            if (block.Kind == BlockKind.CodeBlock || block.Kind == BlockKind.HtmlBlock)
-            {
-                DrawCodeBlockStyle(canvas, block);
-            }
-            if (block.Kind == BlockKind.DefinitionList)
-            {
-                DrawDefinitionListStyle(canvas, block);
-            }
-            if (block.Kind == BlockKind.Footnotes)
-            {
-                DrawFootnotesStyle(canvas, block);
-            }
-            if (block.Kind == BlockKind.HorizontalRule)
-            {
-                DrawHorizontalRule(canvas, block);
-            }
-
-            if (block.TableInfo is { } ti)
-            {
-                DrawTableGrid(canvas, block, ti);
-            }
-
-            foreach (var line in block.Lines)
-            {
-                // 先绘制该行所有文字/元素
-                foreach (var run in line.Runs)
-                    DrawRun(canvas, run, scale, block);
-
-                // 再按“整行大矩形+首尾精确位置”绘制选区，高亮行为与记事本/Word 一致
-                if (selection is { } s && !s.IsEmpty && line.Runs.Count > 0)
+                if (p.Matches(block.Kind))
                 {
-                    var firstRun = line.Runs[0];
-                    var (_, selStart, selEnd) = s.ForBlock(firstRun.BlockIndex);
-                    if (selStart < selEnd)
-                    {
-                        bool any = false;
-                        float lineLeft = 0,
-                            lineRight = 0;
-                        float lineTop = float.MaxValue,
-                            lineBottom = float.MinValue;
-
-                        foreach (var run in line.Runs)
-                        {
-                            var runStart = run.CharOffset;
-                            var runEnd = run.CharOffset + run.Text.Length;
-                            if (selStart >= runEnd || selEnd <= runStart)
-                                continue;
-
-                            var segStart = System.Math.Max(selStart, runStart);
-                            var segEnd = System.Math.Min(selEnd, runEnd);
-                            var (segLeft, segWidth) = GetSelectionRectInRun(run, segStart, segEnd);
-                            if (segWidth <= 0)
-                                continue;
-
-                            var segRight = segLeft + segWidth;
-                            if (!any)
-                            {
-                                any = true;
-                                lineLeft = segLeft;
-                                lineRight = segRight;
-                            }
-                            else
-                            {
-                                lineLeft = System.Math.Min(lineLeft, segLeft);
-                                lineRight = System.Math.Max(lineRight, segRight);
-                            }
-                            lineTop = System.Math.Min(lineTop, run.Bounds.Top);
-                            lineBottom = System.Math.Max(lineBottom, run.Bounds.Bottom);
-                        }
-
-                        if (any && lineRight > lineLeft)
-                        {
-                            canvas.DrawRect(
-                                new SKRect(lineLeft, lineTop, lineRight, lineBottom),
-                                _selectionPaint
-                            );
-                        }
-                    }
+                    painter = p;
+                    break;
                 }
+            }
+            if (painter != null)
+            {
+                var paintCtx = new BlockPaintContext(
+                    canvas,
+                    scale,
+                    block,
+                    selection,
+                    run => DrawRun(canvas, run, scale, block),
+                    line => DrawSelectionForLine(canvas, line, block, selection),
+                    () => DrawBlockBackground(canvas, block)
+                );
+                painter.Paint(block, paintCtx);
             }
 
             canvas.Restore();
         }
+    }
+
+    /// <summary>按 BlockKind 绘制块级装饰（引用条、代码背景、表格线等），供 BlockPaintContext 回调。</summary>
+    private void DrawBlockBackground(SKCanvas canvas, LayoutBlock block)
+    {
+        if (block.Kind == BlockKind.Blockquote)
+            DrawBlockquoteStyle(canvas, block);
+        if (block.Kind == BlockKind.CodeBlock || block.Kind == BlockKind.HtmlBlock)
+            DrawCodeBlockStyle(canvas, block);
+        if (block.Kind == BlockKind.DefinitionList)
+            DrawDefinitionListStyle(canvas, block);
+        if (block.Kind == BlockKind.Footnotes)
+            DrawFootnotesStyle(canvas, block);
+        if (block.Kind == BlockKind.HorizontalRule)
+            DrawHorizontalRule(canvas, block);
+        if (block.TableInfo is { } ti)
+            DrawTableGrid(canvas, block, ti);
+    }
+
+    /// <summary>绘制一行的选区高亮，供 BlockPaintContext 回调。</summary>
+    private void DrawSelectionForLine(SKCanvas canvas, LayoutLine line, LayoutBlock block, SelectionRange? selection)
+    {
+        if (selection is not { } s || s.IsEmpty || line.Runs.Count == 0)
+            return;
+        var firstRun = line.Runs[0];
+        var (_, selStart, selEnd) = s.ForBlock(firstRun.BlockIndex);
+        if (selStart >= selEnd)
+            return;
+        bool any = false;
+        float lineLeft = 0, lineRight = 0;
+        float lineTop = float.MaxValue, lineBottom = float.MinValue;
+        foreach (var run in line.Runs)
+        {
+            var runStart = run.CharOffset;
+            var runEnd = run.CharOffset + run.Text.Length;
+            if (selStart >= runEnd || selEnd <= runStart)
+                continue;
+            var segStart = Math.Max(selStart, runStart);
+            var segEnd = Math.Min(selEnd, runEnd);
+            var (segLeft, segWidth) = GetSelectionRectInRun(run, segStart, segEnd);
+            if (segWidth <= 0)
+                continue;
+            var segRight = segLeft + segWidth;
+            if (!any)
+            {
+                any = true;
+                lineLeft = segLeft;
+                lineRight = segRight;
+            }
+            else
+            {
+                lineLeft = Math.Min(lineLeft, segLeft);
+                lineRight = Math.Max(lineRight, segRight);
+            }
+            lineTop = Math.Min(lineTop, run.Bounds.Top);
+            lineBottom = Math.Max(lineBottom, run.Bounds.Bottom);
+        }
+        if (any && lineRight > lineLeft)
+            canvas.DrawRect(new SKRect(lineLeft, lineTop, lineRight, lineBottom), _selectionPaint);
     }
 
     private (float left, float width) GetSelectionRectInRun(LayoutRun run, int selStart, int selEnd)
@@ -408,7 +407,18 @@ public sealed class SkiaRenderer : ITextMeasurer
     {
         if (run.Style == RunStyle.Math)
         {
-            DrawMathRun(canvas, run);
+            if (block?.TableInfo != null)
+            {
+                canvas.Save();
+                try
+                {
+                    canvas.ClipRect(run.Bounds, SKClipOperation.Intersect);
+                    DrawMathRun(canvas, run);
+                }
+                finally { canvas.Restore(); }
+            }
+            else
+                DrawMathRun(canvas, run);
             return;
         }
         if (run.Style == RunStyle.Image)
@@ -442,50 +452,65 @@ public sealed class SkiaRenderer : ITextMeasurer
         )
             canvas.DrawRect(run.Bounds, _codeBgPaint);
 
-        var baseTextColor = _textPaint.Color;
-        var textColor = run.Style == RunStyle.Link
-            ? FromLinkColor()
-            : IsCodeBlockHighlightStyle(run.Style)
-                ? GetCodeTokenColor(run.Style)
-                : _textPaint.Color;
-        _textPaint.Color = textColor;
-        _textPaint.TextSize = font.Size;
-        var drawText = GetDrawableText(run.Text);
-        float textX = run.Bounds.Left;
-        float textY = run.Bounds.Bottom - 4;
-        if (run.Style is RunStyle.TableHeaderCell or RunStyle.TableCell)
-            textY = run.Bounds.Bottom - 4;
-        canvas.DrawText(drawText, textX, textY, font, _textPaint);
+        // 表格单元格：按 run 边界裁剪，避免测量余量导致文本画出单元格右侧
+        var isTableCell = run.Style is RunStyle.TableHeaderCell or RunStyle.TableCell;
+        if (isTableCell)
+            canvas.Save();
+        try
+        {
+            if (isTableCell)
+                canvas.ClipRect(run.Bounds, SKClipOperation.Intersect);
 
-        if (
-            run.Style == RunStyle.Link
-            && (
-                run.LinkUrl == null
-                || !run.LinkUrl.StartsWith("footnote-back:", StringComparison.Ordinal)
+            var baseTextColor = _textPaint.Color;
+            var textColor = run.Style == RunStyle.Link
+                ? FromLinkColor()
+                : IsCodeBlockHighlightStyle(run.Style)
+                    ? GetCodeTokenColor(run.Style)
+                    : _textPaint.Color;
+            _textPaint.Color = textColor;
+            _textPaint.TextSize = font.Size;
+            var drawText = GetDrawableText(run.Text);
+            float textX = run.Bounds.Left;
+            float textY = run.Bounds.Bottom - 4;
+            if (isTableCell)
+                textY = run.Bounds.Bottom - 4;
+            canvas.DrawText(drawText, textX, textY, font, _textPaint);
+
+            if (
+                run.Style == RunStyle.Link
+                && (
+                    run.LinkUrl == null
+                    || !run.LinkUrl.StartsWith("footnote-back:", StringComparison.Ordinal)
+                )
             )
-        )
-        {
-            using var linePaint = new SKPaint
             {
-                Color = textColor,
-                Style = SKPaintStyle.Stroke,
-                StrokeWidth = 1
-            };
-            var midY = run.Bounds.Top + run.Bounds.Height * 0.85f;
-            canvas.DrawLine(run.Bounds.Left, midY, run.Bounds.Right, midY, linePaint);
-        }
-        else if (run.Style == RunStyle.Strikethrough)
-        {
-            using var linePaint = new SKPaint
+                using var linePaint = new SKPaint
+                {
+                    Color = textColor,
+                    Style = SKPaintStyle.Stroke,
+                    StrokeWidth = 1
+                };
+                var midY = run.Bounds.Top + run.Bounds.Height * 0.85f;
+                canvas.DrawLine(run.Bounds.Left, midY, run.Bounds.Right, midY, linePaint);
+            }
+            else if (run.Style == RunStyle.Strikethrough)
             {
-                Color = _textPaint.Color,
-                Style = SKPaintStyle.Stroke,
-                StrokeWidth = 1
-            };
-            var midY = run.Bounds.Top + run.Bounds.Height * 0.5f;
-            canvas.DrawLine(run.Bounds.Left, midY, run.Bounds.Right, midY, linePaint);
+                using var linePaint = new SKPaint
+                {
+                    Color = _textPaint.Color,
+                    Style = SKPaintStyle.Stroke,
+                    StrokeWidth = 1
+                };
+                var midY = run.Bounds.Top + run.Bounds.Height * 0.5f;
+                canvas.DrawLine(run.Bounds.Left, midY, run.Bounds.Right, midY, linePaint);
+            }
+            _textPaint.Color = baseTextColor;
         }
-        _textPaint.Color = baseTextColor;
+        finally
+        {
+            if (isTableCell)
+                canvas.Restore();
+        }
     }
 
     private void DrawTodoCheckbox(SKCanvas canvas, LayoutRun run)

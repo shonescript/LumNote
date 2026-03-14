@@ -691,14 +691,24 @@ public static class MarkdownParser
     }
 
     /// <summary>
-    /// 兼容旧式单个 $ 包裹单行公式的块级写法：
-    /// $
-    /// +123
-    /// $
-    /// - 起始行为 \"$\";
-    /// - 起始行与首个非空内容行之间不能出现空行；
-    /// - 首个非空内容行之后紧跟一行必须是 \"$\";
-    /// 其他情况一律视为普通文本。
+    /// 兼容单个 $ 包裹「一行内容」的块级公式写法，支持多种等价形式：
+    /// 1) 经典三行：
+    ///    $
+    ///    +123
+    ///    $
+    /// 2) 起始行带内容，结束行为单独一行：
+    ///    $+123
+    ///    $
+    /// 3) 起始行为单独一行，下一行结尾带结束符：
+    ///    $
+    ///    +123$
+    /// 4) 同行起止：
+    ///    $+123$
+    /// 以上几种都解析为单个 MathBlockNode，LaTeX 内容均为 \"+123\"。
+    /// 约束：
+    /// - 所有 $ 标记必须位于块的行首（忽略缩进）；
+    /// - 不允许在起始 $ 与内容之间、或内容与结束 $ 之间插入空行；
+    /// - 若一行内出现超过两个 $，则视为普通文本。
     /// </summary>
     private static bool TryParseSingleDollarMathBlock(
         List<string> lines,
@@ -711,51 +721,98 @@ public static class MarkdownParser
         if (start >= lines.Count)
             return false;
 
-        var firstTrimmed = lines[start].Trim();
-        if (!string.Equals(firstTrimmed, "$", StringComparison.Ordinal))
+        var firstLine = lines[start];
+        var firstTrimmed = firstLine.Trim();
+        if (firstTrimmed.Length == 0)
+            return false;
+        if (firstTrimmed[0] != '$')
+            return false;
+        // 避免与 $$ 数学块冲突
+        if (firstTrimmed.Length >= 2 && firstTrimmed[1] == '$')
             return false;
 
-        int current = start + 1;
-        if (current >= lines.Count)
-            return false;
-
-        // 首个非空内容行
-        int firstContentIndex = -1;
-        bool sawBlankBeforeContent = false;
-        for (int i = current; i < lines.Count; i++)
+        // 情形 4 / 同行起止：$...$
+        int firstDollar = firstTrimmed.IndexOf('$');
+        int secondDollar = firstTrimmed.IndexOf('$', firstDollar + 1);
+        if (secondDollar >= 0)
         {
-            var t = lines[i].Trim();
-            if (t.Length == 0)
-            {
-                if (firstContentIndex < 0)
-                    sawBlankBeforeContent = true;
-                continue;
-            }
-            if (t == "$")
-            {
-                // 遇到结束符前没有任何内容，视为普通文本
+            // 不允许超过两个 $
+            if (firstTrimmed.IndexOf('$', secondDollar + 1) >= 0)
                 return false;
-            }
-            firstContentIndex = i;
-            break;
+
+            var inner = firstTrimmed[(firstDollar + 1)..secondDollar].Trim();
+            if (inner.Length == 0)
+                return false;
+
+            block = new MathBlockNode { LaTeX = inner };
+            consumed = 1;
+            return true;
         }
 
-        if (firstContentIndex < 0)
-            return false;
-        if (sawBlankBeforeContent)
-            return false;
+        // 只在起始处出现一个 $。
+        // 根据起始行是否只有 $ 决定解析分支。
+        if (string.Equals(firstTrimmed, "$", StringComparison.Ordinal))
+        {
+            int next = start + 1;
+            if (next >= lines.Count)
+                return false;
 
-        int formulaLineIndex = firstContentIndex;
-        int closingIndex = formulaLineIndex + 1;
-        if (closingIndex >= lines.Count)
-            return false;
-        if (!string.Equals(lines[closingIndex].Trim(), "$", StringComparison.Ordinal))
-            return false;
+            var secondTrimmed = lines[next].Trim();
+            if (secondTrimmed.Length == 0)
+                return false; // 起始与内容之间不允许空行
 
-        var latex = lines[formulaLineIndex].Trim();
-        block = new MathBlockNode { LaTeX = latex };
-        consumed = closingIndex - start + 1;
-        return true;
+            // 情形 3：
+            // $
+            // +123$
+            if (secondTrimmed.Length > 1 && secondTrimmed[^1] == '$')
+            {
+                var inner = secondTrimmed[..^1].Trim();
+                if (inner.Length == 0)
+                    return false;
+
+                block = new MathBlockNode { LaTeX = inner };
+                consumed = 2;
+                return true;
+            }
+
+            // 情形 1：经典三行
+            if (secondTrimmed == "$")
+                return false; // 起始后立刻结束且无内容，当作普通文本
+
+            int closingIndex = next + 1;
+            if (closingIndex >= lines.Count)
+                return false;
+
+            var closingTrimmed = lines[closingIndex].Trim();
+            if (!string.Equals(closingTrimmed, "$", StringComparison.Ordinal))
+                return false;
+
+            var latex = secondTrimmed;
+            block = new MathBlockNode { LaTeX = latex };
+            consumed = closingIndex - start + 1;
+            return true;
+        }
+        else
+        {
+            // 情形 2：
+            // $+123
+            // $
+            var after = firstTrimmed[1..].Trim();
+            if (after.Length == 0)
+                return false;
+
+            int next = start + 1;
+            if (next >= lines.Count)
+                return false;
+
+            var secondTrimmed = lines[next].Trim();
+            if (!string.Equals(secondTrimmed, "$", StringComparison.Ordinal))
+                return false;
+
+            block = new MathBlockNode { LaTeX = after };
+            consumed = 2;
+            return true;
+        }
     }
 
     private static (HtmlBlockNode, int) ParseHtmlBlock(List<string> lines, int start)
@@ -857,8 +914,10 @@ public static class MarkdownParser
 
     /// <summary>
     /// 解析行内元素 - 支持 **bold** *italic* ~~strikethrough~~ `code` [link](url) ![img](url)
+    /// baseOffset 用于标注节点在所属输入中的起始偏移，便于编辑区高亮按列定位。
+    /// 对于「按行调用」的场景，建议传入该行内起始列号作为 baseOffset。
     /// </summary>
-    public static List<InlineNode> ParseInline(string text)
+    public static List<InlineNode> ParseInline(string text, int baseOffset = 0)
     {
         var result = new List<InlineNode>();
         var span = text.AsSpan();
@@ -866,11 +925,14 @@ public static class MarkdownParser
 
         while (pos < span.Length)
         {
+            int start = pos;
+
             // 图片 ![alt](url)
             if (pos + 1 < span.Length && span[pos] == '!' && span[pos + 1] == '[')
             {
                 if (TryParseImage(span, pos, out var img, out int consumed))
                 {
+                    img.Span = new SourceSpan(baseOffset + start, consumed);
                     result.Add(img);
                     pos += consumed;
                     continue;
@@ -882,6 +944,7 @@ public static class MarkdownParser
             {
                 if (TryParseFootnoteRef(span, pos, out var fnRef, out int consumed))
                 {
+                    fnRef.Span = new SourceSpan(baseOffset + start, consumed);
                     result.Add(fnRef);
                     pos += consumed;
                     continue;
@@ -893,6 +956,7 @@ public static class MarkdownParser
             {
                 if (TryParseLink(span, pos, out var link, out int consumed))
                 {
+                    link.Span = new SourceSpan(baseOffset + start, consumed);
                     result.Add(link);
                     pos += consumed;
                     continue;
@@ -904,6 +968,7 @@ public static class MarkdownParser
             {
                 if (TryParseMathInline(span, pos, out var math, out int consumed))
                 {
+                    math.Span = new SourceSpan(baseOffset + start, consumed);
                     result.Add(math);
                     pos += consumed;
                     continue;
@@ -915,6 +980,7 @@ public static class MarkdownParser
             {
                 if (TryParseCode(span, pos, out var code, out int consumed))
                 {
+                    code.Span = new SourceSpan(baseOffset + start, consumed);
                     result.Add(code);
                     pos += consumed;
                     continue;
@@ -926,6 +992,7 @@ public static class MarkdownParser
             {
                 if (TryParseBold(span, pos, "**", out var bold, out int consumed))
                 {
+                    bold.Span = new SourceSpan(baseOffset + start, consumed);
                     result.Add(bold);
                     pos += consumed;
                     continue;
@@ -937,6 +1004,7 @@ public static class MarkdownParser
             {
                 if (TryParseBold(span, pos, "__", out var bold, out int consumed))
                 {
+                    bold.Span = new SourceSpan(baseOffset + start, consumed);
                     result.Add(bold);
                     pos += consumed;
                     continue;
@@ -948,6 +1016,7 @@ public static class MarkdownParser
             {
                 if (TryParseStrikethrough(span, pos, out var strike, out int consumed))
                 {
+                    strike.Span = new SourceSpan(baseOffset + start, consumed);
                     result.Add(strike);
                     pos += consumed;
                     continue;
@@ -959,13 +1028,20 @@ public static class MarkdownParser
             {
                 if (TryParseItalic(span, pos, out var italic, out int consumed))
                 {
+                    italic.Span = new SourceSpan(baseOffset + start, consumed);
                     result.Add(italic);
                     pos += consumed;
                     continue;
                 }
             }
 
-            result.Add(new TextNode { Content = span[pos].ToString() });
+            // 退化为单字符文本节点
+            var ch = span[pos];
+            result.Add(new TextNode
+            {
+                Content = ch.ToString(),
+                Span = new SourceSpan(baseOffset + pos, 1)
+            });
             pos++;
         }
 

@@ -33,6 +33,8 @@ public partial class MainWindow : Window
     private bool _sidebarSplitterDragging;
     /// <summary>编辑/预览分隔条是否正在拖动。</summary>
     private bool _contentSplitterDragging;
+    /// <summary>当前是否为程序化导航（Alt+Left/Right、搜索结果等），若是则 SelectionChanged 不应 PushBack，避免无限循环。</summary>
+    private bool _isProgrammaticNavigation;
     private readonly ExportService _exportService = new(
     [
         new HtmlExporter(),
@@ -89,10 +91,17 @@ public partial class MainWindow : Window
                 : WindowState.Maximized;
         };
 
-        // 底部状态栏布局切换
-        LayoutBothButton.Click += (_, _) => vm.LayoutMode = EditorLayoutMode.Both;
-        LayoutEditorOnlyButton.Click += (_, _) => vm.LayoutMode = EditorLayoutMode.EditorOnly;
-        LayoutPreviewOnlyButton.Click += (_, _) => vm.LayoutMode = EditorLayoutMode.PreviewOnly;
+        // 底部状态栏布局切换（下拉菜单）
+        if (LayoutModeButton != null)
+        {
+            LayoutBothMenuItem.Click += (_, _) =>
+            {
+                vm.LayoutMode = EditorLayoutMode.Both;
+                PreviewEngine?.RenderControl.ResetEngine();
+            };
+            LayoutEditorOnlyMenuItem.Click += (_, _) => vm.LayoutMode = EditorLayoutMode.EditorOnly;
+            LayoutPreviewOnlyMenuItem.Click += (_, _) => vm.LayoutMode = EditorLayoutMode.PreviewOnly;
+        }
 
         NewFileMenuItem.Click += (_, _) => vm.NewDocument();
 
@@ -224,6 +233,7 @@ public partial class MainWindow : Window
         AddHandler(PointerPressedEvent, OnWindowPointerPressed, RoutingStrategies.Tunnel);
 
         SetupDeferredSplitters();
+
     }
 
     /// <summary>VS 风格分隔条：拖动时只显示蓝色预览线，松手后再应用布局。</summary>
@@ -232,6 +242,17 @@ public partial class MainWindow : Window
         const double sidebarMin = 180;
         const double sidebarMax = 420;
         const double contentMinWidth = 120;
+
+        // 启动时根据配置恢复侧栏宽度
+        if (MainGrid != null && DataContext is MainViewModel vmInit)
+        {
+            var cols = MainGrid.ColumnDefinitions;
+            if (cols.Count >= 1)
+            {
+                var w = Math.Clamp(vmInit.Config.Ui.DocumentListWidth, sidebarMin, sidebarMax);
+                cols[0].Width = new GridLength(w, GridUnitType.Pixel);
+            }
+        }
 
         if (SidebarSplitter != null && MainGrid != null && SidebarSplitterPreviewLine != null && SidebarSplitterOverlay != null)
         {
@@ -262,7 +283,10 @@ public partial class MainWindow : Window
                 var pt = e.GetPosition(MainGrid);
                 var w = Math.Clamp(pt.X, sidebarMin, sidebarMax);
                 var cols = MainGrid!.ColumnDefinitions;
-                if (cols.Count >= 1) cols[0].Width = new GridLength(w, GridUnitType.Pixel);
+                if (cols.Count >= 1)
+                    cols[0].Width = new GridLength(w, GridUnitType.Pixel);
+                if (DataContext is MainViewModel vmSidebar)
+                    vmSidebar.Config.Ui.DocumentListWidth = w;
             };
             SidebarSplitter.PointerCaptureLost += (s, e) =>
             {
@@ -314,6 +338,12 @@ public partial class MainWindow : Window
                 {
                     cols[0].Width = new GridLength(w, GridUnitType.Pixel);
                     cols[2].Width = new GridLength(1, GridUnitType.Star);
+                    if (DataContext is MainViewModel vmContent && total > 4)
+                    {
+                        var usable = total - 4;
+                        var ratio = usable > 0 ? Math.Clamp(w / usable, 0.1, 0.9) : 0.5;
+                        vmContent.Config.Ui.EditorWidth = ratio;
+                    }
                 }
             };
             ContentSplitter.PointerCaptureLost += (s, e) =>
@@ -536,8 +566,10 @@ public partial class MainWindow : Window
         if (DocumentTabControl == null) return;
         DocumentTabControl.SelectionChanged += (_, e) =>
         {
+            // 仅在用户手动切换标签时记录历史；程序化导航（Alt+Left/Right、搜索结果等）通过 _isProgrammaticNavigation 保护，避免形成环路。
+            if (_isProgrammaticNavigation) return;
             if (e.RemovedItems?.Count > 0 && e.RemovedItems[0] is DocumentItem prev && !string.IsNullOrEmpty(prev.FullPath))
-                vm.PushBack(prev.FullPath, prev.LastCaretOffset);
+                vm.RecordLocation(prev.FullPath, prev.LastCaretOffset);
         };
 
         DocumentTabControl.AddHandler(
@@ -622,7 +654,19 @@ public partial class MainWindow : Window
             return;
 
         if (e.PropertyName == nameof(MainViewModel.LayoutMode))
+        {
             ApplyLayout(vm.LayoutMode);
+            // 同步更新底部布局按钮的文字
+            if (LayoutModeButton != null)
+            {
+                LayoutModeButton.Content = vm.LayoutMode switch
+                {
+                    EditorLayoutMode.EditorOnly => "仅编辑",
+                    EditorLayoutMode.PreviewOnly => "仅预览",
+                    _ => "编辑+预览"
+                };
+            }
+        }
         else if (e.PropertyName is nameof(MainViewModel.IsExplorerActive)
                  or nameof(MainViewModel.IsSearchActive)
                  or nameof(MainViewModel.IsGitActive)
@@ -721,6 +765,11 @@ public partial class MainWindow : Window
                 DoGoForward(vm);
             })
         });
+        KeyBindings.Add(new KeyBinding
+        {
+            Gesture = new KeyGesture(Key.D, KeyModifiers.Control),
+            Command = new RelayCommand(EditorDuplicateSelectionOrLine)
+        });
         // Ctrl+F 由编辑区 SearchPanel 处理（文件内查找）；跨文件搜索通过侧栏“搜索”按钮打开
         KeyBindings.Add(new KeyBinding { Gesture = new KeyGesture(Key.F, KeyModifiers.Control), Command = new RelayCommand(() => FocusEditorFind(vm)) });
         KeyBindings.Add(new KeyBinding { Gesture = new KeyGesture(Key.Add, KeyModifiers.Control), Command = vm.ZoomInCommand });
@@ -783,6 +832,8 @@ public partial class MainWindow : Window
     internal void NavigateTo(string path, int offset)
     {
         if (DataContext is not MainViewModel vm) return;
+        _isProgrammaticNavigation = true;
+        _editorController.SuppressNextHistoryRecord();
         vm.OpenDocument(path);
         Dispatcher.UIThread.Post(() =>
         {
@@ -798,6 +849,7 @@ public partial class MainWindow : Window
                 }
             }
             catch { }
+            finally { _isProgrammaticNavigation = false; }
         });
     }
 
@@ -806,20 +858,79 @@ public partial class MainWindow : Window
         if (result == null || DataContext is not MainViewModel vm) return;
         if (result.FilePath == vm.CurrentFilePath && EditorTextBox is TextEditor editor && editor.Document != null)
         {
+            // 当前已在同一文件内，直接跳转到对应行，同样视为程序化导航，跳过一次历史记录。
+            _editorController.SuppressNextHistoryRecord();
             var lineNum = Math.Clamp(result.LineNumber, 1, editor.Document.LineCount);
             var line = editor.Document.GetLineByNumber(lineNum);
             editor.TextArea.Caret.Offset = line.Offset;
             editor.TextArea.Caret.BringCaretToView();
             return;
         }
+        _isProgrammaticNavigation = true;
+        _editorController.SuppressNextHistoryRecord();
         _editorController.RequestGoToLine(result.LineNumber);
         vm.OpenDocument(result.FilePath);
+        Dispatcher.UIThread.Post(() => _isProgrammaticNavigation = false);
     }
 
     internal void PushFocusHistory(string path, int offset)
     {
         if (DataContext is MainViewModel vm)
-            vm.PushBack(path, offset);
+            vm.RecordLocation(path, offset);
+    }
+
+    /// <summary>
+    /// Ctrl+D：在无选区时复制当前行到下一行；有选区时复制选区并插入到其后方。
+    /// 行复制行为与 VS / VS Code 接近：整行复制（含行尾换行），光标移动到新行的相同列。
+    /// </summary>
+    private void EditorDuplicateSelectionOrLine()
+    {
+        if (EditorTextBox is not TextEditor editor || editor.Document == null)
+            return;
+
+        editor.Focus();
+        var doc = editor.Document;
+        var selection = editor.TextArea.Selection;
+
+        if (selection != null && !selection.IsEmpty)
+        {
+            var seg = selection.SurroundingSegment;
+            if (seg == null || seg.Length == 0)
+                return;
+
+            string selectedText = doc.GetText(seg.Offset, seg.Length);
+            int insertOffset = seg.EndOffset;
+            doc.Insert(insertOffset, selectedText);
+
+            // 选中新复制出的区域，便于连续 Ctrl+D。
+            editor.SelectionStart = insertOffset;
+            editor.SelectionLength = selectedText.Length;
+            editor.TextArea.Caret.Offset = insertOffset + selectedText.Length;
+            return;
+        }
+
+        // 无选区：复制当前整行（含行尾换行）插入到下一行。
+        int caretOffset = editor.TextArea.Caret.Offset;
+        if (doc.LineCount == 0)
+            return;
+
+        var line = doc.GetLineByOffset(caretOffset);
+        int lineStart = line.Offset;
+        int lineEnd = line.LineNumber == doc.LineCount
+            ? doc.TextLength
+            : doc.GetLineByNumber(line.LineNumber + 1).Offset;
+        int lineLength = lineEnd - lineStart;
+        if (lineLength <= 0)
+            return;
+
+        string lineText = doc.GetText(lineStart, lineLength);
+        doc.Insert(lineEnd, lineText);
+
+        // 将光标移动到新插入行的对应列位置。
+        int columnInLine = caretOffset - lineStart;
+        int newLineStart = lineEnd;
+        int newCaret = Math.Clamp(newLineStart + columnInLine, newLineStart, newLineStart + lineLength);
+        editor.TextArea.Caret.Offset = newCaret;
     }
 
     private void EditorUndo()
@@ -1162,7 +1273,7 @@ public partial class MainWindow : Window
             if (e.PropertyName != nameof(MainViewModel.SelectedSearchResult) || vm.SelectedSearchResult == null)
                 return;
             if (EditorTextBox is TextEditor ed)
-                vm.PushBack(vm.CurrentFilePath ?? "", ed.TextArea.Caret.Offset);
+                vm.RecordLocation(vm.CurrentFilePath ?? "", ed.TextArea.Caret.Offset);
             NavigateToSearchResult(vm.SelectedSearchResult);
         };
     }
@@ -1178,8 +1289,7 @@ public partial class MainWindow : Window
     {
         if (sender is not Control c || c.DataContext is not SearchResultItem item || DataContext is not MainViewModel vm)
             return;
-        if (EditorTextBox is TextEditor ed)
-            vm.PushBack(vm.CurrentFilePath ?? "", ed.TextArea.Caret.Offset);
+        // 仅通过 SelectedSearchResult 触发导航；真正的历史记录在 SetupSearchResultsNavigation 中统一处理。
         vm.SelectedSearchResult = item;
     }
 
@@ -1199,12 +1309,21 @@ public partial class MainWindow : Window
         var columns = ContentSplitGrid.ColumnDefinitions;
         if (columns.Count < 3) return;
 
+        // 从配置中读取编辑区宽度比例，用于 Both 布局时保持上次分栏比例
+        double editorRatio = 0.5;
+        if (DataContext is MainViewModel vm)
+        {
+            var r = vm.Config.Ui.EditorWidth;
+            if (r > 0 && r < 1)
+                editorRatio = Math.Clamp(r, 0.1, 0.9);
+        }
+
         switch (mode)
         {
             case EditorLayoutMode.Both:
-                columns[0].Width = new GridLength(1, GridUnitType.Star);
+                columns[0].Width = new GridLength(editorRatio, GridUnitType.Star);
                 columns[1].Width = new GridLength(4);
-                columns[2].Width = new GridLength(1, GridUnitType.Star);
+                columns[2].Width = new GridLength(1 - editorRatio, GridUnitType.Star);
                 break;
             case EditorLayoutMode.EditorOnly:
                 columns[0].Width = new GridLength(1, GridUnitType.Star);

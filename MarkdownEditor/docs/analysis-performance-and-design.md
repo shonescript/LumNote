@@ -32,7 +32,7 @@
 | **csproj** | `OutputType=WinExe` | 跨平台需改为 `Exe`，并处理各平台窗口/托盘等差异。 |
 | **MainWindow.axaml.cs** | 反射设置 AvaloniaEdit `EnableRectangularSelection` | 易被裁剪、随版本断裂。改为公共 API 或 TrimmerRoots 显式保留该类型/属性。 |
 | **EngineRenderControl.cs** | `Process.Start(UseShellExecute = true)` 打开链接 | 行为依赖系统默认浏览器，属“平台相关行为”而非 P/Invoke。跨平台可接受；若需统一行为可抽象为 `IOpenUrlService` 再按平台实现。 |
-| **AppConfig** | `JsonSerializer.Deserialize/Serialize` 无 Source Generator | TrimmerRoots 未保留 AppConfig/UiConfig/MarkdownStyleConfig，PublishTrimmed 可能裁掉属性。建议用 [JsonSerializable] 源生成或 TrimmerRoots 保留这些类型。 |
+| **AppConfig** | 配置与最近文件/文件夹已改用 LumConfig 持久化 | 无反射、AOT 友好，不再使用 JsonSerializer。 |
 
 ### 1.3 已确认无问题的用法
 
