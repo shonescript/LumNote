@@ -17,7 +17,11 @@ public sealed class FileTreeNode : ViewModelBase
     public string DisplayName { get; }
     public string FullPath { get; }
     public bool IsFolder { get; }
+    /// <summary>树中层级（0=根下一级），用于缩进；避免 Avalonia 对空子节点错误多算一层缩进。</summary>
+    public int Level { get; set; }
     public ObservableCollection<FileTreeNode> Children { get; }
+    /// <summary>该文件夹的子节点是否已从磁盘加载过（动态加载用，仅文件夹有效）。</summary>
+    public bool ChildrenLoaded { get; set; }
 
     /// <summary>文件夹是否展开。仅对文件夹有效，用于绑定 TreeViewItem.IsExpanded。</summary>
     public bool IsExpanded

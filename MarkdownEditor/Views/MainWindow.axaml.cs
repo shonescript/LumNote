@@ -279,10 +279,10 @@ public partial class MainWindow : Window
             }, RoutingStrategies.Tunnel);
         }
 
-        if (FileTreeView != null)
+        if (FileTreeList != null)
         {
-            // 使用 AddHandler 确保在冒泡阶段也能收到事件，并统一用单击折叠/展开文件夹
-            FileTreeView.AddHandler(PointerPressedEvent, FileTreeViewOnPointerPressed, RoutingStrategies.Tunnel);
+            // 整行点击：左键展开/折叠文件夹并选中，右键仅选中（ContextFlyout 用）
+            FileTreeList.AddHandler(PointerPressedEvent, FileTreeListOnPointerPressed, RoutingStrategies.Tunnel);
         }
 
         // 监听按键抬起事件，用于在执行 Alt 组合键（键盘或鼠标）后拦截随后的“裸 Alt”抬起，避免焦点跳到菜单栏。
@@ -291,6 +291,8 @@ public partial class MainWindow : Window
 
         // 监听全局鼠标按下事件：当检测到 Alt+左键（列选择等）时，标记需要拦截下一次 Alt KeyUp。
         AddHandler(PointerPressedEvent, OnWindowPointerPressed, RoutingStrategies.Tunnel);
+        // 点击重命名框外时提交重命名，避免因 AvaloniaEdit 等抛出 VisualLinesInvalidException 导致焦点无法移出而卡住
+        AddHandler(PointerPressedEvent, OnClickOutsideRenameCommit, RoutingStrategies.Tunnel);
 
         // 焦点进入编辑区/预览区时同步 ActivePane，使状态栏缩放百分比等即时更新
         AddHandler(GotFocusEvent, OnWindowGotFocus, RoutingStrategies.Bubble);
@@ -541,41 +543,36 @@ public partial class MainWindow : Window
         }
     }
 
-    private void FileTreeViewOnPointerPressed(object? sender, PointerPressedEventArgs e)
+    private void FileTreeListOnPointerPressed(object? sender, PointerPressedEventArgs e)
     {
-        if (e.Source is not Control control)
+        if (e.Source is not Control control || DataContext is not MainViewModel vm)
             return;
 
         var item = control
             .GetVisualAncestors()
-            .OfType<TreeViewItem>()
+            .OfType<ListBoxItem>()
             .FirstOrDefault();
+        var node = item?.DataContext as FileTreeNode;
+        if (node == null) return;
 
         if (e.GetCurrentPoint(this).Properties.IsRightButtonPressed)
         {
-            if (item?.DataContext is FileTreeNode node && DataContext is MainViewModel vm)
-            {
-                vm.SelectedTreeNode = node;
-            }
+            vm.SelectedTreeNode = node;
             return;
         }
 
         if (!e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
             return;
 
-        if (item?.DataContext is FileTreeNode node2 && node2.IsFolder)
-        {
-            node2.IsExpanded = !node2.IsExpanded;
-            e.Handled = true;
-        }
+        // 左键：选中由 ListBox 绑定处理；若为文件夹且非重命名则整行点击展开/折叠（VSCode 风格）
+        if (node.IsFolder && !node.IsRenaming)
+            vm.ToggleFolderNode(node);
     }
 
     private void SetupFileTreeRootButtons(MainViewModel vm)
     {
         if (FileTreeRefreshRootBtn != null)
             FileTreeRefreshRootBtn.Click += (_, _) => vm.RefreshFileTree();
-        if (FileTreeOpenWorkspaceBtn != null)
-            FileTreeOpenWorkspaceBtn.Click += async (_, _) => await DoOpenWorkspaceAsync(vm);
         if (ExplorerOpenWorkspaceBtn != null)
             ExplorerOpenWorkspaceBtn.Click += async (_, _) => await DoOpenWorkspaceAsync(vm);
         if (ExplorerOpenFolderBtn != null)
@@ -637,41 +634,75 @@ public partial class MainWindow : Window
         FileTreeDeleteItem.Click += async (_, _) =>
         {
             var node = vm.SelectedTreeNode;
-            if (node == null || node.IsFolder) return;
+            if (node == null) return;
             var path = node.FullPath;
-            var dialog = new Window
+            if (node.IsFolder)
             {
-                Title = "确认删除",
-                Width = 320,
-                Height = 120,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
-                Icon = GetAppIcon()
-            };
-            var ok = new Button { Content = "删除" };
-            var cancel = new Button { Content = "取消" };
-            cancel.Click += (_, _) => dialog.Close();
-            ok.Click += (_, _) =>
-            {
-                if (vm.DeleteFileByPath(path))
-                    dialog.Close();
-            };
-            dialog.Content = new StackPanel
-            {
-                Margin = new Thickness(16),
-                Spacing = 12,
-                Children =
+                if (vm.IsWorkspaceRoot(path)) return;
+                var dialog = new Window
                 {
-                    new TextBlock { Text = "确定要删除此文件吗？", TextWrapping = TextWrapping.Wrap },
-                    new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, Spacing = 8, Children = { ok, cancel } }
-                }
-            };
-            await dialog.ShowDialog(this);
+                    Title = "确认删除文件夹",
+                    Width = 360,
+                    Height = 140,
+                    WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                    Icon = GetAppIcon()
+                };
+                var ok = new Button { Content = "删除" };
+                var cancel = new Button { Content = "取消" };
+                cancel.Click += (_, _) => dialog.Close();
+                ok.Click += (_, _) =>
+                {
+                    if (vm.DeleteFolderByPath(path))
+                        dialog.Close();
+                };
+                dialog.Content = new StackPanel
+                {
+                    Margin = new Thickness(16),
+                    Spacing = 12,
+                    Children =
+                    {
+                        new TextBlock { Text = "将删除该文件夹及其中所有内容（文件与子目录），且无法恢复。确定继续？", TextWrapping = TextWrapping.Wrap },
+                        new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, Spacing = 8, Children = { ok, cancel } }
+                    }
+                };
+                await dialog.ShowDialog(this);
+            }
+            else
+            {
+                var dialog = new Window
+                {
+                    Title = "确认删除",
+                    Width = 320,
+                    Height = 120,
+                    WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                    Icon = GetAppIcon()
+                };
+                var ok = new Button { Content = "删除" };
+                var cancel = new Button { Content = "取消" };
+                cancel.Click += (_, _) => dialog.Close();
+                ok.Click += (_, _) =>
+                {
+                    if (vm.DeleteFileByPath(path))
+                        dialog.Close();
+                };
+                dialog.Content = new StackPanel
+                {
+                    Margin = new Thickness(16),
+                    Spacing = 12,
+                    Children =
+                    {
+                        new TextBlock { Text = "确定要删除此文件吗？", TextWrapping = TextWrapping.Wrap },
+                        new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, Spacing = 8, Children = { ok, cancel } }
+                    }
+                };
+                await dialog.ShowDialog(this);
+            }
         };
 
         FileTreeRenameItem.Click += (_, _) =>
         {
             var node = vm.SelectedTreeNode;
-            if (node == null || node.IsFolder) return;
+            if (node == null) return;
             node.EditName = node.DisplayName;
             node.IsRenaming = true;
         };
@@ -683,16 +714,60 @@ public partial class MainWindow : Window
             if (FileTreeOpenFolderItem != null)
                 FileTreeOpenFolderItem.IsEnabled = hasNode;
             FileTreeCopyPathItem.IsEnabled = hasNode;
-            FileTreeRenameItem.IsEnabled = hasNode && node is { IsFolder: false };
+            FileTreeRenameItem.IsEnabled = hasNode;
             FileTreeNewFileItem.IsEnabled = hasNode;
             FileTreeNewFolderItem.IsEnabled = hasNode;
-            FileTreeDeleteItem.IsEnabled = hasNode && node is { IsFolder: false };
+            FileTreeDeleteItem.IsEnabled = hasNode && (node is { IsFolder: false } || (node!.IsFolder && !vm.IsWorkspaceRoot(node.FullPath)));
         }
 
-        if (FileTreeView?.ContextFlyout is MenuFlyout flyout)
+        if (FileTreeList?.ContextFlyout is MenuFlyout flyout)
         {
             flyout.Opening += (_, _) => UpdateFileTreeMenuState();
         }
+    }
+
+    /// <summary>重命名 TextBox 加载后获得焦点并全选；并注册 Tunnel KeyDown，在 TreeView 之前处理 Enter/Escape，避免卡在编辑状态。</summary>
+    private void TreeItemRenameTextBox_OnLoaded(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not Avalonia.Controls.TextBox box || box.DataContext is not FileTreeNode node || !node.IsRenaming)
+            return;
+        // Tunnel 阶段处理按键，确保在 TreeView 展开/折叠之前提交或取消重命名
+        void OnPreviewKeyDown(object? s, KeyEventArgs ev)
+        {
+            if (ev.Key == Key.Enter)
+            {
+                CommitTreeItemRename(box);
+                ev.Handled = true;
+            }
+            else if (ev.Key == Key.Escape)
+            {
+                node.IsRenaming = false;
+                node.EditName = node.DisplayName;
+                ev.Handled = true;
+            }
+        }
+        box.AddHandler(KeyDownEvent, OnPreviewKeyDown, RoutingStrategies.Tunnel);
+        // 延迟一帧再聚焦，减少“新建文件夹后立即重命名”时编辑器失焦触发的 VisualLinesInvalidException
+        Dispatcher.UIThread.Post(() =>
+        {
+            Dispatcher.UIThread.Post(() =>
+            {
+                try
+                {
+                    box.Focus();
+                    var len = box.Text?.Length ?? 0;
+                    if (len > 0)
+                    {
+                        box.SelectionStart = 0;
+                        box.SelectionEnd = len;
+                    }
+                }
+                catch
+                {
+                    // 控件已脱离视觉树等时忽略
+                }
+            }, DispatcherPriority.Loaded);
+        }, DispatcherPriority.Loaded);
     }
 
     private void TreeItemRename_OnLostFocus(object? sender, RoutedEventArgs e)
@@ -700,25 +775,7 @@ public partial class MainWindow : Window
         CommitTreeItemRename(sender);
     }
 
-    private void TreeItemRename_OnKeyDown(object? sender, KeyEventArgs e)
-    {
-        if (e.Key == Key.Enter)
-        {
-            CommitTreeItemRename(sender);
-            e.Handled = true;
-        }
-        else if (e.Key == Key.Escape)
-        {
-            if (sender is Control c && c.DataContext is FileTreeNode node)
-            {
-                node.IsRenaming = false;
-                node.EditName = node.DisplayName;
-            }
-            e.Handled = true;
-        }
-    }
-
-    private void CommitTreeItemRename(object? sender)
+    private async void CommitTreeItemRename(object? sender)
     {
         if (sender is not Avalonia.Controls.TextBox box || box.DataContext is not FileTreeNode node || DataContext is not MainViewModel vm)
             return;
@@ -726,7 +783,19 @@ public partial class MainWindow : Window
         node.IsRenaming = false;
         var newName = box.Text?.Trim();
         if (string.IsNullOrEmpty(newName) || newName == node.DisplayName) return;
-        vm.RenameFileByPath(node.FullPath, newName);
+        string? error = null;
+        if (node.IsFolder)
+        {
+            var (_, err) = vm.RenameFolderByPath(node.FullPath, newName);
+            error = err;
+        }
+        else
+        {
+            var (_, err) = vm.RenameFileByPath(node.FullPath, newName);
+            error = err;
+        }
+        if (!string.IsNullOrEmpty(error))
+            await ShowRenameErrorDialogAsync(error);
     }
 
     /// <summary>标签页行为：记录后退栈 + 处理中键/关闭按钮关闭时的保存确认。</summary>
@@ -1142,6 +1211,51 @@ public partial class MainWindow : Window
         {
             _suppressNextAltKeyUp = true;
         }
+    }
+
+    /// <summary>点击不在“重命名 TextBox”上时提交重命名，避免焦点无法移出导致卡住（如新建后立即重命名触发 VisualLinesInvalidException）。</summary>
+    private void OnClickOutsideRenameCommit(object? sender, PointerPressedEventArgs e)
+    {
+        if (DataContext is not MainViewModel vm || vm.SelectedTreeNode?.IsRenaming != true)
+            return;
+        if (e.Source is not Visual source)
+            return;
+        // 若点击的是重命名框本身或在其内部，不提交
+        foreach (var v in source.GetVisualAncestors())
+        {
+            if (v is Avalonia.Controls.TextBox tb && tb.DataContext is FileTreeNode node && node.IsRenaming)
+                return;
+        }
+        if (source is Avalonia.Controls.TextBox box && box.DataContext is FileTreeNode n && n.IsRenaming)
+            return;
+        var (_, error) = vm.TryCommitTreeItemRename();
+        if (!string.IsNullOrEmpty(error))
+            _ = ShowRenameErrorDialogAsync(error);
+    }
+
+    private async System.Threading.Tasks.Task ShowRenameErrorDialogAsync(string message)
+    {
+        var dialog = new Window
+        {
+            Title = "重命名失败",
+            Width = 360,
+            MinHeight = 100,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Icon = GetAppIcon()
+        };
+        var close = new Button { Content = "确定" };
+        close.Click += (_, _) => dialog.Close();
+        dialog.Content = new StackPanel
+        {
+            Margin = new Thickness(16),
+            Spacing = 12,
+            Children =
+            {
+                new TextBlock { Text = message, TextWrapping = TextWrapping.Wrap },
+                close
+            }
+        };
+        await dialog.ShowDialog(this);
     }
 
     private void DoGoBack(MainViewModel vm)

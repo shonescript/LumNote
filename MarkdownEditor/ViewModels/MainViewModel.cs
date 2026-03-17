@@ -119,10 +119,14 @@ public sealed class MainViewModel : ViewModelBase
     private string _currentFileName = "";
     private DocumentItem? _selectedDocument;
     private FileTreeNode? _selectedTreeNode;
+    /// <summary>刷新文件树时恢复选中用，为 true 时 SelectedTreeNode  setter 不触发打开文档，避免重复开标签。</summary>
+    private bool _isRestoringFileTreeSelection;
     private ObservableCollection<DocumentItem> _documents = [];
     private ObservableCollection<DocumentItem> _filteredDocuments = [];
     private ObservableCollection<DocumentItem> _openDocuments = [];
     private ObservableCollection<FileTreeNode> _fileTreeRoot = [];
+    /// <summary>扁平可见节点列表，用于虚拟化 ListBox 展示（VSCode 风格，整行点击展开/折叠）。</summary>
+    private readonly ObservableCollection<FileTreeNode> _visibleFileTree = [];
     private readonly ObservableCollection<SearchResultItem> _searchResults = [];
     private readonly ObservableCollection<SearchResultGroup> _searchResultGroups = [];
     /// <summary>扁平的搜索结果行（组头+匹配行），用于虚拟化列表，减少内存与 UI 阻塞。</summary>
@@ -456,6 +460,9 @@ public sealed class MainViewModel : ViewModelBase
     /// <summary>文件树根节点（VSCode 风格侧边栏用）。</summary>
     public ObservableCollection<FileTreeNode> FileTreeRoot => _fileTreeRoot;
 
+    /// <summary>扁平可见节点列表，用于侧栏 ListBox 虚拟化展示；展开/折叠后需调用 RebuildVisibleFileTree。</summary>
+    public ObservableCollection<FileTreeNode> VisibleFileTree => _visibleFileTree;
+
     /// <summary>请求在独立窗口中打开图片（仅显示图片，无编辑区）。由视图订阅并弹出 ImageViewWindow；预览区点击图片时使用。</summary>
     public event Action<string>? OpenImageInNewWindowRequested;
 
@@ -497,6 +504,14 @@ public sealed class MainViewModel : ViewModelBase
             if (_selectedTreeNode == value) return;
             _selectedTreeNode = value;
             OnPropertyChanged();
+
+            // 刷新后仅恢复树选中状态，不再次打开文档，避免同一文档被多次加入标签
+            if (_isRestoringFileTreeSelection)
+            {
+                if (value is { IsFolder: false })
+                    PreviewImagePath = null;
+                return;
+            }
 
             // 统一行为：
             // - 文档(.md/.txt)：打开并预览
@@ -1269,13 +1284,74 @@ public sealed class MainViewModel : ViewModelBase
         }
     }
 
-    /// <summary>刷新侧栏文件树（由根目录“刷新”按钮等调用）。</summary>
+    /// <summary>刷新侧栏文件树（由根目录“刷新”按钮等调用）。刷新前保存展开状态与选中项，刷新后恢复；若选中项已不存在则清空选中。</summary>
     public void RefreshFileTree()
     {
         if (_workspaceFolderPaths.Count == 0) return;
+        var expandedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        CollectExpandedPaths(_fileTreeRoot, expandedPaths);
+        var selectedPath = _selectedTreeNode?.FullPath;
+
         RescanWorkspaceDocuments();
         BuildFileTreeFromWorkspace();
+
+        ApplyExpandedPaths(_fileTreeRoot, expandedPaths);
+        EnsureExpandedFoldersLoaded(_fileTreeRoot);
+        RebuildVisibleFileTree();
+        _isRestoringFileTreeSelection = true;
+        try
+        {
+            SelectedTreeNode = FindNodeByPath(_fileTreeRoot, selectedPath);
+        }
+        finally
+        {
+            _isRestoringFileTreeSelection = false;
+        }
+
         FilterDocuments();
+        // 刷新后 _documents 已重建为新实例，需把已打开文档的内容与状态迁移到新实例，避免右侧编辑区变空白
+        MigrateOpenDocumentsAfterRefresh();
+        // 同步当前文档引用与选中节点，避免新建文件后点击无反应（内部路径/引用不一致）
+        var currentPath = _activeDocument?.FullPath;
+        if (!string.IsNullOrEmpty(currentPath))
+        {
+            var docInList = _documents.FirstOrDefault(d => string.Equals(d.FullPath, currentPath, StringComparison.OrdinalIgnoreCase));
+            if (docInList != null && _activeDocument != docInList)
+                ActiveDocument = docInList;
+        }
+    }
+
+    /// <summary>刷新后把 _openDocuments 中的旧 DocumentItem 状态迁移到 _documents 中的新实例，并替换引用，避免编辑区空白。</summary>
+    private void MigrateOpenDocumentsAfterRefresh()
+    {
+        var openList = _openDocuments.ToList();
+        var activePath = _activeDocument?.FullPath;
+        for (var i = 0; i < openList.Count; i++)
+        {
+            var oldDoc = openList[i];
+            var newDoc = _documents.FirstOrDefault(d => string.Equals(d.FullPath, oldDoc.FullPath, StringComparison.OrdinalIgnoreCase));
+            if (newDoc == null) continue;
+            newDoc.CachedMarkdown = oldDoc.CachedMarkdown;
+            newDoc.IsModified = oldDoc.IsModified;
+            newDoc.LastCaretOffset = oldDoc.LastCaretOffset;
+            newDoc.LastKnownWriteTimeUtc = oldDoc.LastKnownWriteTimeUtc;
+            newDoc.EncodingName = oldDoc.EncodingName;
+            newDoc.EditorZoomLevel = oldDoc.EditorZoomLevel;
+            newDoc.PreviewZoomLevel = oldDoc.PreviewZoomLevel;
+            newDoc.IsOpen = true;
+            _openDocuments[i] = newDoc;
+        }
+        OnPropertyChanged(nameof(OpenDocuments));
+        // 若当前活动文档已迁移，指向新实例并通知视图，避免标签选中错乱；不调用 setter 以免 LoadFromDocumentItem 覆盖 _currentMarkdown
+        if (!string.IsNullOrEmpty(activePath))
+        {
+            var newActive = _documents.FirstOrDefault(d => string.Equals(d.FullPath, activePath, StringComparison.OrdinalIgnoreCase));
+            if (newActive != null && _activeDocument != newActive)
+            {
+                _activeDocument = newActive;
+                OnPropertyChanged(nameof(ActiveDocument));
+            }
+        }
     }
 
     private void RescanWorkspaceDocuments()
@@ -1305,55 +1381,77 @@ public sealed class MainViewModel : ViewModelBase
         }
     }
 
+    /// <summary>仅构建根节点，并只加载根下第一层；子文件夹在用户展开时再动态加载。</summary>
     private void BuildFileTreeFromWorkspace()
     {
         _fileTreeRoot.Clear();
-        var rootPathSet = new HashSet<string>(_workspaceFolderPaths, StringComparer.OrdinalIgnoreCase);
-        bool multiRoot = _workspaceFolderPaths.Count > 1;
-
         foreach (var rootPath in _workspaceFolderPaths)
         {
             var root = Path.GetFullPath(rootPath);
+            if (!Directory.Exists(root)) continue;
             var rootName = Path.GetFileName(root);
             if (string.IsNullOrEmpty(rootName)) rootName = root;
             var rootNode = new FileTreeNode(rootName, root, true);
-            rootNode.IsExpanded = false;
-            var rootMap = new Dictionary<string, FileTreeNode>(StringComparer.OrdinalIgnoreCase);
+            rootNode.Level = 0;
+            rootNode.IsExpanded = true;
+            LoadChildrenForFolder(rootNode);
+            _fileTreeRoot.Add(rootNode);
+        }
+        RebuildVisibleFileTree();
+    }
 
+    /// <summary>动态加载该文件夹下的直接子目录和文件（仅扫描当前层），并标记已加载。</summary>
+    private void LoadChildrenForFolder(FileTreeNode folderNode)
+    {
+        if (!folderNode.IsFolder || folderNode.ChildrenLoaded) return;
+        var path = Path.GetFullPath(folderNode.FullPath);
+        if (!Directory.Exists(path)) return;
+        try
+        {
+            var dirs = Directory.GetDirectories(path)
+                .Select(Path.GetFullPath)
+                .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            foreach (var fullDir in dirs)
+            {
+                var displayName = Path.GetFileName(fullDir);
+                if (string.IsNullOrEmpty(displayName)) continue;
+                var folderChild = new FileTreeNode(displayName, fullDir, true);
+                folderChild.Level = folderNode.Level + 1;
+                folderChild.IsExpanded = false;
+                folderNode.Children.Add(folderChild);
+            }
+            var dirNorm = path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
             foreach (var doc in _documents)
             {
-                if (doc.WorkspaceRoot != root) continue;
-                var segments = doc.RelativePath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                if (segments.Length == 0) continue;
-
-                ObservableCollection<FileTreeNode> parentChildren = rootNode.Children;
-                string currentPath = root;
-
-                for (int i = 0; i < segments.Length; i++)
-                {
-                    bool isLast = i == segments.Length - 1;
-                    currentPath = Path.Combine(currentPath, segments[i]);
-
-                    if (isLast)
-                    {
-                        var fileNode = new FileTreeNode(segments[i], doc.FullPath, false);
-                        parentChildren.Add(fileNode);
-                        continue;
-                    }
-
-                    if (!rootMap.TryGetValue(currentPath, out var folderNode))
-                    {
-                        folderNode = new FileTreeNode(segments[i], currentPath, true);
-                        folderNode.IsExpanded = false;
-                        rootMap[currentPath] = folderNode;
-                        parentChildren.Add(folderNode);
-                    }
-                    parentChildren = folderNode.Children;
-                }
+                var docDir = Path.GetDirectoryName(doc.FullPath);
+                if (string.IsNullOrEmpty(docDir)) continue;
+                var docDirNorm = Path.GetFullPath(docDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                if (!string.Equals(docDirNorm, dirNorm, StringComparison.OrdinalIgnoreCase)) continue;
+                var fileName = Path.GetFileName(doc.FullPath);
+                if (string.IsNullOrEmpty(fileName)) continue;
+                if (folderNode.Children.Any(c => !c.IsFolder && string.Equals(c.FullPath, doc.FullPath, StringComparison.OrdinalIgnoreCase)))
+                    continue;
+                var fileNode = new FileTreeNode(fileName, doc.FullPath, false);
+                fileNode.Level = folderNode.Level + 1;
+                folderNode.Children.Add(fileNode);
             }
+            SortTreeNodes(folderNode.Children);
+        }
+        catch { }
+        folderNode.ChildrenLoaded = true;
+    }
 
-            SortTreeNodes(rootNode.Children);
-            _fileTreeRoot.Add(rootNode);
+    /// <summary>对树中所有已展开的文件夹执行一次子节点加载（刷新后恢复展开状态时用）。</summary>
+    private void EnsureExpandedFoldersLoaded(IEnumerable<FileTreeNode> nodes)
+    {
+        foreach (var n in nodes)
+        {
+            if (n.IsFolder && n.IsExpanded)
+            {
+                LoadChildrenForFolder(n);
+                EnsureExpandedFoldersLoaded(n.Children);
+            }
         }
     }
 
@@ -1366,6 +1464,101 @@ public sealed class MainViewModel : ViewModelBase
             nodes.Add(n);
             SortTreeNodes(n.Children);
         }
+    }
+
+    /// <summary>收集当前树中所有已展开文件夹的 FullPath，用于刷新后恢复。</summary>
+    private static void CollectExpandedPaths(IEnumerable<FileTreeNode> nodes, HashSet<string> result)
+    {
+        foreach (var n in nodes)
+        {
+            if (n.IsFolder && n.IsExpanded)
+                result.Add(n.FullPath);
+            CollectExpandedPaths(n.Children, result);
+        }
+    }
+
+    /// <summary>将保存的展开路径应用到新构建的树上。</summary>
+    private static void ApplyExpandedPaths(IEnumerable<FileTreeNode> nodes, HashSet<string> expandedPaths)
+    {
+        foreach (var n in nodes)
+        {
+            if (n.IsFolder && expandedPaths.Contains(n.FullPath))
+                n.IsExpanded = true;
+            ApplyExpandedPaths(n.Children, expandedPaths);
+        }
+    }
+
+    /// <summary>根据当前展开状态重建扁平可见列表；差异同步以减少展开/折叠时的闪烁。</summary>
+    private void RebuildVisibleFileTree()
+    {
+        var newVisible = new List<FileTreeNode>();
+        foreach (var root in _fileTreeRoot)
+            CollectVisibleNodes(root, newVisible);
+        SyncVisibleFileTree(newVisible);
+    }
+
+    private static void CollectVisibleNodes(FileTreeNode node, List<FileTreeNode> list)
+    {
+        list.Add(node);
+        if (!node.IsFolder || !node.IsExpanded) return;
+        foreach (var child in node.Children)
+            CollectVisibleNodes(child, list);
+    }
+
+    /// <summary>将 _visibleFileTree 同步为 newVisible，只增删差异部分，减少 UI 闪烁。</summary>
+    private void SyncVisibleFileTree(List<FileTreeNode> newVisible)
+    {
+        var current = _visibleFileTree;
+        int i = 0;
+        while (i < current.Count && i < newVisible.Count && current[i] == newVisible[i])
+            i++;
+        if (i == current.Count && i == newVisible.Count)
+            return;
+        while (current.Count > i)
+            current.RemoveAt(current.Count - 1);
+        for (int j = i; j < newVisible.Count; j++)
+            current.Add(newVisible[j]);
+    }
+
+    /// <summary>切换文件夹展开/折叠（整行点击时由视图调用）；展开时若未加载则先动态加载该层子节点。</summary>
+    public void ToggleFolderNode(FileTreeNode? node)
+    {
+        if (node == null || !node.IsFolder) return;
+        node.IsExpanded = !node.IsExpanded;
+        if (node.IsExpanded)
+            LoadChildrenForFolder(node);
+        RebuildVisibleFileTree();
+    }
+
+    /// <summary>由视图在“点击重命名框外”时调用：若当前选中节点处于重命名状态则提交并退出重命名，避免因焦点无法移出而卡住。返回 (是否已处理, 错误信息，有错误时由视图弹框)。</summary>
+    public (bool Handled, string? ErrorMessage) TryCommitTreeItemRename()
+    {
+        var node = _selectedTreeNode;
+        if (node == null || !node.IsRenaming) return (false, null);
+        node.IsRenaming = false;
+        var newName = node.EditName?.Trim();
+        if (string.IsNullOrEmpty(newName) || newName == node.DisplayName) return (true, null);
+        if (node.IsFolder)
+        {
+            var (_, err) = RenameFolderByPath(node.FullPath, newName);
+            return (true, err);
+        }
+        var (_, errF) = RenameFileByPath(node.FullPath, newName);
+        return (true, errF);
+    }
+
+    /// <summary>在树中按 FullPath 查找节点；不存在则返回 null。</summary>
+    private static FileTreeNode? FindNodeByPath(IEnumerable<FileTreeNode> nodes, string? path)
+    {
+        if (string.IsNullOrEmpty(path)) return null;
+        foreach (var n in nodes)
+        {
+            if (string.Equals(n.FullPath, path, StringComparison.OrdinalIgnoreCase))
+                return n;
+            var found = FindNodeByPath(n.Children, path);
+            if (found != null) return found;
+        }
+        return null;
     }
 
     public void OnMarkdownChanged()
@@ -1509,10 +1702,11 @@ public sealed class MainViewModel : ViewModelBase
         var path = Path.Combine(dir, baseName);
         var n = 1;
         while (Directory.Exists(path))
-            path = Path.Combine(dir, $"{baseName} {n++}");
+            path = Path.Combine(dir, $"{baseName} ({n++})");
         try
         {
             Directory.CreateDirectory(path);
+            // 使用统一的扫描/构建逻辑刷新整棵树，确保新建文件夹层级与缩进与磁盘结构严格一致
             RefreshFileTree();
             return path;
         }
@@ -1528,11 +1722,12 @@ public sealed class MainViewModel : ViewModelBase
         if (string.IsNullOrWhiteSpace(directoryPath) || !Directory.Exists(directoryPath))
             return null;
         var dir = Path.GetFullPath(directoryPath);
-        var baseName = "新文档.md";
-        var path = Path.Combine(dir, baseName);
+        const string baseNameNoExt = "新文档";
+        const string ext = ".md";
+        var path = Path.Combine(dir, baseNameNoExt + ext);
         var n = 1;
         while (File.Exists(path))
-            path = Path.Combine(dir, $"新文档 {n++}.md");
+            path = Path.Combine(dir, $"{baseNameNoExt} ({n++}){ext}");
         try
         {
             File.WriteAllText(path, "");
@@ -1578,29 +1773,68 @@ public sealed class MainViewModel : ViewModelBase
         return true;
     }
 
-    /// <summary>重命名文件（仅文件）。新名为完整路径或仅文件名。返回新路径，失败返回 null。</summary>
-    public string? RenameFileByPath(string oldFilePath, string newNameOrFullPath)
+    /// <summary>删除文件夹及其内部所有内容（文件与子目录）。根目录不可删除。返回是否成功。</summary>
+    public bool DeleteFolderByPath(string folderPath)
+    {
+        if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+            return false;
+        var path = Path.GetFullPath(folderPath);
+        if (IsWorkspaceRoot(path))
+            return false;
+        for (int i = _openDocuments.Count - 1; i >= 0; i--)
+        {
+            var doc = _openDocuments[i];
+            if (doc.FullPath.StartsWith(path, StringComparison.OrdinalIgnoreCase))
+            {
+                _openDocuments.RemoveAt(i);
+                doc.IsOpen = false;
+                if (_activeDocument == doc)
+                    ActiveDocument = _openDocuments.FirstOrDefault();
+            }
+        }
+        for (int i = _documents.Count - 1; i >= 0; i--)
+        {
+            if (_documents[i].FullPath.StartsWith(path, StringComparison.OrdinalIgnoreCase))
+                _documents.RemoveAt(i);
+        }
+        OnPropertyChanged(nameof(OpenDocuments));
+        try
+        {
+            Directory.Delete(path, recursive: true);
+        }
+        catch
+        {
+            return false;
+        }
+        RefreshFileTree();
+        return true;
+    }
+
+    /// <summary>重命名文件（仅文件）。新名为完整路径或仅文件名。返回 (新路径, 错误信息)，成功时错误为 null。</summary>
+    public (string? NewPath, string? ErrorMessage) RenameFileByPath(string oldFilePath, string newNameOrFullPath)
     {
         if (string.IsNullOrWhiteSpace(oldFilePath) || !File.Exists(oldFilePath))
-            return null;
+            return (null, "文件不存在或路径无效。");
         var oldPath = Path.GetFullPath(oldFilePath);
         var dir = Path.GetDirectoryName(oldPath);
-        if (string.IsNullOrEmpty(dir)) return null;
+        if (string.IsNullOrEmpty(dir)) return (null, "无法确定所在目录。");
 
         var newPath = Path.IsPathRooted(newNameOrFullPath)
             ? Path.GetFullPath(newNameOrFullPath)
             : Path.Combine(dir, newNameOrFullPath.Trim());
+        if (string.IsNullOrWhiteSpace(Path.GetFileName(newPath)))
+            return (null, "新文件名不能为空。");
         if (string.Equals(oldPath, newPath, StringComparison.OrdinalIgnoreCase))
-            return oldPath;
-        if (File.Exists(newPath)) return null;
+            return (oldPath, null);
+        if (File.Exists(newPath)) return (null, "目标位置已存在同名文件。");
 
         try
         {
             File.Move(oldPath, newPath);
         }
-        catch
+        catch (Exception ex)
         {
-            return null;
+            return (null, ex.Message);
         }
 
         var openDoc = _openDocuments.FirstOrDefault(d => string.Equals(d.FullPath, oldPath, StringComparison.OrdinalIgnoreCase));
@@ -1647,7 +1881,71 @@ public sealed class MainViewModel : ViewModelBase
         }
 
         RefreshFileTree();
-        return newPath;
+        return (newPath, null);
+    }
+
+    /// <summary>重命名文件夹。新名为完整路径或仅文件夹名。返回 (新路径, 错误信息)，成功时错误为 null。</summary>
+    public (string? NewPath, string? ErrorMessage) RenameFolderByPath(string oldFolderPath, string newNameOrFullPath)
+    {
+        if (string.IsNullOrWhiteSpace(oldFolderPath) || !Directory.Exists(oldFolderPath))
+            return (null, "文件夹不存在或路径无效。");
+        var oldPath = Path.GetFullPath(oldFolderPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var parentDir = Path.GetDirectoryName(oldPath);
+        if (string.IsNullOrEmpty(parentDir)) return (null, "无法确定父目录。");
+
+        var newPath = Path.IsPathRooted(newNameOrFullPath)
+            ? Path.GetFullPath(newNameOrFullPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+            : Path.Combine(parentDir, newNameOrFullPath.Trim());
+        if (string.IsNullOrWhiteSpace(Path.GetFileName(newPath)))
+            return (null, "新文件夹名不能为空。");
+        if (string.Equals(oldPath, newPath, StringComparison.OrdinalIgnoreCase))
+            return (oldPath, null);
+        if (Directory.Exists(newPath)) return (null, "目标位置已存在同名文件夹。");
+
+        try
+        {
+            Directory.Move(oldPath, newPath);
+        }
+        catch (Exception ex)
+        {
+            return (null, ex.Message);
+        }
+
+        var prefix = oldPath + Path.DirectorySeparatorChar;
+        var prefixAlt = oldPath + Path.AltDirectorySeparatorChar;
+        foreach (var doc in _documents.ToList())
+        {
+            var fp = doc.FullPath;
+            if (fp.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) || fp.StartsWith(prefixAlt, StringComparison.OrdinalIgnoreCase))
+            {
+                var rel = fp.Substring(oldPath.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                var newFull = Path.Combine(newPath, rel);
+                var root = GetWorkspaceRootForPath(newFull);
+                var newRel = root != null ? Path.GetRelativePath(root, newFull) : Path.GetFileName(newFull);
+                var newDoc = new DocumentItem(newFull, newRel) { WorkspaceRoot = root };
+                var idx = _documents.IndexOf(doc);
+                _documents[idx] = newDoc;
+                if (_openDocuments.Contains(doc))
+                {
+                    var openIdx = _openDocuments.IndexOf(doc);
+                    _openDocuments.RemoveAt(openIdx);
+                    newDoc.IsOpen = true;
+                    newDoc.CachedMarkdown = doc.CachedMarkdown;
+                    newDoc.IsModified = doc.IsModified;
+                    newDoc.LastKnownWriteTimeUtc = doc.LastKnownWriteTimeUtc;
+                    newDoc.EncodingName = doc.EncodingName;
+                    newDoc.EditorZoomLevel = doc.EditorZoomLevel;
+                    newDoc.PreviewZoomLevel = doc.PreviewZoomLevel;
+                    newDoc.LastCaretOffset = doc.LastCaretOffset;
+                    _openDocuments.Insert(openIdx, newDoc);
+                    if (_activeDocument == doc)
+                        ActiveDocument = newDoc;
+                }
+            }
+        }
+        OnPropertyChanged(nameof(OpenDocuments));
+        RefreshFileTree();
+        return (newPath, null);
     }
 
     private static int _untitledCounter;
@@ -1681,6 +1979,20 @@ public sealed class MainViewModel : ViewModelBase
                 return r;
         }
         return _workspaceFolderPaths[0];
+    }
+
+    /// <summary>指定路径是否为工作区根目录之一（根目录不可删除）。</summary>
+    public bool IsWorkspaceRoot(string fullPath)
+    {
+        if (string.IsNullOrWhiteSpace(fullPath) || _workspaceFolderPaths.Count == 0) return false;
+        var normalized = Path.GetFullPath(fullPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        foreach (var root in _workspaceFolderPaths)
+        {
+            var r = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            if (string.Equals(normalized, r, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
     }
 
     private void LoadDocument(string path)

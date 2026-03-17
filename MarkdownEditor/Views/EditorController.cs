@@ -360,6 +360,10 @@ internal sealed class EditorController
 
                             _editor.TextArea.TextView.Redraw();
                         }
+                        catch (VisualLinesInvalidException)
+                        {
+                            // 视图正在重建（如焦点切到文件树重命名框）时可能抛出，忽略即可
+                        }
                         catch
                         {
                             // 控件已销毁或断开视觉树时忽略，不影响使用
