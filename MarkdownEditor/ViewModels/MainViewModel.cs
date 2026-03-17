@@ -159,6 +159,8 @@ public sealed class MainViewModel : ViewModelBase
     private CancellationTokenSource? _searchCts;
     private Task? _searchTask;
     private DispatcherTimer? _saveRecentFilesTimer;
+    private DispatcherTimer? _searchLoadingDotsTimer;
+    private string _searchLoadingDots = ".";
 
     /// <summary>无文档时编辑区默认缩放。</summary>
     private double _editorZoomLevel = 1.0;
@@ -166,8 +168,6 @@ public sealed class MainViewModel : ViewModelBase
     private double _previewZoomLevelDefault = 1.0;
     /// <summary>当前激活窗格：Editor / Preview，用于 Ctrl+/- 和状态栏显示。</summary>
     private string _activePane = "Editor";
-    /// <summary>文件在外部被修改且当前未修改时为 true，可提示用户重新加载。</summary>
-    private bool _fileChangedExternally;
     /// <summary>当前选择的编码显示名（用于状态栏与保存时）。</summary>
     private string _currentEncodingName = "UTF-8";
 
@@ -209,7 +209,17 @@ public sealed class MainViewModel : ViewModelBase
 
     private bool _isSearching;
     /// <summary>是否正在执行搜索（用于显示“搜索中”提示）。</summary>
-    public bool IsSearching { get => _isSearching; private set { if (SetProperty(ref _isSearching, value)) OnPropertyChanged(nameof(IsSearchCompleted)); } }
+    public bool IsSearching
+    {
+        get => _isSearching;
+        private set
+        {
+            if (!SetProperty(ref _isSearching, value)) return;
+            OnPropertyChanged(nameof(IsSearchCompleted));
+            OnPropertyChanged(nameof(SearchResultStatusText));
+            if (value) StartSearchLoadingDotsTimer(); else StopSearchLoadingDotsTimer();
+        }
+    }
     /// <summary>搜索未在进行中，用于显示结果数量。</summary>
     public bool IsSearchCompleted => !_isSearching;
 
@@ -217,8 +227,11 @@ public sealed class MainViewModel : ViewModelBase
     /// <summary>当前搜索结果总条数（匹配行数）；搜索完成后更新，无结果时为 0。</summary>
     public int SearchResultCount { get => _searchResultCount; private set => SetProperty(ref _searchResultCount, value); }
 
-    /// <summary>搜索完成后的结果数量文案，如「共 0 条」「共 12 条」。</summary>
-    public string SearchResultCountText => $"共 {SearchResultCount} 条";
+    /// <summary>结果数量文案；搜索中时在「x 个结果」后追加循环小点 . / .. / ... / .... 表示进行中。</summary>
+    public string SearchResultStatusText => $"{SearchResultCount} 个结果" + (IsSearching ? _searchLoadingDots : "");
+
+    /// <summary>搜索结果数量文案（仅数量，无状态点）。</summary>
+    public string SearchResultCountText => $"{SearchResultCount} 个结果";
 
     private SearchResultItem? _selectedSearchResult;
     /// <summary>用户点击某条搜索结果时设置，由视图订阅并调用 NavigateToSearchResult。</summary>
@@ -682,14 +695,7 @@ public sealed class MainViewModel : ViewModelBase
             CurrentEncodingName = name;
     });
 
-    /// <summary>文件在磁盘上被外部修改（未保存时可重新加载）。</summary>
-    public bool FileChangedExternally
-    {
-        get => _fileChangedExternally;
-        set => SetProperty(ref _fileChangedExternally, value);
-    }
-
-    /// <summary>从磁盘重新加载当前文件内容（不占用文件，使用当前文档编码）。</summary>
+    /// <summary>从磁盘重新加载当前文件内容（使用当前文档编码）。</summary>
     public void ReloadFromDisk()
     {
         if (string.IsNullOrWhiteSpace(CurrentFilePath) || _activeDocument == null) return;
@@ -710,7 +716,6 @@ public sealed class MainViewModel : ViewModelBase
             _activeDocument.LastKnownWriteTimeUtc = File.GetLastWriteTimeUtc(path);
             _currentMarkdown = text;
             _isModified = false;
-            FileChangedExternally = false;
             OnPropertyChanged(nameof(CurrentMarkdown));
             OnPropertyChanged(nameof(IsModified));
         }
@@ -762,9 +767,6 @@ public sealed class MainViewModel : ViewModelBase
     /// <summary>仅缩放预览区（预览标题栏按钮用）。</summary>
     public ICommand ZoomPreviewInCommand => new RelayCommand(() => PreviewZoomLevel = Math.Min(2.5, PreviewZoomLevel + 0.1));
     public ICommand ZoomPreviewOutCommand => new RelayCommand(() => PreviewZoomLevel = Math.Max(0.5, PreviewZoomLevel - 0.1));
-    public ICommand ReloadFromDiskCommand => new RelayCommand(ReloadFromDisk);
-    public ICommand DismissFileChangedCommand => new RelayCommand(() => FileChangedExternally = false);
-
     public ICommand SaveCommand => new RelayCommand(SaveCurrent);
     public ICommand CloseDocumentCommand => new RelayCommand<DocumentItem>(CloseDocument);
     public ICommand OpenRecentDocumentCommand => new RelayCommand<string>(OpenDocument);
@@ -773,6 +775,9 @@ public sealed class MainViewModel : ViewModelBase
     {
         if (item != null) SelectedSearchResult = item;
     });
+
+    /// <summary>停止当前搜索（搜索中时由界面停止按钮调用）。</summary>
+    public ICommand CancelSearchCommand => new RelayCommand(() => CancelSearch());
 
     /// <summary>欢迎页点击最近文件夹时打开该文件夹。</summary>
     public ICommand OpenRecentFolderCommand => new RelayCommand<string>(path =>
@@ -1169,13 +1174,14 @@ public sealed class MainViewModel : ViewModelBase
     /// <summary>展开时且折叠条 hover 时显示收起三角。</summary>
     public bool ShowSidebarCollapseIcon => !IsSidebarCollapsed && IsSidebarCollapseStripHovered;
 
-    /// <summary>打开文件夹时枚举的文件扩展名模式（.md、.txt 与常见图片格式）。</summary>
-    private static readonly string[] FolderFilePatterns =
-        ["*.md", "*.txt", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.bmp", "*.svg"];
+    /// <summary>工作区展示与搜索共用的文件类型（当前仅 .md、.txt）。</summary>
+    private static readonly string[] FolderFilePatterns = ["*.md", "*.txt"];
 
     public void LoadFolder(string path)
     {
         if (!Directory.Exists(path)) return;
+        CancelSearch();
+        ClearSearchResults();
         _workspaceFolderPaths.Clear();
         _workspaceFolderPaths.Add(Path.GetFullPath(path));
         _documentFolder = path;
@@ -1193,6 +1199,8 @@ public sealed class MainViewModel : ViewModelBase
     /// <summary>添加多个文件夹到工作区；新根默认折叠。</summary>
     public void AddFoldersToWorkspace(IEnumerable<string> paths)
     {
+        CancelSearch();
+        ClearSearchResults();
         var added = false;
         foreach (var p in paths)
         {
@@ -1219,6 +1227,8 @@ public sealed class MainViewModel : ViewModelBase
     {
         var list = rootPaths.Select(Path.GetFullPath).Where(Directory.Exists).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         if (list.Count == 0) return;
+        CancelSearch();
+        ClearSearchResults();
         _workspaceFolderPaths.Clear();
         _workspaceFolderPaths.AddRange(list);
         _documentFolder = list[0];
@@ -1354,6 +1364,7 @@ public sealed class MainViewModel : ViewModelBase
         }
     }
 
+    /// <summary>仅扫描各工作区根目录下第一层文件，不递归；子目录内文件在展开时由 LoadChildrenForFolder 按需加入 _documents。</summary>
     private void RescanWorkspaceDocuments()
     {
         _documents.Clear();
@@ -1366,7 +1377,7 @@ public sealed class MainViewModel : ViewModelBase
             {
                 try
                 {
-                    foreach (var file in Directory.EnumerateFiles(root, pattern, SearchOption.AllDirectories))
+                    foreach (var file in Directory.EnumerateFiles(root, pattern, SearchOption.TopDirectoryOnly))
                     {
                         if (seen.Add(file))
                         {
@@ -1400,7 +1411,7 @@ public sealed class MainViewModel : ViewModelBase
         RebuildVisibleFileTree();
     }
 
-    /// <summary>动态加载该文件夹下的直接子目录和文件（仅扫描当前层），并标记已加载。</summary>
+    /// <summary>动态加载该文件夹下的直接子目录和文件（仅扫描当前层），并标记已加载；子目录内文件按需加入 _documents。</summary>
     private void LoadChildrenForFolder(FileTreeNode folderNode)
     {
         if (!folderNode.IsFolder || folderNode.ChildrenLoaded) return;
@@ -1421,20 +1432,27 @@ public sealed class MainViewModel : ViewModelBase
                 folderChild.IsExpanded = false;
                 folderNode.Children.Add(folderChild);
             }
-            var dirNorm = path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            foreach (var doc in _documents)
+            var root = GetWorkspaceRootForPath(path);
+            foreach (var pattern in FolderFilePatterns)
             {
-                var docDir = Path.GetDirectoryName(doc.FullPath);
-                if (string.IsNullOrEmpty(docDir)) continue;
-                var docDirNorm = Path.GetFullPath(docDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                if (!string.Equals(docDirNorm, dirNorm, StringComparison.OrdinalIgnoreCase)) continue;
-                var fileName = Path.GetFileName(doc.FullPath);
-                if (string.IsNullOrEmpty(fileName)) continue;
-                if (folderNode.Children.Any(c => !c.IsFolder && string.Equals(c.FullPath, doc.FullPath, StringComparison.OrdinalIgnoreCase)))
-                    continue;
-                var fileNode = new FileTreeNode(fileName, doc.FullPath, false);
-                fileNode.Level = folderNode.Level + 1;
-                folderNode.Children.Add(fileNode);
+                try
+                {
+                    foreach (var file in Directory.EnumerateFiles(path, pattern, SearchOption.TopDirectoryOnly))
+                    {
+                        var fullPath = Path.GetFullPath(file);
+                        if (_documents.Any(d => string.Equals(d.FullPath, fullPath, StringComparison.OrdinalIgnoreCase)))
+                            continue;
+                        var rel = root != null ? Path.GetRelativePath(root, fullPath) : Path.GetFileName(fullPath);
+                        var doc = new DocumentItem(fullPath, rel) { WorkspaceRoot = root };
+                        _documents.Add(doc);
+                        var fileName = Path.GetFileName(fullPath);
+                        if (string.IsNullOrEmpty(fileName)) continue;
+                        var fileNode = new FileTreeNode(fileName, fullPath, false);
+                        fileNode.Level = folderNode.Level + 1;
+                        folderNode.Children.Add(fileNode);
+                    }
+                }
+                catch { }
             }
             SortTreeNodes(folderNode.Children);
         }
@@ -2070,23 +2088,6 @@ public sealed class MainViewModel : ViewModelBase
         ActiveDocument = doc;        
     }
 
-    /// <summary>由视图定时调用，检测当前文件是否在外部被修改（不占用文件）。</summary>
-    public void CheckFileChangedExternally()
-    {
-        if (string.IsNullOrWhiteSpace(CurrentFilePath) || !File.Exists(CurrentFilePath) || _activeDocument == null)
-            return;
-        if (IsModified)
-            return;
-        try
-        {
-            var current = File.GetLastWriteTimeUtc(CurrentFilePath);
-            var known = _activeDocument.LastKnownWriteTimeUtc;
-            if (known.HasValue && current != known.Value)
-                FileChangedExternally = true;
-        }
-        catch { }
-    }
-
     private void ClearEditor()
     {
         _currentMarkdown = "";
@@ -2160,18 +2161,77 @@ public sealed class MainViewModel : ViewModelBase
         }
     }
 
-    /// <summary>单次搜索从磁盘读取的最大文件数，避免输入时卡顿。</summary>
-    private const int MaxFilesToReadForSearch = 50;
-
-    /// <summary>参与搜索的单文件最大字节数，超过则仅在有缓存时搜索。</summary>
+    /// <summary>参与搜索的单文件最大字节数，超过部分不读取（流式截断）。</summary>
     private const int MaxFileSizeForSearch = 2 * 1024 * 1024;
 
-    /// <summary>在已加载的文档列表中搜索，结果可点击定位到行。异步执行，结果按文件逐步追加并显示“搜索中”提示。不在 UI 线程做耗时操作。</summary>
+    /// <summary>每搜索多少文件后强制提交一批结果（与满批结果一起触发更新）。</summary>
+    private const int SearchFileBatchSize = 100;
+
+    /// <summary>停止当前搜索任务，已显示的结果保留；仅在新搜索或关键词/工作区变更时清空。</summary>
+    public void CancelSearch()
+    {
+        _searchCts?.Cancel();
+        _searchCts?.Dispose();
+        _searchCts = null;
+        IsSearching = false;
+        SearchResultCount = _searchResults.Count;
+        OnPropertyChanged(nameof(IsSearching));
+        OnPropertyChanged(nameof(SearchResultCount));
+        OnPropertyChanged(nameof(SearchResultCountText));
+        OnPropertyChanged(nameof(SearchResultStatusText));
+    }
+
+    /// <summary>清空搜索结果（工作区切换时调用；新搜索时由 DoSearch 内清空）。</summary>
+    private void ClearSearchResults()
+    {
+        _searchResults.Clear();
+        _searchResultGroups.Clear();
+        _flatSearchResultRows.Clear();
+        SearchResultCount = 0;
+        OnPropertyChanged(nameof(SearchResults));
+        OnPropertyChanged(nameof(SearchResultGroups));
+        OnPropertyChanged(nameof(FlatSearchResultRows));
+        OnPropertyChanged(nameof(SearchResultCount));
+        OnPropertyChanged(nameof(SearchResultCountText));
+        OnPropertyChanged(nameof(SearchResultStatusText));
+    }
+
+    private void StartSearchLoadingDotsTimer()
+    {
+        StopSearchLoadingDotsTimer();
+        _searchLoadingDots = ".";
+        OnPropertyChanged(nameof(SearchResultStatusText));
+        _searchLoadingDotsTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(400) };
+        _searchLoadingDotsTimer.Tick += (_, _) =>
+        {
+            _searchLoadingDots = _searchLoadingDots switch { "." => "..", ".." => "...", "..." => "....", _ => "." };
+            OnPropertyChanged(nameof(SearchResultStatusText));
+        };
+        _searchLoadingDotsTimer.Start();
+    }
+
+    private void StopSearchLoadingDotsTimer()
+    {
+        _searchLoadingDotsTimer?.Stop();
+        _searchLoadingDotsTimer = null;
+    }
+
+    /// <summary>全工作区 grep 式搜索：后台线程逐层枚举目录并搜索，大文件流式截断。工作区或关键词变更时可中断。</summary>
     public void DoSearch()
     {
-        var q = SearchQuery?.Trim();
+        if (!Dispatcher.UIThread.CheckAccess())
+        {
+            Dispatcher.UIThread.Post(DoSearch, DispatcherPriority.Normal);
+            return;
+        }
+
+        // 关键词：先 Trim 再去掉全部空格，再判空
+        var q = string.Concat((SearchQuery ?? "").Trim().Where(c => c != ' '));
         if (string.IsNullOrEmpty(q))
         {
+            _searchCts?.Cancel();
+            _searchCts?.Dispose();
+            _searchCts = null;
             _searchResults.Clear();
             _searchResultGroups.Clear();
             _flatSearchResultRows.Clear();
@@ -2182,6 +2242,7 @@ public sealed class MainViewModel : ViewModelBase
             OnPropertyChanged(nameof(FlatSearchResultRows));
             OnPropertyChanged(nameof(SearchResultCount));
             OnPropertyChanged(nameof(SearchResultCountText));
+            OnPropertyChanged(nameof(SearchResultStatusText));
             return;
         }
 
@@ -2191,130 +2252,244 @@ public sealed class MainViewModel : ViewModelBase
         _searchCts = cts;
         var token = cts.Token;
 
-        // 立即清空结果并显示“搜索中”，再在后台执行搜索
+        var roots = _workspaceFolderPaths.ToList();
+        if (roots.Count == 0)
+        {
+            IsSearching = false;
+            return;
+        }
+
         _searchResults.Clear();
         _searchResultGroups.Clear();
         _flatSearchResultRows.Clear();
+        SearchResultCount = 0;
         IsSearching = true;
         OnPropertyChanged(nameof(SearchResults));
         OnPropertyChanged(nameof(SearchResultGroups));
         OnPropertyChanged(nameof(FlatSearchResultRows));
+        OnPropertyChanged(nameof(SearchResultCount));
+        OnPropertyChanged(nameof(SearchResultCountText));
+        OnPropertyChanged(nameof(SearchResultStatusText));
 
-        var docsSnapshot = _documents.ToList();
         var queryLower = q.ToLowerInvariant();
+        const int resultBatchSize = 5;
 
         _searchTask = Task.Run(() =>
         {
-            int readFromDisk = 0;
             var batch = new List<SearchResultGroup>();
-            const int batchSize = 3;
-            foreach (var doc in docsSnapshot)
-            {
-                if (token.IsCancellationRequested)
-                    return;
+            var dirQueue = new Queue<string>();
+            foreach (var r in roots)
+                if (Directory.Exists(r))
+                    dirQueue.Enqueue(r);
+            int filesSearched = 0;
 
-                var text = doc.CachedMarkdown ?? "";
-                if (string.IsNullOrEmpty(text))
+            while (dirQueue.Count > 0 && !token.IsCancellationRequested)
+            {
+                var dir = dirQueue.Dequeue();
+                try
                 {
-                    if (readFromDisk >= MaxFilesToReadForSearch) continue;
+                    foreach (var subDir in Directory.EnumerateDirectories(dir))
+                    {
+                        if (token.IsCancellationRequested) return;
+                        dirQueue.Enqueue(subDir);
+                    }
+                }
+                catch (DirectoryNotFoundException) { }
+                catch (UnauthorizedAccessException) { }
+
+                foreach (var pattern in FolderFilePatterns)
+                {
+                    if (token.IsCancellationRequested) return;
                     try
                     {
-                        if (File.Exists(doc.FullPath))
+                        foreach (var fullPath in Directory.EnumerateFiles(dir, pattern))
                         {
-                            var fi = new FileInfo(doc.FullPath);
-                            if (fi.Length > MaxFileSizeForSearch) continue;
-                            text = File.ReadAllText(doc.FullPath);
-                            readFromDisk++;
+                            if (token.IsCancellationRequested) return;
+                            filesSearched++;
+
+                            string text;
+                            try
+                            {
+                                text = ReadTextUpToMaxBytes(fullPath, MaxFileSizeForSearch);
+                            }
+                            catch { continue; }
+                            if (string.IsNullOrEmpty(text)) continue;
+
+                            var fileResults = new List<SearchResultItem>();
+                            var lines = text.Split('\n');
+                            for (int i = 0; i < lines.Length; i++)
+                            {
+                                if (token.IsCancellationRequested) return;
+                                var line = lines[i];
+                                if (line.IndexOf(queryLower, StringComparison.OrdinalIgnoreCase) >= 0)
+                                {
+                                    var preview = line.Trim();
+                                    if (preview.Length > 80) preview = preview[..77] + "...";
+                                    fileResults.Add(new SearchResultItem(fullPath, i + 1, preview));
+                                }
+                            }
+                            if (fileResults.Count == 0) continue;
+
+                            batch.Add(new SearchResultGroup(fullPath, fileResults.OrderBy(r => r.LineNumber).ToList()));
+                            if (batch.Count >= resultBatchSize)
+                            {
+                                var toPost = batch.ToList();
+                                batch.Clear();
+                                PostSearchBatch(toPost, token);
+                            }
                         }
                     }
-                    catch { }
+                    catch (DirectoryNotFoundException) { }
+                    catch (UnauthorizedAccessException) { }
                 }
 
-                if (string.IsNullOrEmpty(text))
-                    continue;
-
-                var fileResults = new List<SearchResultItem>();
-                var lines = text.Split('\n');
-                for (int i = 0; i < lines.Length; i++)
-                {
-                    if (token.IsCancellationRequested)
-                        return;
-                    var line = lines[i];
-                    if (line.IndexOf(queryLower, StringComparison.OrdinalIgnoreCase) >= 0)
-                    {
-                        var preview = line.Trim();
-                        if (preview.Length > 80) preview = preview[..77] + "...";
-                        fileResults.Add(new SearchResultItem(doc.FullPath, i + 1, preview));
-                    }
-                }
-
-                if (fileResults.Count == 0)
-                    continue;
-
-                var group = new SearchResultGroup(doc.FullPath, fileResults.OrderBy(r => r.LineNumber).ToList());
-                batch.Add(group);
-                if (batch.Count >= batchSize)
+                if (filesSearched > 0 && filesSearched % SearchFileBatchSize == 0 && batch.Count > 0)
                 {
                     var toPost = batch.ToList();
                     batch.Clear();
-                    Dispatcher.UIThread.Post(() =>
-                    {
-                        if (token.IsCancellationRequested) return;
-                        foreach (var g in toPost)
-                        {
-                            _searchResultGroups.Add(g);
-                            foreach (var r in g.Items)
-                                _searchResults.Add(r);
-                            _flatSearchResultRows.Add(new SearchResultGroupRowViewModel(g));
-                            foreach (var r in g.Items)
-                                _flatSearchResultRows.Add(new SearchResultLineRowViewModel(r, g));
-                        }
-                        OnPropertyChanged(nameof(SearchResults));
-                        OnPropertyChanged(nameof(SearchResultGroups));
-                        OnPropertyChanged(nameof(FlatSearchResultRows));
-                    }, DispatcherPriority.Background);
+                    PostSearchBatch(toPost, token);
                 }
             }
 
             if (batch.Count > 0)
-            {
-                var toPost = batch.ToList();
-                Dispatcher.UIThread.Post(() =>
-                {
-                    if (token.IsCancellationRequested) return;
-                    foreach (var g in toPost)
-                    {
-                        _searchResultGroups.Add(g);
-                        foreach (var r in g.Items)
-                            _searchResults.Add(r);
-                        _flatSearchResultRows.Add(new SearchResultGroupRowViewModel(g));
-                        foreach (var r in g.Items)
-                            _flatSearchResultRows.Add(new SearchResultLineRowViewModel(r, g));
-                    }
-                    OnPropertyChanged(nameof(SearchResults));
-                    OnPropertyChanged(nameof(SearchResultGroups));
-                    OnPropertyChanged(nameof(FlatSearchResultRows));
-                }, DispatcherPriority.Background);
-            }
+                PostSearchBatch(batch, token);
 
             Dispatcher.UIThread.Post(() =>
             {
+                if (_searchCts != cts) return;
                 IsSearching = false;
                 SearchResultCount = _searchResults.Count;
                 OnPropertyChanged(nameof(IsSearching));
                 OnPropertyChanged(nameof(SearchResultCount));
                 OnPropertyChanged(nameof(SearchResultCountText));
+                OnPropertyChanged(nameof(SearchResultStatusText));
             });
         }, token).ContinueWith(_ =>
         {
             Dispatcher.UIThread.Post(() =>
             {
+                if (_searchCts != cts) return;
                 IsSearching = false;
                 SearchResultCount = _searchResults.Count;
                 OnPropertyChanged(nameof(IsSearching));
                 OnPropertyChanged(nameof(SearchResultCount));
                 OnPropertyChanged(nameof(SearchResultCountText));
+                OnPropertyChanged(nameof(SearchResultStatusText));
             });
         }, TaskContinuationOptions.None);
+    }
+
+    /// <summary>截断读取时的重叠量（overlap），前段与后段在边界处重叠，避免在行中间切断。</summary>
+    private const int SearchTruncateOverlapBytes = 64 * 1024;
+
+    /// <summary>大文件分两段截断读取：先读「前面长度+overlap」，再读「overlap+后面长度」，合并后供搜索。</summary>
+    private static string ReadTextUpToMaxBytes(string fullPath, int maxBytes)
+    {
+        using var fs = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        long fileLen = fs.Length;
+        if (fileLen == 0) return "";
+        if (fileLen <= maxBytes)
+        {
+            var buf = new byte[(int)fileLen];
+            int total = 0;
+            while (total < buf.Length)
+            {
+                int n = fs.Read(buf, total, buf.Length - total);
+                if (n <= 0) break;
+                total += n;
+            }
+            return total == 0 ? "" : Encoding.UTF8.GetString(buf, 0, total);
+        }
+
+        int overlap = SearchTruncateOverlapBytes;
+        // 前段：0 ～ maxBytes + overlap
+        int lenA = (int)Math.Min(fileLen, maxBytes + overlap);
+        var bytesA = new byte[lenA];
+        int totalA = 0;
+        fs.Position = 0;
+        while (totalA < lenA)
+        {
+            int n = fs.Read(bytesA, totalA, lenA - totalA);
+            if (n <= 0) break;
+            totalA += n;
+        }
+        if (totalA == 0) return "";
+
+        int cutA = Math.Min(totalA, maxBytes);
+        int safeCutA = FindUtf8SafeCut(bytesA, cutA);
+        var seg1 = Encoding.UTF8.GetString(bytesA, 0, safeCutA);
+        if (safeCutA < totalA)
+        {
+            var tail = Encoding.UTF8.GetString(bytesA, safeCutA, totalA - safeCutA);
+            int firstNl = tail.IndexOf('\n');
+            if (firstNl >= 0) tail = tail.AsSpan(0, firstNl + 1).ToString();
+            seg1 += tail;
+        }
+
+        // 后段：maxBytes - overlap ～ 文件末尾（overlap + 后面长度）
+        long startB = Math.Max(0, maxBytes - overlap);
+        int lenB = (int)(fileLen - startB);
+        if (lenB <= 0) return seg1;
+        var bytesB = new byte[lenB];
+        fs.Position = startB;
+        int totalB = 0;
+        while (totalB < lenB)
+        {
+            int n = fs.Read(bytesB, totalB, lenB - totalB);
+            if (n <= 0) break;
+            totalB += n;
+        }
+        if (totalB == 0) return seg1;
+
+        // 后段中跳过与前段重叠的字节（从 overlap 起才是“后面长度”），并按 UTF-8 边界与首行截断
+        int skipB = (int)(maxBytes - startB);
+        if (skipB >= totalB) return seg1;
+        int startInB = skipB;
+        while (startInB < totalB && (bytesB[startInB] & 0xC0) == 0x80)
+            startInB++;
+        var seg2Raw = Encoding.UTF8.GetString(bytesB, startInB, totalB - startInB);
+        int firstNl2 = seg2Raw.IndexOf('\n');
+        var seg2 = firstNl2 >= 0 ? seg2Raw[(firstNl2 + 1)..] : seg2Raw;
+
+        return seg1 + seg2;
+    }
+
+    /// <summary>在 limit 处按完整 UTF-8 字符边界截断，返回可安全解码的字节长度。</summary>
+    private static int FindUtf8SafeCut(byte[] bytes, int limit)
+    {
+        if (limit <= 0) return 0;
+        int len = Math.Min(limit, bytes.Length);
+        int i = len - 1;
+        while (i >= 0 && (bytes[i] & 0xC0) == 0x80)
+            i--;
+        if (i < 0) return 0;
+        int charLen = bytes[i] < 0x80 ? 1 : bytes[i] < 0xE0 ? 2 : bytes[i] < 0xF0 ? 3 : 4;
+        if (i + charLen <= len) return i + charLen;
+        return i;
+    }
+
+    /// <summary>将一批搜索结果提交到 UI 线程，实现搜索过程中结果与数量的动态更新。</summary>
+    private void PostSearchBatch(List<SearchResultGroup> toPost, CancellationToken token)
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (token.IsCancellationRequested) return;
+            foreach (var g in toPost)
+            {
+                _searchResultGroups.Add(g);
+                foreach (var r in g.Items)
+                    _searchResults.Add(r);
+                _flatSearchResultRows.Add(new SearchResultGroupRowViewModel(g));
+                foreach (var r in g.Items)
+                    _flatSearchResultRows.Add(new SearchResultLineRowViewModel(r, g));
+            }
+            SearchResultCount = _searchResults.Count;
+            OnPropertyChanged(nameof(SearchResults));
+            OnPropertyChanged(nameof(SearchResultGroups));
+            OnPropertyChanged(nameof(FlatSearchResultRows));
+            OnPropertyChanged(nameof(SearchResultCount));
+            OnPropertyChanged(nameof(SearchResultCountText));
+            OnPropertyChanged(nameof(SearchResultStatusText));
+        }, DispatcherPriority.Background);
     }
 }

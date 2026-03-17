@@ -45,8 +45,6 @@ public partial class MainWindow : Window
     private bool _isSyncingScroll;
     private bool _isClosingProgrammatically;
     private readonly DispatcherTimer _searchDebounceTimer;
-    private DispatcherTimer? _fileCheckTimer;
-    private DispatcherTimer? _searchLoadingFlashTimer;
     /// <summary>标记当前是否需要拦截下一次 Alt 键抬起事件，避免 Alt 组合键操作后激活菜单访问键。</summary>
     private bool _suppressNextAltKeyUp;
     /// <summary>侧栏分隔条是否正在拖动（仅显示蓝色预览线，松手后应用布局）。</summary>
@@ -227,30 +225,7 @@ public partial class MainWindow : Window
                 _searchDebounceTimer.Stop();
                 _searchDebounceTimer.Start();
             }
-            if (e.PropertyName == nameof(MainViewModel.CurrentFilePath))
-            {
-                if (string.IsNullOrEmpty(vm.CurrentFilePath))
-                    _fileCheckTimer?.Stop();
-                else
-                    _fileCheckTimer?.Start();
-            }
         };
-        _fileCheckTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
-        _fileCheckTimer.Tick += (_, _) =>
-        {
-            try
-            {
-                if (DataContext is MainViewModel v)
-                    v.CheckFileChangedExternally();
-            }
-            catch
-            {
-                // 文件 IO 等异常不影响使用，仅跳过本次检测
-            }
-        };
-        if (!string.IsNullOrEmpty(vm.CurrentFilePath))
-            _fileCheckTimer.Start();
-
         if (EditorTextBox != null)
             EditorTextBox.GotFocus += (_, _) => vm.ActivePane = "Editor";
 
@@ -339,7 +314,7 @@ public partial class MainWindow : Window
                 SidebarSplitterPreviewLine!.Margin = new Thickness(x, 0, 0, 0);
                 if (SidebarCollapseStripOverlay != null && DataContext is MainViewModel vmMove && !vmMove.IsSidebarCollapsed)
                 {
-                    var overlayLeft = x - SidebarStripWidthExpanded;
+                    var overlayLeft = x - ScrollbarWidth - SidebarCollapseFloatingWidth;
                     SidebarCollapseStripOverlay.Margin = new Thickness(overlayLeft, 0, 0, 0);
                 }
             };
@@ -431,7 +406,9 @@ public partial class MainWindow : Window
     }
 
     private const double SidebarCollapsedWidth = 20;
-    private const double SidebarStripWidthExpanded = 16;
+    /// <summary>展开时折叠箭头悬浮块宽度（仅箭头，不留白）；贴滚动条左侧。</summary>
+    private const double SidebarCollapseFloatingWidth = 24;
+    private const double ScrollbarWidth = 12;
     private const double SidebarMinWidth = 180;
     private const double SidebarMaxWidth = 420;
 
@@ -469,10 +446,10 @@ public partial class MainWindow : Window
             mainCols[1].Width = new GridLength(collapsed ? 0 : SidebarSplitterWidth, GridUnitType.Pixel);
         if (SidebarSplitter != null)
             SidebarSplitter.IsVisible = !collapsed;
-        // 悬浮折叠条：不占布局宽度。折叠时贴左（0）；展开时放在侧栏内部最右 16px，不压住分隔条以便拖动调整宽度
-        var overlayWidth = collapsed ? SidebarCollapsedWidth : SidebarStripWidthExpanded;
+        // 折叠箭头单独悬浮：展开时置于滚动条左侧居中，不占内容区留白；折叠时贴左
+        var overlayWidth = collapsed ? SidebarCollapsedWidth : SidebarCollapseFloatingWidth;
         SidebarCollapseStripOverlay.Width = overlayWidth;
-        var overlayLeft = collapsed ? 0 : (sidebarWidthPx - overlayWidth);
+        var overlayLeft = collapsed ? 0 : (sidebarWidthPx - ScrollbarWidth - overlayWidth);
         SidebarCollapseStripOverlay.Margin = new Thickness(overlayLeft, 0, 0, 0);
         // 折叠时去掉侧栏右边线，与主内容区完全贴齐不留缝
         if (SidebarBorder != null)
@@ -481,7 +458,8 @@ public partial class MainWindow : Window
 
     private void SidebarCollapseStrip_OnPointerPressed(object? sender, PointerPressedEventArgs e)
     {
-        if (SidebarCollapseStripOverlay == null || !e.GetCurrentPoint(SidebarCollapseStripOverlay).Properties.IsLeftButtonPressed) return;
+        var hitTarget = sender as Visual;
+        if (hitTarget == null || !e.GetCurrentPoint(hitTarget).Properties.IsLeftButtonPressed) return;
         e.Handled = true;
         if (DataContext is MainViewModel vm)
             vm.IsSidebarCollapsed = !vm.IsSidebarCollapsed;
@@ -502,11 +480,10 @@ public partial class MainWindow : Window
     /// <summary>窗口关闭时停止所有定时器，避免 Tick 在析构后触发导致异常。</summary>
     private void StopAllTimers()
     {
-            try
-            {
-                _searchDebounceTimer.Stop();
-                _fileCheckTimer?.Stop();
-            }
+        try
+        {
+            _searchDebounceTimer.Stop();
+        }
         catch { }
     }
 
@@ -996,10 +973,7 @@ public partial class MainWindow : Window
             UpdateActivityBarHighlight(vm);
         else if (e.PropertyName == nameof(MainViewModel.IsSearching))
         {
-            if (vm.IsSearching)
-                StartSearchLoadingFlash();
-            else
-                StopSearchLoadingFlash();
+            // 搜索状态由 ViewModel 的 SearchResultStatusText（x 个结果 + 循环小点）与定时器处理
         }
         else if (e.PropertyName == nameof(MainViewModel.ShowEditorPaneForCurrentDoc))
         {
@@ -1022,27 +996,6 @@ public partial class MainWindow : Window
         ActivitySettingsButton.Classes.Set("active", vm.IsSettingsActive);
     }
 
-    private void StartSearchLoadingFlash()
-    {
-        StopSearchLoadingFlash();
-        if (SearchLoadingTextBlock == null) return;
-        SearchLoadingTextBlock.Opacity = 0.4;
-        _searchLoadingFlashTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(450) };
-        _searchLoadingFlashTimer.Tick += (_, _) =>
-        {
-            if (SearchLoadingTextBlock == null) return;
-            SearchLoadingTextBlock.Opacity = Math.Abs(SearchLoadingTextBlock.Opacity - 1) < 0.01 ? 0.4 : 1.0;
-        };
-        _searchLoadingFlashTimer.Start();
-    }
-
-    private void StopSearchLoadingFlash()
-    {
-        _searchLoadingFlashTimer?.Stop();
-        _searchLoadingFlashTimer = null;
-        if (SearchLoadingTextBlock != null)
-            SearchLoadingTextBlock.Opacity = 0.85;
-    }
 
     private void SetupEditorContextMenuAndKeys(MainViewModel vm)
     {

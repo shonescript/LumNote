@@ -64,7 +64,7 @@
     </Style>
     <Style Selector="TabItem:selected">
       <Setter Property="Foreground" Value="{DynamicResource TabItemSelectedForeground}"/>
-      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="FontWeight" Value="Normal"/>
     </Style>
     <Style Selector="TabItem:selected:pointerover /template/ Border">
       <Setter Property="Background" Value="{DynamicResource TabItemSelectedBackground}"/>
@@ -199,12 +199,6 @@
     </Style>
     <Style Selector="Border.statusBar Button">
       <Setter Property="Foreground" Value="{DynamicResource StatusBarForeground}"/>
-    </Style>
-    <Style Selector="Border.fileChangedBar">
-      <Setter Property="Background" Value="{DynamicResource FileChangedBarBackground}"/>
-    </Style>
-    <Style Selector="Border.fileChangedBar TextBlock">
-      <Setter Property="Foreground" Value="{DynamicResource FileChangedBarForeground}"/>
     </Style>
     <!-- 预览控件背景由 Markdown 渲染主题控制，这里不再用界面主题色覆盖，避免冲掉 Markdown 背景 -->
     <Style Selector="controls|MarkdownEngineView ScrollViewer">
@@ -551,17 +545,17 @@
                 <TextBlock Text="结果（按文件分组，点击行定位）"
                            FontSize="10"
                            VerticalAlignment="Center"/>
-                <TextBlock Text="搜索中…"
+                <Button x:Name="SearchStopButton"
+                        Command="{Binding CancelSearchCommand}"
+                        IsVisible="{Binding IsSearching}"
+                        Padding="4,2"
+                        FontSize="10"
+                        Content="停止"
+                        Cursor="Hand"
+                        VerticalAlignment="Center"/>
+                <TextBlock Text="{Binding SearchResultStatusText}"
                            FontSize="10"
                            Foreground="{DynamicResource EditorForeground}"
-                           IsVisible="{Binding IsSearching}"
-                           VerticalAlignment="Center"
-                           Opacity="0.85"
-                           x:Name="SearchLoadingTextBlock"/>
-                <TextBlock Text="{Binding SearchResultCountText}"
-                           FontSize="10"
-                           Foreground="{DynamicResource EditorForeground}"
-                           IsVisible="{Binding IsSearchCompleted}"
                            VerticalAlignment="Center"
                            Opacity="0.85"/>
               </StackPanel>
@@ -947,31 +941,37 @@
         </Grid>
       </Grid>
       </Grid>
-      <!-- 折叠条悬浮层：不占布局宽度，叠在内容区左侧 -->
+      <!-- 折叠箭头悬浮层：仅箭头大小，垂直居中贴滚动条左侧，不占内容区留白 -->
       <Border x:Name="SidebarCollapseStripOverlay"
               HorizontalAlignment="Left"
               VerticalAlignment="Stretch"
               Background="Transparent"
-              Cursor="Hand"
-              ZIndex="100"
-              ToolTip.Tip="{Binding IsSidebarCollapsed, Converter={x:Static conv:SidebarCollapseToolTipConverter.Instance}}"
-              PointerPressed="SidebarCollapseStrip_OnPointerPressed"
-              PointerEntered="SidebarCollapseStrip_OnPointerEntered"
-              PointerExited="SidebarCollapseStrip_OnPointerExited">
-        <Panel HorizontalAlignment="Center" VerticalAlignment="Center">
-          <Path x:Name="SidebarExpandPath"
-                IsVisible="{Binding IsSidebarCollapsed}"
-                Data="M 0 0 L 6 4 L 0 8 Z"
-                Fill="{DynamicResource SidebarTextForeground}"
-                Stretch="Uniform"
-                Width="8" Height="10"/>
-          <Path x:Name="SidebarCollapsePath"
-                IsVisible="{Binding ShowSidebarCollapseIcon}"
-                Data="M 6 0 L 0 4 L 6 8 Z"
-                Fill="{DynamicResource SidebarTextForeground}"
-                Stretch="Uniform"
-                Width="8" Height="10"/>
-        </Panel>
+              ZIndex="100">
+        <Border x:Name="SidebarCollapseButtonHitArea"
+                HorizontalAlignment="Center"
+                VerticalAlignment="Center"
+                Width="24" Height="24"
+                Background="Transparent"
+                Cursor="Hand"
+                ToolTip.Tip="{Binding IsSidebarCollapsed, Converter={x:Static conv:SidebarCollapseToolTipConverter.Instance}}"
+                PointerPressed="SidebarCollapseStrip_OnPointerPressed"
+                PointerEntered="SidebarCollapseStrip_OnPointerEntered"
+                PointerExited="SidebarCollapseStrip_OnPointerExited">
+          <Panel HorizontalAlignment="Center" VerticalAlignment="Center">
+            <Path x:Name="SidebarExpandPath"
+                  IsVisible="{Binding IsSidebarCollapsed}"
+                  Data="M 0 0 L 6 4 L 0 8 Z"
+                  Fill="{DynamicResource SidebarTextForeground}"
+                  Stretch="Uniform"
+                  Width="8" Height="10"/>
+            <Path x:Name="SidebarCollapsePath"
+                  IsVisible="{Binding ShowSidebarCollapseIcon}"
+                  Data="M 6 0 L 0 4 L 6 8 Z"
+                  Fill="{DynamicResource SidebarTextForeground}"
+                  Stretch="Uniform"
+                  Width="8" Height="10"/>
+          </Panel>
+        </Border>
       </Border>
     </Grid>
 
@@ -1072,6 +1072,7 @@
               <MenuFlyout Placement="Top">
                 <MenuItem Header="UTF-8" Command="{Binding SetEncodingCommand}" CommandParameter="UTF-8"/>
                 <MenuItem Header="ASCII" Command="{Binding SetEncodingCommand}" CommandParameter="ASCII"/>
+                <MenuItem Header="GB18030" Command="{Binding SetEncodingCommand}" CommandParameter="GB18030"/>
                 <MenuItem Header="GBK" Command="{Binding SetEncodingCommand}" CommandParameter="GBK"/>
                 <MenuItem Header="GB2312" Command="{Binding SetEncodingCommand}" CommandParameter="GB2312"/>
                 <MenuItem Header="UTF-16" Command="{Binding SetEncodingCommand}" CommandParameter="UTF-16"/>
@@ -1086,26 +1087,5 @@
       </Grid>
     </Border>
 
-    <!-- 文件在外部被修改时显示的提示条（浮在内容区上方，不占用文件） -->
-    <Border x:Name="FileChangedBar"
-            Grid.Row="1"
-            IsVisible="{Binding FileChangedExternally}"
-            Padding="12,6"
-            HorizontalAlignment="Stretch"
-            VerticalAlignment="Top"
-            Margin="0,36,0,0"
-            ZIndex="100"
-            Classes="fileChangedBar">
-      <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center" HorizontalAlignment="Center">
-        <TextBlock Text="文件已在外部修改。"
-                   VerticalAlignment="Center"/>
-        <Button Content="重新加载"
-                Command="{Binding ReloadFromDiskCommand}"
-                Padding="8,2"/>
-        <Button Content="忽略"
-                Command="{Binding DismissFileChangedCommand}"
-                Padding="8,2"/>
-      </StackPanel>
-    </Border>
   </Grid>
 </Window>
