@@ -55,7 +55,7 @@ public static class BlockScanner
             return new BlockSpan(startLine, end, BlockKind.Blockquote);
         }
 
-        // 列表
+        // 列表：遇空行即结束当前列表 span，以便后续扫描出空行块，多行回车能正确渲染
         if (IsListStart(trimmed))
         {
             int end = startLine + 1;
@@ -63,10 +63,7 @@ public static class BlockScanner
             {
                 var t = doc.GetLine(end).Trim();
                 if (t.Length == 0)
-                {
-                    end++;
-                    continue;
-                }
+                    break;
                 if (!IsListStart(t) && !IsListContinuation(t))
                     break;
                 end++;

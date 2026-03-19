@@ -103,23 +103,21 @@ internal sealed class IncrementalParseManager
             return ReparseFull(doc);
         }
 
-        // 2) 若脏区间包含脚注定义或脚注区，为避免复杂的归一化依赖，直接全量解析。
-        for (int i = firstDirty; i <= lastDirty; i++)
-        {
-            var node = _blocks[i];
-            if (node is FootnoteDefNode or FootnoteSectionNode)
-                return ReparseFull(doc);
-        }
-
-        // 3) 计算需要重新扫描的源码行窗口：覆盖所有脏块的完整行范围。
+        // 2) 计算需要重新扫描的源码行窗口：覆盖所有脏块的完整行范围，且至少覆盖本次请求的 [lineStart, lineEnd)。
+        //    插入行时旧块 endLine 可能小于 lineEnd，导致新下移行（如图片）未被扫描而丢失，故取 max。
         var firstRange = _ranges[firstDirty];
         var lastRange = _ranges[lastDirty];
         int scanStartLine = firstRange.startLine;
-        int scanEndLine = lastRange.endLine;
+        int scanEndLine = Math.Max(lastRange.endLine, lineEnd);
 
-        // 4) 使用 BlockScanner 从 scanStartLine 开始重新扫描，直到超出 scanEndLine。
+        // 3) 使用 BlockScanner 从 scanStartLine 开始重新扫描，直到超出 scanEndLine。
+        //    注意：span.EndLine 可能会“跨过”scanEndLine（因为我们以 span.StartLine 作为起点继续解析）。
+        //    因此合并替换范围不能只用 scanEndLine，而应基于实际解析覆盖到的 actualScanEndLine。
         var newBlocksSegment = new List<MarkdownNode?>();
         var newRangesSegment = new List<(int startLine, int endLine)>();
+        int parsedEmptyLineBlocks = 0;
+        int parsedMaxEmptyLineCount = 0;
+        int actualScanEndLine = scanStartLine;
         int line = scanStartLine;
         while (line < doc.LineCount && line < scanEndLine)
         {
@@ -131,10 +129,17 @@ internal sealed class IncrementalParseManager
             if (span.StartLine >= scanEndLine)
                 break;
 
+            actualScanEndLine = Math.Max(actualScanEndLine, span.EndLine);
+
             var text = GetSpanText(doc, span);
             var fullDoc = MarkdownParser.Parse(text);
             foreach (var child in fullDoc.Children)
             {
+                if (child is EmptyLineNode el)
+                {
+                    parsedEmptyLineBlocks++;
+                    parsedMaxEmptyLineCount = Math.Max(parsedMaxEmptyLineCount, el.LineCount);
+                }
                 newBlocksSegment.Add(child);
                 newRangesSegment.Add((span.StartLine, span.EndLine));
             }
@@ -142,8 +147,34 @@ internal sealed class IncrementalParseManager
             line = span.EndLine;
         }
 
-        // 5) 组装新的全量块列表：前段 + 新段 + 后段。
-        var mergedBlocks = new List<MarkdownNode?>(_blocks.Count - (lastDirty - firstDirty + 1) + newBlocksSegment.Count);
+        // 4) 对齐第 6 步合并替换范围：用 actualScanEndLine 覆盖 span.EndLine 跨越的部分，
+        //    避免“解析了额外块内容但没把对应旧块一起替换”，从而在插入行附近留下多余留白/行。
+        int lastDirtyExpanded = lastDirty;
+        for (int i = lastDirty + 1; i < _ranges.Count; i++)
+        {
+            var (s, _) = _ranges[i];
+            if (s < actualScanEndLine)
+                lastDirtyExpanded = i;
+            else
+                break; // _ranges 按块顺序递增，startLine >= actualScanEndLine 后后续都不会被覆盖
+        }
+
+        // 5) 若脏区间（含实际扫描覆盖范围）包含脚注定义或脚注区，为避免复杂的归一化依赖，直接全量解析。
+        for (int i = firstDirty; i <= lastDirtyExpanded; i++)
+        {
+            var node = _blocks[i];
+            if (node is FootnoteDefNode or FootnoteSectionNode)
+                return ReparseFull(doc);
+        }
+
+        // 5.5) 夹在两个 BulletListNode 之间的空行/仅空白段落会渲染成“多一行”留白，合并前过滤掉。
+        FilterMiddleEmptyBlocksBetweenLists(newBlocksSegment, newRangesSegment);
+        // 5.6) 重扫可能把一段列表拆成多段列表块（中间有空行），合并相邻同类型列表以避免块间留白。
+        MergeConsecutiveListBlocks(newBlocksSegment, newRangesSegment);
+
+        // 6) 组装新的全量块列表：前段 + 新段 + 后段。
+        //    注意：中段替换的旧块范围使用 lastDirtyExpanded（避免新旧重叠/遗漏）。
+        var mergedBlocks = new List<MarkdownNode?>(_blocks.Count - (lastDirtyExpanded - firstDirty + 1) + newBlocksSegment.Count);
         var mergedRanges = new List<(int startLine, int endLine)>(mergedBlocks.Capacity);
 
         // 前段：0 .. firstDirty-1
@@ -153,20 +184,167 @@ internal sealed class IncrementalParseManager
             mergedRanges.Add(_ranges[i]);
         }
 
-        // 中段：新的解析结果
+        // 中段：新的解析结果（可能已被 FilterMiddleEmptyBlocksBetweenLists 收缩）
         mergedBlocks.AddRange(newBlocksSegment);
         mergedRanges.AddRange(newRangesSegment);
 
-        // 后段：lastDirty+1 .. 末尾
-        for (int i = lastDirty + 1; i < _blocks.Count; i++)
+        // 后段：lastDirtyExpanded+1 .. 末尾
+        for (int i = lastDirtyExpanded + 1; i < _blocks.Count; i++)
         {
             mergedBlocks.Add(_blocks[i]);
             mergedRanges.Add(_ranges[i]);
         }
 
+        // 6.5) 对整份块列表合并相邻的同类型列表块（解决“中间插入后再在末尾插入”仍出现两段列表留白，以及 -/1. 等列表模式）
+        MergeConsecutiveListBlocksInFullList(mergedBlocks, mergedRanges);
+
         _blocks = mergedBlocks;
         _ranges = mergedRanges;
         return new BlockListSnapshot(mergedBlocks, mergedRanges);
+    }
+
+    /// <summary>
+    /// 仅移除“夹在两个列表块之间”的**单行**空块，避免列表中间误插一行空行时出现留白；
+    /// 多行回车（两行及以上空行）保留，以正确渲染段落间距。原地修改两个列表。
+    /// </summary>
+    private static void FilterMiddleEmptyBlocksBetweenLists(
+        List<MarkdownNode?> newBlocksSegment,
+        List<(int startLine, int endLine)> newRangesSegment)
+    {
+        if (newBlocksSegment.Count != newRangesSegment.Count || newBlocksSegment.Count < 3)
+            return;
+
+        var keep = new List<int>();
+        for (int i = 0; i < newBlocksSegment.Count; i++)
+        {
+            if (i > 0 && i < newBlocksSegment.Count - 1 &&
+                IsListBlock(newBlocksSegment[i - 1]) &&
+                IsListBlock(newBlocksSegment[i + 1]) &&
+                IsEmptyOrWhitespaceOnlyBlock(newBlocksSegment[i]) &&
+                IsSingleLineRange(newRangesSegment[i]) &&
+                !IsMultiLineEmptyBlock(newBlocksSegment[i]))
+                continue;
+            keep.Add(i);
+        }
+
+        if (keep.Count == newBlocksSegment.Count)
+            return;
+
+        var newBlocks = new List<MarkdownNode?>(keep.Count);
+        var newRanges = new List<(int startLine, int endLine)>(keep.Count);
+        foreach (int idx in keep)
+        {
+            newBlocks.Add(newBlocksSegment[idx]);
+            newRanges.Add(newRangesSegment[idx]);
+        }
+        newBlocksSegment.Clear();
+        newBlocksSegment.AddRange(newBlocks);
+        newRangesSegment.Clear();
+        newRangesSegment.AddRange(newRanges);
+    }
+
+    private static bool IsListBlock(MarkdownNode? node) =>
+        node is BulletListNode or OrderedListNode;
+
+    /// <summary>仅当该块对应源码为单行（或 0 行）时返回 true，用于保留多行空行的渲染。</summary>
+    private static bool IsSingleLineRange((int startLine, int endLine) r) =>
+        r.endLine - r.startLine <= 1;
+
+    /// <summary>多行空行块（EmptyLineNode.LineCount &gt; 1）一律保留，不参与“夹在两列表之间单行空”的过滤。</summary>
+    private static bool IsMultiLineEmptyBlock(MarkdownNode? node) =>
+        node is EmptyLineNode el && el.LineCount > 1;
+
+    private static bool IsEmptyOrWhitespaceOnlyBlock(MarkdownNode? node)
+    {
+        if (node is EmptyLineNode)
+            return true;
+        if (node is not ParagraphNode p || p.Content == null)
+            return false;
+        if (p.Content.Count == 0)
+            return true;
+        for (int i = 0; i < p.Content.Count; i++)
+        {
+            if (p.Content[i] is not TextNode t || !string.IsNullOrWhiteSpace(t.Content))
+                return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// 将列表中连续的多个同类型列表块（BulletListNode 或 OrderedListNode）合并为一块，
+    /// 避免因中间空行被拆成多段而在渲染时出现块间留白。原地修改两个列表。
+    /// </summary>
+    private static void MergeConsecutiveListBlocks(
+        List<MarkdownNode?> blocks,
+        List<(int startLine, int endLine)> ranges)
+    {
+        if (blocks.Count != ranges.Count || blocks.Count < 2)
+            return;
+
+        var outBlocks = new List<MarkdownNode?>();
+        var outRanges = new List<(int startLine, int endLine)>();
+
+        int i = 0;
+        while (i < blocks.Count)
+        {
+            if (blocks[i] is BulletListNode firstBullet)
+            {
+                int rangeStart = ranges[i].startLine;
+                int rangeEnd = ranges[i].endLine;
+                var allItems = new List<ListItemNode>(firstBullet.Items);
+                int j = i + 1;
+                while (j < blocks.Count && blocks[j] is BulletListNode nextList)
+                {
+                    allItems.AddRange(nextList.Items);
+                    rangeEnd = ranges[j].endLine;
+                    j++;
+                }
+                outBlocks.Add(new BulletListNode { Items = allItems });
+                outRanges.Add((rangeStart, rangeEnd));
+                i = j;
+                continue;
+            }
+
+            if (blocks[i] is OrderedListNode firstOrdered)
+            {
+                int rangeStart = ranges[i].startLine;
+                int rangeEnd = ranges[i].endLine;
+                var allItems = new List<ListItemNode>(firstOrdered.Items);
+                int j = i + 1;
+                while (j < blocks.Count && blocks[j] is OrderedListNode nextList)
+                {
+                    allItems.AddRange(nextList.Items);
+                    rangeEnd = ranges[j].endLine;
+                    j++;
+                }
+                outBlocks.Add(new OrderedListNode { StartNumber = firstOrdered.StartNumber, Items = allItems });
+                outRanges.Add((rangeStart, rangeEnd));
+                i = j;
+                continue;
+            }
+
+            outBlocks.Add(blocks[i]);
+            outRanges.Add(ranges[i]);
+            i++;
+        }
+
+        if (outBlocks.Count == blocks.Count)
+            return;
+
+        blocks.Clear();
+        blocks.AddRange(outBlocks);
+        ranges.Clear();
+        ranges.AddRange(outRanges);
+    }
+
+    /// <summary>
+    /// 对整份块列表合并相邻的同类型列表块，解决“中间插入后再在末尾插入”仍出现两段列表留白等问题。
+    /// </summary>
+    private static void MergeConsecutiveListBlocksInFullList(
+        List<MarkdownNode?> blocks,
+        List<(int startLine, int endLine)> ranges)
+    {
+        MergeConsecutiveListBlocks(blocks, ranges);
     }
 
     /// <summary>

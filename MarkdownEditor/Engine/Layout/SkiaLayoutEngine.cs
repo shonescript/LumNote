@@ -226,8 +226,8 @@ public sealed class SkiaLayoutEngine : ILayoutEngine, ILayoutEnvironment
                 LayoutFootnoteSectionBlock(block, fs, width, blockIndex, ref x, ref y);
                 break;
             case EmptyLineNode el:
-                // 多空行最多显示 2 个
-                int emptyLines = Math.Min(el.LineCount, 2);
+                // 多空行按实际数量渲染（上限 10 行），保证多行回车可见
+                int emptyLines = Math.Clamp(el.LineCount, 1, 10);
                 y += _baseFontSize * _lineSpacing * emptyLines;
                 break;
             default:

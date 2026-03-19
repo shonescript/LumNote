@@ -183,9 +183,11 @@
     <Style Selector="Grid.previewPane">
       <Setter Property="Background" Value="Transparent"/>
     </Style>
+    <!-- 标签栏：背景色与底部分隔线，与下方编辑/预览区区分 -->
     <Style Selector="Border.tabBarBorder">
       <Setter Property="Background" Value="{DynamicResource TabBarBackground}"/>
       <Setter Property="BorderBrush" Value="{DynamicResource TabBarBorderBrush}"/>
+      <Setter Property="BorderThickness" Value="0,0,0,1"/>
     </Style>
     <Style Selector="ae|TextEditor.editorControl">
       <Setter Property="Background" Value="{DynamicResource ContentBackground}"/>
@@ -835,10 +837,9 @@
           </ScrollViewer>
         </Border>
 
-        <!-- 文档标签页（右侧上方），有文档时显示；左侧固定「+」新文档按钮 -->
+        <!-- 文档标签页（右侧上方），有文档时显示；左侧固定「+」新文档按钮；底部分隔线与编辑区区分 -->
         <Border Grid.Row="0"
                 IsVisible="{Binding ShowEditorView}"
-                BorderThickness="0"
                 Classes="tabBarBorder">
           <StackPanel Orientation="Horizontal" Margin="0,2,0,0" Spacing="2">
             <Button x:Name="NewDocumentTabButton"
