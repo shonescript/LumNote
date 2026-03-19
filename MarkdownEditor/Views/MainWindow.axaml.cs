@@ -2,6 +2,7 @@ using System.ComponentModel;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
+using Avalonia.Input.Platform;
 using Avalonia.Interactivity;
 using Avalonia.Media;
 using Avalonia.Media.Imaging;
@@ -1043,11 +1044,14 @@ public partial class MainWindow : Window
             {
                 try
                 {
-                    var text = await clipboard.GetTextAsync();
-                    canPaste = !string.IsNullOrEmpty(text);
+                    var text = await clipboard.TryGetTextAsync();
+                    if (!string.IsNullOrEmpty(text)) { canPaste = true; goto done; }
+                    if (await ClipboardPasteHelper.TryGetFileOrImageAsync(clipboard) != null)
+                        canPaste = true;
                 }
                 catch { }
             }
+        done:
             await Dispatcher.UIThread.InvokeAsync(() =>
             {
                 EditorContextPaste.IsEnabled = canPaste;
@@ -1495,7 +1499,7 @@ public partial class MainWindow : Window
         }
 
         // 3. 文本粘贴
-        var text = await clipboard.GetTextAsync();
+        var text = await clipboard.TryGetTextAsync();
         if (!string.IsNullOrEmpty(text))
         {
             editor.Document.Replace(offset, length, text);
@@ -1970,7 +1974,7 @@ public partial class MainWindow : Window
             Spacing = 10,
             Children =
             {
-                Para("Ver 1.0.0 @ 2026", FontWeight.SemiBold),
+                Para("Ver 1.0.0.2 @ 2026", FontWeight.SemiBold),
                 Para(
                     "We built this to solve our own problems. Now we maintain it to solve yours. Free forever. Works offline. No accounts, no tracking, no expiration date. Just a reliable tool that grows with you."
                 ),
