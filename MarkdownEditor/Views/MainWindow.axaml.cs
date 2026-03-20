@@ -772,7 +772,6 @@ public partial class MainWindow : Window
                         };
                         mi.Click += (_, _) =>
                         {
-                            vm.OpenDocument(path);
                             vm.EnterCompareWithCommit(path, commit.Sha);
                             Dispatcher.UIThread.Post(RefreshDualDiffDisplay, DispatcherPriority.Loaded);
                         };
@@ -2550,7 +2549,6 @@ public partial class MainWindow : Window
         gitVm.CompareFileWithWorkingRequested += (_, t) =>
         {
             var (fullPath, sha) = t;
-            vm.OpenDocument(fullPath);
             vm.EnterCompareWithCommit(fullPath, sha);
             Dispatcher.UIThread.Post(RefreshDualDiffDisplay, DispatcherPriority.Loaded);
         };
@@ -2981,7 +2979,6 @@ public partial class MainWindow : Window
         if (DataContext is not MainViewModel vm || e.AddedItems?.Count is not 1) return;
         if (e.AddedItems[0] is not Models.GitChangeItem item || string.IsNullOrEmpty(item.FullPath)) return;
         var path = item.FullPath;
-        vm.OpenDocument(path);
         vm.EnterCompareWithCommit(path, "HEAD");
         var retryCount = 0;
         const int maxRetries = 3;
@@ -3040,7 +3037,6 @@ public partial class MainWindow : Window
         win.SetCompareWithCurrentAction(() =>
         {
             win.Close();
-            vm.OpenDocument(filePath);
             vm.EnterCompareWithCommit(filePath, commit.Sha);
             Dispatcher.UIThread.Post(RefreshDualDiffDisplay, DispatcherPriority.Loaded);
         });

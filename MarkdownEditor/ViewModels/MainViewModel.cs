@@ -114,11 +114,14 @@ public sealed partial class MainViewModel : ViewModelBase
     /// <summary>是否有超出显示上限的最近文件夹。</summary>
     public bool HasMoreRecentFolders => _recentFolderPaths.Count > RecentDisplayLimit;
 
-    /// <summary>无打开文档时显示欢迎页（最近打开列表）。</summary>
-    public bool ShowWelcomeView => _openDocuments.Count == 0;
+    /// <summary>无打开文档且未处于比对模式时显示欢迎页（最近打开列表）。</summary>
+    public bool ShowWelcomeView => _openDocuments.Count == 0 && !IsDiffCompareActive;
 
-    /// <summary>有打开文档时显示编辑/预览区（与 ShowWelcomeView 互斥）。</summary>
-    public bool ShowEditorView => _openDocuments.Count > 0;
+    /// <summary>有打开文档或处于比对模式时显示编辑/预览区（与 ShowWelcomeView 互斥）。</summary>
+    public bool ShowEditorView => _openDocuments.Count > 0 || IsDiffCompareActive;
+
+    /// <summary>仅在有打开文档时显示标签栏；比对模式不额外占用标签。</summary>
+    public bool ShowDocumentTabBar => _openDocuments.Count > 0;
 
     public MainViewModel()
     {
@@ -512,6 +515,8 @@ public sealed partial class MainViewModel : ViewModelBase
         set
         {
             if (_activeDocument == value) return;
+            if (value is not null && IsDiffCompareActive)
+                ExitCompareWithCommit();
 
             var pathToSave = string.IsNullOrEmpty(_currentFilePath)
                 ? (_activeDocument != null ? "untitled:" + _activeDocument.DisplayName : null)
@@ -564,16 +569,24 @@ public sealed partial class MainViewModel : ViewModelBase
     public void OpenImageInTab(string path)
     {
         if (string.IsNullOrWhiteSpace(path) || !IsPreviewableImagePath(path)) return;
+        var fullPath = Path.GetFullPath(path);
 
-        var doc = _documents.FirstOrDefault(d => string.Equals(d.FullPath, path, StringComparison.OrdinalIgnoreCase));
+        var opened = FindOpenDocumentByPath(fullPath);
+        if (opened is not null)
+        {
+            ActiveDocument = opened;
+            return;
+        }
+
+        var doc = _documents.FirstOrDefault(d => string.Equals(d.FullPath, fullPath, StringComparison.OrdinalIgnoreCase));
         if (doc is null)
         {
-            var root = GetWorkspaceRootForPath(path);
-            var rel = root != null ? Path.GetRelativePath(root, path) : Path.GetFileName(path);
-            doc = new DocumentItem(path, rel) { WorkspaceRoot = root };
+            var root = GetWorkspaceRootForPath(fullPath);
+            var rel = root != null ? Path.GetRelativePath(root, fullPath) : Path.GetFileName(fullPath);
+            doc = new DocumentItem(fullPath, rel) { WorkspaceRoot = root };
             _documents.Add(doc);
         }
-        if (!_openDocuments.Contains(doc))
+        if (FindOpenDocumentByPath(fullPath) is null)
         {
             doc.IsOpen = true;
             _openDocuments.Add(doc);
@@ -1018,6 +1031,7 @@ public sealed partial class MainViewModel : ViewModelBase
     {
         OnPropertyChanged(nameof(ShowWelcomeView));
         OnPropertyChanged(nameof(ShowEditorView));
+        OnPropertyChanged(nameof(ShowDocumentTabBar));
     }
 
     private void PushRecentFolder(string path)
@@ -1826,6 +1840,7 @@ public sealed partial class MainViewModel : ViewModelBase
         OnPropertyChanged(nameof(ShowMarkdownPreviewWhenNotDiffing));
         OnPropertyChanged(nameof(ShowPreviewImageWhenNotDiffing));
         OnPropertyChanged(nameof(IsSingleEditorPaneVisible));
+        NotifyWelcomeViewChanged();
     }
 
     /// <summary>退出与 Git 版本的比对；若当前内容含历史虚拟行则先剥离。</summary>
@@ -1841,6 +1856,7 @@ public sealed partial class MainViewModel : ViewModelBase
         OnPropertyChanged(nameof(ShowMarkdownPreviewWhenNotDiffing));
         OnPropertyChanged(nameof(ShowPreviewImageWhenNotDiffing));
         OnPropertyChanged(nameof(IsSingleEditorPaneVisible));
+        NotifyWelcomeViewChanged();
     }
 
     /// <summary>是否显示单栏编辑器（非双栏比对时）。</summary>
@@ -2166,22 +2182,30 @@ public sealed partial class MainViewModel : ViewModelBase
 
     private void LoadDocument(string path)
     {
-        if (IsDiffCompareActive && !string.Equals(path, _diffCompareFilePath, StringComparison.OrdinalIgnoreCase))
+        if (IsDiffCompareActive)
             ExitCompareWithCommit();
         if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
             PushRecentFile(path);
+        var fullPath = Path.GetFullPath(path);
 
-        var doc = _documents.FirstOrDefault(d => string.Equals(d.FullPath, path, StringComparison.OrdinalIgnoreCase));
+        var opened = FindOpenDocumentByPath(fullPath);
+        if (opened is not null)
+        {
+            ActiveDocument = opened;
+            return;
+        }
+
+        var doc = _documents.FirstOrDefault(d => string.Equals(d.FullPath, fullPath, StringComparison.OrdinalIgnoreCase));
         if (doc is null)
         {
-            var root = GetWorkspaceRootForPath(path);
-            var rel = root != null ? Path.GetRelativePath(root, path) : Path.GetFileName(path);
-            doc = new DocumentItem(path, rel) { WorkspaceRoot = root };
+            var root = GetWorkspaceRootForPath(fullPath);
+            var rel = root != null ? Path.GetRelativePath(root, fullPath) : Path.GetFileName(fullPath);
+            doc = new DocumentItem(fullPath, rel) { WorkspaceRoot = root };
             _documents.Add(doc);
         }
 
         // 优先从关闭文档缓存恢复（最多 10 个），否则从磁盘读取
-        var cacheIdx = _closedDocumentCache.FindIndex(t => string.Equals(t.path, path, StringComparison.OrdinalIgnoreCase));
+        var cacheIdx = _closedDocumentCache.FindIndex(t => string.Equals(t.path, fullPath, StringComparison.OrdinalIgnoreCase));
         if (cacheIdx >= 0)
         {
             var (_, content) = _closedDocumentCache[cacheIdx];
@@ -2190,10 +2214,10 @@ public sealed partial class MainViewModel : ViewModelBase
         }
 
         // 无缓存时在后台读取内容
-        if (doc.CachedMarkdown is null && File.Exists(path))
+        if (doc.CachedMarkdown is null && File.Exists(fullPath))
         {
             var docRef = doc;
-            var pathCopy = Path.GetFullPath(path);
+            var pathCopy = fullPath;
             Task.Run(() =>
             {
                 string text = "";
@@ -2236,9 +2260,16 @@ public sealed partial class MainViewModel : ViewModelBase
             NotifyWelcomeViewChanged();
         }
 
-        if (File.Exists(path))
-            doc.LastKnownWriteTimeUtc = File.GetLastWriteTimeUtc(path);
+        if (File.Exists(fullPath))
+            doc.LastKnownWriteTimeUtc = File.GetLastWriteTimeUtc(fullPath);
         ActiveDocument = doc;        
+    }
+
+    private DocumentItem? FindOpenDocumentByPath(string fullPath)
+    {
+        return _openDocuments.FirstOrDefault(d =>
+            !string.IsNullOrEmpty(d.FullPath) &&
+            string.Equals(Path.GetFullPath(d.FullPath), fullPath, StringComparison.OrdinalIgnoreCase));
     }
 
     private void ClearEditor()
