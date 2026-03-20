@@ -17,6 +17,11 @@ public partial class GitCreateBranchWindow : Window
         {
             if (e.Key == Avalonia.Input.Key.Enter) OnOk(s, e);
         };
+        Opened += (_, _) =>
+        {
+            BranchNameBox?.Focus();
+            BranchNameBox?.SelectAll();
+        };
     }
 
     private void OnOk(object? sender, RoutedEventArgs e)

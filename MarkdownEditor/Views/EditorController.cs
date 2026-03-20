@@ -7,7 +7,6 @@ using Avalonia.VisualTree;
 using AvaloniaEdit;
 using AvaloniaEdit.Search;
 using AvaloniaEdit.Rendering;
-using MarkdownEditor;
 using MarkdownEditor.Controls;
 using MarkdownEditor.Engine.Highlighting;
 using MarkdownEditor.ViewModels;
@@ -161,11 +160,7 @@ internal sealed class EditorController
             if (e.PropertyName == nameof(MainViewModel.CurrentMarkdown))
             {
                 var target = _viewModel.CurrentMarkdown ?? string.Empty;
-                // #region agent log
                 var hasVirtual = MarkdownEditor.Services.DiffVirtualLineHelper.ContainsVirtualLines(target);
-                var skip = _currentMarkdownChangeFromEditor && !hasVirtual;
-                DebugLog.Write("C", "EditorController.PropertyChanged", "CurrentMarkdown changed", new { targetLen = target.Length, fromEditor = _currentMarkdownChangeFromEditor, hasVirtual, skip });
-                // #endregion
                 if (_currentMarkdownChangeFromEditor)
                 {
                     _currentMarkdownChangeFromEditor = false;
@@ -174,9 +169,6 @@ internal sealed class EditorController
                 }
 
                 var willSet = !string.Equals(_editor.Text, target, StringComparison.Ordinal);
-                // #region agent log
-                if (willSet) DebugLog.Write("C", "EditorController.PropertyChanged.set", "Setting editor.Text", new { targetLen = target.Length });
-                // #endregion
                 if (willSet)
                 {
                     var caret = _editor.TextArea.Caret.Offset;
@@ -209,11 +201,6 @@ internal sealed class EditorController
             {
                 _currentMarkdownChangeFromEditor = true;
                 _viewModel.CurrentMarkdown = text;
-            }
-
-            if (_viewModel.IsDiffCompareActive)
-            {
-                try { _editor.TextArea.TextView.Redraw(); } catch (VisualLinesInvalidException) { }
             }
 
             // 文本已变化，下一次高亮需要强制重算当前窗口（避免使用旧 token）。

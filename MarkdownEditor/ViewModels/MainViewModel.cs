@@ -138,6 +138,17 @@ public sealed partial class MainViewModel : ViewModelBase
         LoadRecentFoldersFromDisk(_recentFolderPaths);
         _ = InitializeRecentFilesAsync();
         _gitPaneViewModel = new GitPaneViewModel(GetWorkspaceFolderPaths);
+        _gitPaneViewModel.ExplorerRefreshRequested += (_, _) => RefreshExplorerFromDisk();
+    }
+
+    /// <summary>重新扫描工作区并重建资源管理器文件树（Git 切换分支/提交后等）。</summary>
+    public void RefreshExplorerFromDisk()
+    {
+        if (!HasWorkspaceOpen) return;
+        RescanWorkspaceDocuments();
+        BuildFileTreeFromWorkspace();
+        FilterDocuments();
+        RebuildVisibleFileTree();
     }
 
     /// <summary>版本管理面板 ViewModel（仓库选择、变更列表、暂存、提交、分支、拉取/推送）。</summary>
@@ -623,6 +634,8 @@ public sealed partial class MainViewModel : ViewModelBase
             {
                 OnPropertyChanged(nameof(ShowPreviewImage));
                 OnPropertyChanged(nameof(ShowMarkdownPreview));
+                OnPropertyChanged(nameof(ShowMarkdownPreviewWhenNotDiffing));
+                OnPropertyChanged(nameof(ShowPreviewImageWhenNotDiffing));
             }
         }
     }
@@ -632,6 +645,12 @@ public sealed partial class MainViewModel : ViewModelBase
 
     /// <summary>是否显示 Markdown 预览（即未在预览图片）。</summary>
     public bool ShowMarkdownPreview => string.IsNullOrEmpty(_previewImagePath);
+
+    /// <summary>与 Git 比对时隐藏右侧渲染区。</summary>
+    public bool ShowMarkdownPreviewWhenNotDiffing => ShowMarkdownPreview && !IsDiffCompareActive;
+
+    /// <summary>与 Git 比对时隐藏图片预览。</summary>
+    public bool ShowPreviewImageWhenNotDiffing => ShowPreviewImage && !IsDiffCompareActive;
 
     private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -1494,6 +1513,7 @@ public sealed partial class MainViewModel : ViewModelBase
             {
                 var displayName = Path.GetFileName(fullDir);
                 if (string.IsNullOrEmpty(displayName)) continue;
+                if (displayName.Equals(".git", StringComparison.OrdinalIgnoreCase)) continue;
                 var folderChild = new FileTreeNode(displayName, fullDir, true);
                 folderChild.Level = folderNode.Level + 1;
                 folderChild.IsExpanded = false;
@@ -1795,7 +1815,7 @@ public sealed partial class MainViewModel : ViewModelBase
         LoadDocument(path);
     }
 
-    /// <summary>与指定 Git 提交比对：进入编辑区 diff 模式，对比源为该文件在 commitSha 时的内容。由 Timeline“与当前比对”触发。</summary>
+    /// <summary>与指定 Git 提交比对：进入双栏只读 diff（由视图填充左右编辑区）。</summary>
     public void EnterCompareWithCommit(string filePath, string commitSha)
     {
         _diffCompareFilePath = filePath;
@@ -1803,21 +1823,28 @@ public sealed partial class MainViewModel : ViewModelBase
         OnPropertyChanged(nameof(DiffCompareFilePath));
         OnPropertyChanged(nameof(DiffCompareCommitSha));
         OnPropertyChanged(nameof(IsDiffCompareActive));
+        OnPropertyChanged(nameof(ShowMarkdownPreviewWhenNotDiffing));
+        OnPropertyChanged(nameof(ShowPreviewImageWhenNotDiffing));
+        OnPropertyChanged(nameof(IsSingleEditorPaneVisible));
     }
 
-    /// <summary>退出与 Git 版本的比对，恢复普通编辑；若当前内容含虚拟行则先剥离再清空比对状态。</summary>
+    /// <summary>退出与 Git 版本的比对；若当前内容含历史虚拟行则先剥离。</summary>
     public void ExitCompareWithCommit()
     {
         if (Services.DiffVirtualLineHelper.ContainsVirtualLines(CurrentMarkdown))
             CurrentMarkdown = Services.DiffVirtualLineHelper.RemoveVirtualLines(CurrentMarkdown ?? "");
         _diffCompareFilePath = null;
         _diffCompareCommitSha = null;
-        _currentDiffLineMap = null;
         OnPropertyChanged(nameof(DiffCompareFilePath));
         OnPropertyChanged(nameof(DiffCompareCommitSha));
         OnPropertyChanged(nameof(IsDiffCompareActive));
-        OnPropertyChanged(nameof(CurrentDiffLineMap));
+        OnPropertyChanged(nameof(ShowMarkdownPreviewWhenNotDiffing));
+        OnPropertyChanged(nameof(ShowPreviewImageWhenNotDiffing));
+        OnPropertyChanged(nameof(IsSingleEditorPaneVisible));
     }
+
+    /// <summary>是否显示单栏编辑器（非双栏比对时）。</summary>
+    public bool IsSingleEditorPaneVisible => !IsDiffCompareActive;
 
     private string? _diffCompareFilePath;
     private string? _diffCompareCommitSha;
@@ -1831,45 +1858,8 @@ public sealed partial class MainViewModel : ViewModelBase
     /// <summary>是否处于“与 Git 版本比对”模式。</summary>
     public bool IsDiffCompareActive => !string.IsNullOrEmpty(_diffCompareFilePath) && !string.IsNullOrEmpty(_diffCompareCommitSha);
 
-    /// <summary>退出比对模式（供编辑区“退出比对”按钮绑定）。</summary>
+    /// <summary>退出比对模式（供双栏工具栏绑定）。</summary>
     public ICommand ExitCompareCommand => new RelayCommand(ExitCompareWithCommit);
-
-    private Models.GitDiffLineMap? _currentDiffLineMap;
-
-    /// <summary>当前编辑区 diff 行映射（与 Git 版本比对时由视图调用 <see cref="UpdateDiffLineMap"/> 更新）。</summary>
-    public Models.GitDiffLineMap? CurrentDiffLineMap => _currentDiffLineMap;
-
-    /// <summary>根据当前编辑器内容与 <see cref="DiffCompareFilePath"/>、<see cref="DiffCompareCommitSha"/> 更新 diff 行映射；仅在 <see cref="IsDiffCompareActive"/> 时有效。</summary>
-    public void UpdateDiffLineMap(string? currentEditorContent)
-    {
-        if (!IsDiffCompareActive || string.IsNullOrEmpty(_diffCompareFilePath) || string.IsNullOrEmpty(_diffCompareCommitSha)) return;
-        var repoRoot = Services.GitService.FindRepositoryRootForPath(_diffCompareFilePath);
-        if (string.IsNullOrEmpty(repoRoot)) return;
-        _currentDiffLineMap = Services.GitService.GetDiffLineMap(repoRoot, _diffCompareFilePath, currentEditorContent ?? "", _diffCompareCommitSha);
-        OnPropertyChanged(nameof(CurrentDiffLineMap));
-    }
-
-    /// <summary>在已进入比对的前提下，将“真实内容”插入虚拟行并设为当前文档，同时用扩展行映射替换 CurrentDiffLineMap，便于错开显示已删除行（无反射）。</summary>
-    public void ApplyVirtualLinesForCompare(string realContent)
-    {
-        // #region agent log
-        DebugLog.Write("A", "MainViewModel.ApplyVirtualLinesForCompare.entry", "ApplyVirtualLinesForCompare", new { realLen = realContent?.Length ?? 0, isDiffActive = IsDiffCompareActive });
-        // #endregion
-        if (!IsDiffCompareActive || string.IsNullOrEmpty(realContent)) return;
-        UpdateDiffLineMap(realContent);
-        // #region agent log
-        var deletedCount = _currentDiffLineMap?.DeletedLines.Count ?? 0;
-        DebugLog.Write("B", "MainViewModel.ApplyVirtualLinesForCompare.afterUpdate", "After UpdateDiffLineMap", new { deletedCount, mapNull = _currentDiffLineMap == null });
-        // #endregion
-        if (_currentDiffLineMap == null || _currentDiffLineMap.DeletedLines.Count == 0) return;
-        var (displayContent, extendedMap) = Services.DiffVirtualLineHelper.BuildDisplayWithVirtualLines(realContent, _currentDiffLineMap);
-        // #region agent log
-        DebugLog.Write("E", "MainViewModel.ApplyVirtualLinesForCompare.afterBuild", "After BuildDisplay", new { displayLen = displayContent?.Length ?? 0, hasVirtual = Services.DiffVirtualLineHelper.ContainsVirtualLines(displayContent) });
-        // #endregion
-        CurrentMarkdown = displayContent;
-        _currentDiffLineMap = extendedMap;
-        OnPropertyChanged(nameof(CurrentDiffLineMap));
-    }
 
     /// <summary>在指定目录下新建子文件夹并刷新树。返回新文件夹路径，失败返回 null。</summary>
     public string? NewFolderInFolder(string directoryPath)
@@ -2231,12 +2221,6 @@ public sealed partial class MainViewModel : ViewModelBase
                     {
                         _currentMarkdown = text;
                         _isModified = false;
-                        // #region agent log
-                        var pathMatch = IsDiffCompareActive && string.Equals(_diffCompareFilePath, docRef.FullPath, StringComparison.OrdinalIgnoreCase);
-                        DebugLog.Write("D", "MainViewModel.LoadDocument.async", "Async load done", new { pathMatch, textLen = text?.Length ?? 0, diffPath = _diffCompareFilePath, docPath = docRef.FullPath });
-                        // #endregion
-                        if (IsDiffCompareActive && string.Equals(_diffCompareFilePath, docRef.FullPath, StringComparison.OrdinalIgnoreCase))
-                            ApplyVirtualLinesForCompare(text);
                         OnPropertyChanged(nameof(CurrentMarkdown));
                         OnPropertyChanged(nameof(IsModified));
                     }
@@ -2463,6 +2447,8 @@ public sealed partial class MainViewModel : ViewModelBase
                     foreach (var subDir in Directory.EnumerateDirectories(dir))
                     {
                         if (token.IsCancellationRequested) return;
+                        if (string.Equals(Path.GetFileName(subDir), ".git", StringComparison.OrdinalIgnoreCase))
+                            continue;
                         dirQueue.Enqueue(subDir);
                     }
                 }

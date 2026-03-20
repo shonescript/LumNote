@@ -1,4 +1,6 @@
 using System.Collections.ObjectModel;
+using System.IO;
+using System.Linq;
 using System.Windows.Input;
 using Avalonia.Threading;
 using MarkdownEditor.Models;
@@ -13,12 +15,19 @@ public sealed class GitPaneViewModel : ViewModelBase
     private List<GitRepositoryInfo> _repositories = [];
     private GitRepositoryInfo? _selectedRepository;
     private string _currentBranchName = "";
-    private string? _selectedBranchName;
     private List<string> _branchNames = [];
+    private GitBranchListItem? _selectedBranchItem;
+    private bool _suppressBranchPickerSync;
     private string _commitMessage = "";
     private bool _isRefreshing;
+    private bool _isCommitting;
     private string? _statusMessage;
     private string? _pullPushError;
+    private string _historyTitle = "当前分支最新提交";
+    private int _gitPaneTabIndex;
+
+    /// <summary>正在刷新选中提交的改动文件列表；为真时视图应忽略文件 ListBox 的 SelectionChanged，避免误触发比对。</summary>
+    public bool SuppressCommitFileCompareSelection { get; private set; }
 
     public GitPaneViewModel(Func<IReadOnlyList<string>> getWorkspaceRoots)
     {
@@ -26,7 +35,7 @@ public sealed class GitPaneViewModel : ViewModelBase
         Changes = new ObservableCollection<GitChangeItem>();
         RefreshRepositoriesCommand = new RelayCommand(RefreshRepositories);
         InitRepositoryCommand = new RelayCommand(InitRepository);
-        RefreshStatusCommand = new RelayCommand(RefreshStatus);
+        RefreshStatusCommand = new RelayCommand(() => RefreshStatus());
         StageAllCommand = new RelayCommand(StageAll);
         UnstageAllCommand = new RelayCommand(UnstageAll);
         StageSelectedCommand = new RelayCommand(StageSelected);
@@ -35,6 +44,8 @@ public sealed class GitPaneViewModel : ViewModelBase
         CreateBranchCommand = new RelayCommand(CreateBranch);
         PullCommand = new RelayCommand(PullAsync);
         PushCommand = new RelayCommand(PushAsync);
+        HardResetToSelectedCommitCommand = new RelayCommand(RequestHardReset);
+        RevertSelectedCommitCommand = new RelayCommand(RequestRevert);
     }
 
     /// <summary>拉取/推送时用于获取凭证；由视图设置为弹窗等。若未设置则使用空凭证（可能失败）。</summary>
@@ -69,8 +80,77 @@ public sealed class GitPaneViewModel : ViewModelBase
             FileHistory.Add(item);
     }
 
-    /// <summary>用户点击时间线中某条提交时，请求查看该版本内容或与当前比对。参数：commitSha。</summary>
-    public event EventHandler<string>? ViewCommitRequested;
+    /// <summary>当前分支（HEAD）最近提交列表。</summary>
+    public ObservableCollection<GitCommitItem> BranchCommits { get; } = new();
+
+    private GitCommitItem? _selectedBranchCommit;
+
+    /// <summary>「历史」页选中的提交；变更 <see cref="SelectedCommitChangedFiles"/>。</summary>
+    public GitCommitItem? SelectedBranchCommit
+    {
+        get => _selectedBranchCommit;
+        set
+        {
+            if (!SetProperty(ref _selectedBranchCommit, value)) return;
+            LoadSelectedCommitChangedFiles();
+            if (value != null)
+                HistoryTitle = $"{value.MessageShort} · {value.Date:yyyy-MM-dd HH:mm}";
+            else
+                HistoryTitle = "当前分支最新提交";
+            NotifyBrowseModeChanged();
+        }
+    }
+
+    /// <summary>选中提交相对父提交的改动文件列表。</summary>
+    public ObservableCollection<GitCommitChangedFileItem> SelectedCommitChangedFiles { get; } = new();
+
+    /// <summary>0=当前（提交/未提交），1=当前分支提交历史。</summary>
+    public int GitPaneTabIndex
+    {
+        get => _gitPaneTabIndex;
+        set
+        {
+            if (SetProperty(ref _gitPaneTabIndex, value))
+                NotifyBrowseModeChanged();
+        }
+    }
+
+    public bool IsCommitSelected => SelectedBranchCommit != null;
+
+    /// <summary>「当前」页显示提交说明与 Commit。</summary>
+    public bool ShowCommitWorkspace => SelectedRepositoryIsInitialized && GitPaneTabIndex == 0;
+
+    /// <summary>「历史」页且已选提交时的提示条。</summary>
+    public bool ShowHistoryBrowseHint => SelectedRepositoryIsInitialized && GitPaneTabIndex == 1 && IsCommitSelected;
+
+    public string HistoryTitle
+    {
+        get => _historyTitle;
+        private set
+        {
+            if (SetProperty(ref _historyTitle, value))
+                OnPropertyChanged(nameof(HistoryChangedFilesMergedCaption));
+        }
+    }
+
+    /// <summary>历史页：合并「此提交改动文件」与当前选中提交摘要（单行）。</summary>
+    public string HistoryChangedFilesMergedCaption =>
+        !IsCommitSelected ? "" : $"此提交改动文件 · {HistoryTitle}";
+
+    /// <summary>请求将工作区硬重置到某提交（由主窗确认后执行）。</summary>
+    public event EventHandler<string>? HardResetToCommitRequested;
+
+    /// <summary>请求 revert 某提交（由主窗确认后执行）。</summary>
+    public event EventHandler<string>? RevertCommitRequested;
+
+    /// <summary>请求将某文件与当前工作区在双栏 diff 中比对。参数：绝对路径与提交 Sha。</summary>
+    public event EventHandler<(string fullPath, string commitSha)>? CompareFileWithWorkingRequested;
+
+    /// <summary>提交说明为空时用户点击 Commit，由视图弹框提示。</summary>
+    public event EventHandler? CommitMessageEmptyRequested;
+
+    /// <summary>切换分支或提交后工作区文件集可能变化，请求主窗刷新资源管理器树。</summary>
+    public event EventHandler? ExplorerRefreshRequested;
 
     /// <summary>当前选中的变更项（单条，用于“暂存所选”/“取消暂存所选”）。</summary>
     public GitChangeItem? SelectedChangeItem
@@ -93,6 +173,7 @@ public sealed class GitPaneViewModel : ViewModelBase
             {
                 OnPropertyChanged(nameof(SelectedRepositoryIsInitialized));
                 OnPropertyChanged(nameof(ShowInitRepositoryPanel));
+                NotifyBrowseModeChanged();
                 RefreshStatus();
                 LoadTimelineForFile();
                 OnPropertyChanged(nameof(CurrentBranchName));
@@ -115,20 +196,27 @@ public sealed class GitPaneViewModel : ViewModelBase
 
     public IReadOnlyList<string> BranchNames => _branchNames;
 
-    /// <summary>当前选中的分支（ComboBox 绑定）；设置时执行切换分支。</summary>
-    public string? SelectedBranchName
+    /// <summary>分支下拉数据源（含当前标记，非当前项可显示删除）。</summary>
+    public ObservableCollection<GitBranchListItem> BranchListItems { get; } = new();
+
+    /// <summary>当前选中的分支项；用户从下拉选择时执行 <see cref="CheckoutBranch"/>。</summary>
+    public GitBranchListItem? SelectedBranchItem
     {
-        get => _selectedBranchName ?? _currentBranchName;
+        get => _selectedBranchItem;
         set
         {
-            if (string.IsNullOrEmpty(value) || value == _selectedBranchName) return;
-            if (SetProperty(ref _selectedBranchName, value))
-                CheckoutBranch(value);
+            if (!SetProperty(ref _selectedBranchItem, value)) return;
+            if (_suppressBranchPickerSync || value == null) return;
+            CheckoutBranch(value.Name);
         }
     }
 
     /// <summary>“更改数(n)” 文案。</summary>
     public string ChangesCountText => $"更改数({Changes.Count})";
+
+    /// <summary>工作区未提交更改标题（与「共 n 项」合并）。</summary>
+    public string UncommittedChangesHeader =>
+        Changes.Count > 0 ? $"当前未提交更改（共 {Changes.Count} 项）" : "当前未提交更改（无）";
 
     public string CommitMessage
     {
@@ -140,6 +228,13 @@ public sealed class GitPaneViewModel : ViewModelBase
     {
         get => _isRefreshing;
         private set => SetProperty(ref _isRefreshing, value);
+    }
+
+    /// <summary>正在执行提交（后台线程写 Git），用于禁用 Commit 与提示等待。</summary>
+    public bool IsCommitting
+    {
+        get => _isCommitting;
+        private set => SetProperty(ref _isCommitting, value);
     }
 
     public string? StatusMessage
@@ -154,9 +249,8 @@ public sealed class GitPaneViewModel : ViewModelBase
         private set => SetProperty(ref _pullPushError, value);
     }
 
-    private bool HasStagedChanges => Changes.Any(c => c.IsStaged);
-
     public ICommand RefreshRepositoriesCommand { get; }
+    public ICommand InitRepositoryCommand { get; }
     public ICommand RefreshStatusCommand { get; }
     public ICommand StageAllCommand { get; }
     public ICommand UnstageAllCommand { get; }
@@ -166,6 +260,130 @@ public sealed class GitPaneViewModel : ViewModelBase
     public ICommand CreateBranchCommand { get; }
     public ICommand PullCommand { get; }
     public ICommand PushCommand { get; }
+
+    public ICommand HardResetToSelectedCommitCommand { get; }
+    public ICommand RevertSelectedCommitCommand { get; }
+
+    /// <summary>在侧栏中选中改动文件后，与当前工作区双栏比对。</summary>
+    public void RequestCompareFileWithWorking(GitCommitChangedFileItem item)
+    {
+        if (_selectedRepository == null || _selectedBranchCommit == null) return;
+        var rel = item.RelativePath.Replace('/', Path.DirectorySeparatorChar);
+        var full = Path.GetFullPath(Path.Combine(_selectedRepository.WorkingDirectory, rel));
+        CompareFileWithWorkingRequested?.Invoke(this, (full, _selectedBranchCommit.Sha));
+    }
+
+    private void RequestHardReset()
+    {
+        if (_selectedBranchCommit == null) return;
+        HardResetToCommitRequested?.Invoke(this, _selectedBranchCommit.Sha);
+    }
+
+    private void RequestRevert()
+    {
+        if (_selectedBranchCommit == null) return;
+        RevertCommitRequested?.Invoke(this, _selectedBranchCommit.Sha);
+    }
+
+    private void LoadBranchCommits()
+    {
+        if (_selectedRepository == null || !_selectedRepository.IsInitialized)
+        {
+            BranchCommits.Clear();
+            SelectedBranchCommit = null;
+            HistoryTitle = "当前分支最新提交";
+            NotifyBrowseModeChanged();
+            return;
+        }
+
+        // 刷新状态后会再次调用本方法；勿清空用户正在查看的提交，否则文件列表会一闪消失。
+        var keepSha = _selectedBranchCommit?.Sha;
+        var root = _selectedRepository.WorkingDirectory;
+        Task.Run(() =>
+        {
+            var list = GitService.GetRecentCommitsOnHead(root, 80);
+            Dispatcher.UIThread.Post(() =>
+            {
+                BranchCommits.Clear();
+                foreach (var c in list)
+                    BranchCommits.Add(c);
+
+                if (!string.IsNullOrEmpty(keepSha))
+                {
+                    var restored = BranchCommits.FirstOrDefault(c => c.Sha == keepSha);
+                    if (restored != null)
+                        SelectedBranchCommit = restored;
+                    else
+                    {
+                        SelectedBranchCommit = null;
+                        HistoryTitle = "当前分支最新提交";
+                    }
+                }
+                else
+                    HistoryTitle = "当前分支最新提交";
+
+                NotifyBrowseModeChanged();
+            });
+        });
+    }
+
+    private void LoadSelectedCommitChangedFiles()
+    {
+        void EndSuppress() =>
+            Dispatcher.UIThread.Post(() => { SuppressCommitFileCompareSelection = false; }, DispatcherPriority.Loaded);
+
+        SuppressCommitFileCompareSelection = true;
+        SelectedCommitChangedFiles.Clear();
+        if (_selectedRepository == null || _selectedBranchCommit == null)
+        {
+            EndSuppress();
+            return;
+        }
+
+        var root = _selectedRepository.WorkingDirectory;
+        var sha = _selectedBranchCommit.Sha;
+        Task.Run(() =>
+        {
+            try
+            {
+                var files = GitService.GetChangedFilesInCommit(root, sha);
+                Dispatcher.UIThread.Post(() =>
+                {
+                    try
+                    {
+                        SelectedCommitChangedFiles.Clear();
+                        foreach (var f in files)
+                            SelectedCommitChangedFiles.Add(f);
+                    }
+                    finally
+                    {
+                        EndSuppress();
+                    }
+                });
+            }
+            catch
+            {
+                Dispatcher.UIThread.Post(EndSuppress);
+            }
+        });
+    }
+
+    private void RebuildBranchListItemsFromNames(string? currentBranchName)
+    {
+        _suppressBranchPickerSync = true;
+        try
+        {
+            BranchListItems.Clear();
+            foreach (var n in _branchNames)
+                BranchListItems.Add(new GitBranchListItem(n, string.Equals(n, currentBranchName, StringComparison.OrdinalIgnoreCase)));
+            _selectedBranchItem = BranchListItems.FirstOrDefault(x => x.IsCurrent);
+            OnPropertyChanged(nameof(SelectedBranchItem));
+        }
+        finally
+        {
+            _suppressBranchPickerSync = false;
+        }
+    }
 
     public void RefreshRepositories()
     {
@@ -188,7 +406,8 @@ public sealed class GitPaneViewModel : ViewModelBase
         RefreshStatus();
     }
 
-    public void RefreshStatus()
+    /// <param name="statusMessageAfterRefresh">刷新完成并清空列表后写入的状态文案；默认 null 表示清除提示。</param>
+    public void RefreshStatus(string? statusMessageAfterRefresh = null)
     {
         if (_selectedRepository == null)
         {
@@ -196,7 +415,14 @@ public sealed class GitPaneViewModel : ViewModelBase
             CurrentBranchName = "";
             _branchNames = [];
             OnPropertyChanged(nameof(BranchNames));
+            BranchListItems.Clear();
+            _suppressBranchPickerSync = true;
+            _selectedBranchItem = null;
+            OnPropertyChanged(nameof(SelectedBranchItem));
+            _suppressBranchPickerSync = false;
+            OnPropertyChanged(nameof(UncommittedChangesHeader));
             StatusMessage = "未选择仓库";
+            NotifyBrowseModeChanged();
             return;
         }
         if (!_selectedRepository.IsInitialized)
@@ -205,7 +431,13 @@ public sealed class GitPaneViewModel : ViewModelBase
             CurrentBranchName = "";
             _branchNames = [];
             OnPropertyChanged(nameof(BranchNames));
-            StatusMessage = "此文件夹尚未初始化 Git，可点击下方按钮初始化。";
+            BranchListItems.Clear();
+            _suppressBranchPickerSync = true;
+            _selectedBranchItem = null;
+            OnPropertyChanged(nameof(SelectedBranchItem));
+            _suppressBranchPickerSync = false;
+            OnPropertyChanged(nameof(UncommittedChangesHeader));
+            NotifyBrowseModeChanged();
             return;
         }
         IsRefreshing = true;
@@ -222,30 +454,37 @@ public sealed class GitPaneViewModel : ViewModelBase
                     Changes.Add(item);
                 CurrentBranchName = branch ?? "";
                 _branchNames = branches.ToList();
-                _selectedBranchName = branch;
                 OnPropertyChanged(nameof(BranchNames));
-                OnPropertyChanged(nameof(SelectedBranchName));
+                RebuildBranchListItemsFromNames(branch);
                 OnPropertyChanged(nameof(ChangesCountText));
+                OnPropertyChanged(nameof(UncommittedChangesHeader));
                 IsRefreshing = false;
-                StatusMessage = status.Count > 0 ? $"共 {status.Count} 项更改" : "无更改";
+                StatusMessage = statusMessageAfterRefresh;
+                LoadBranchCommits();
             });
         });
     }
 
-    public ICommand InitRepositoryCommand { get; }
+    private void NotifyBrowseModeChanged()
+    {
+        OnPropertyChanged(nameof(IsCommitSelected));
+        OnPropertyChanged(nameof(ShowCommitWorkspace));
+        OnPropertyChanged(nameof(ShowHistoryBrowseHint));
+        OnPropertyChanged(nameof(HistoryChangedFilesMergedCaption));
+    }
 
     private void InitRepository()
     {
         if (_selectedRepository == null || _selectedRepository.IsInitialized) return;
-        if (GitService.InitRepository(_selectedRepository.WorkingDirectory))
+        var (ok, err) = GitService.InitRepository(_selectedRepository.WorkingDirectory);
+        if (ok)
         {
             RefreshRepositories();
-            StatusMessage = "已在此文件夹创建 Git 仓库";
+            StatusMessage = "已创建 Git 仓库：已在 main 分支完成首次提交（空提交），可用于版本管理。";
+            ExplorerRefreshRequested?.Invoke(this, EventArgs.Empty);
         }
         else
-        {
-            StatusMessage = "初始化失败";
-        }
+            StatusMessage = err ?? "初始化失败";
     }
 
     private void StageAll()
@@ -282,24 +521,44 @@ public sealed class GitPaneViewModel : ViewModelBase
             RefreshStatus();
     }
 
-    /// <summary>智能提交（Smart Commit）：提交前自动暂存所有未暂存的更改，再执行提交。</summary>
-    private void Commit()
+    /// <summary>智能提交（Smart Commit）：在后台线程暂存并提交，避免大量文件时阻塞 UI。</summary>
+    private async void Commit()
     {
-        if (_selectedRepository == null || string.IsNullOrWhiteSpace(CommitMessage)) return;
-        var paths = Changes.Select(c => c.FullPath).ToList();
-        if (paths.Count > 0)
-            GitService.Stage(_selectedRepository.WorkingDirectory, paths);
-        var (success, error) = GitService.Commit(_selectedRepository.WorkingDirectory, CommitMessage.Trim());
-        if (success)
+        if (_selectedRepository == null || IsCommitting) return;
+        if (string.IsNullOrWhiteSpace(CommitMessage))
         {
-            CommitMessage = "";
-            OnPropertyChanged(nameof(CommitMessage));
-            RefreshStatus();
-            StatusMessage = "已保存版本";
+            CommitMessageEmptyRequested?.Invoke(this, EventArgs.Empty);
+            return;
         }
-        else
+
+        var repo = _selectedRepository.WorkingDirectory;
+        var message = CommitMessage.Trim();
+        var paths = Changes.Select(c => c.FullPath).ToList();
+
+        IsCommitting = true;
+        StatusMessage = paths.Count > 0 ? $"正在提交（暂存并写入 {paths.Count} 项）…" : "正在提交…";
+        try
         {
-            StatusMessage = error ?? "提交失败";
+            var (success, error) = await Task.Run(() =>
+            {
+                if (paths.Count > 0 && !GitService.Stage(repo, paths))
+                    return (false, "暂存失败");
+                return GitService.Commit(repo, message);
+            }).ConfigureAwait(true);
+
+            if (success)
+            {
+                CommitMessage = "";
+                OnPropertyChanged(nameof(CommitMessage));
+                RefreshStatus("已保存版本");
+                ExplorerRefreshRequested?.Invoke(this, EventArgs.Empty);
+            }
+            else
+                StatusMessage = error ?? "提交失败";
+        }
+        finally
+        {
+            IsCommitting = false;
         }
     }
 
@@ -318,9 +577,15 @@ public sealed class GitPaneViewModel : ViewModelBase
         if (_selectedRepository == null) return;
         var (success, error) = GitService.CheckoutBranch(_selectedRepository.WorkingDirectory, branchName);
         if (success)
+        {
             RefreshStatus();
+            ExplorerRefreshRequested?.Invoke(this, EventArgs.Empty);
+        }
         else
+        {
             StatusMessage = error ?? "切换失败";
+            RebuildBranchListItemsFromNames(CurrentBranchName);
+        }
     }
 
     private async void PullAsync()
@@ -334,6 +599,7 @@ public sealed class GitPaneViewModel : ViewModelBase
             {
                 RefreshStatus();
                 PullPushError = null;
+                ExplorerRefreshRequested?.Invoke(this, EventArgs.Empty);
             }
             else
                 PullPushError = error;
@@ -351,6 +617,7 @@ public sealed class GitPaneViewModel : ViewModelBase
             {
                 RefreshStatus();
                 PullPushError = null;
+                ExplorerRefreshRequested?.Invoke(this, EventArgs.Empty);
             }
             else
                 PullPushError = error;

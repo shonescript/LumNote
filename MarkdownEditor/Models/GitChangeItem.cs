@@ -34,4 +34,13 @@ public sealed class GitChangeItem
 
     /// <summary>单字母状态（M=修改 A=新增 D=删除 ?=未跟踪），用于列表左侧着色。</summary>
     public string StatusLetter => IsDeleted ? "D" : (IsNew || IsUntracked) ? "A" : "M";
+
+    /// <summary>悬停在状态字母上时显示的简短中文说明。</summary>
+    public string StatusLetterTooltip =>
+        IsDeleted ? "删除（D）" :
+        IsUntracked ? "未跟踪（A）" :
+        IsNew ? "新增（A）" :
+        IsStaged && IsModified ? "已暂存，工作区尚有修改（M）" :
+        IsStaged ? "已暂存（M）" :
+        IsModified ? "已修改，尚未暂存（M）" : "已修改（M）";
 }

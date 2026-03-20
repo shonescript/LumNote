@@ -208,6 +208,55 @@
     <Style Selector="controls|MarkdownEngineView ScrollViewer">
       <Setter Property="Background" Value="Transparent"/>
     </Style>
+    <!-- Git 侧栏内 TabControl：主窗文档栏的 TabControl 故意隐藏内容区，此处需恢复 -->
+    <Style Selector="TabControl.gitPaneSubTabs ContentPresenter#PART_SelectedContentHost">
+      <Setter Property="IsVisible" Value="True"/>
+      <Setter Property="Height" Value="NaN"/>
+    </Style>
+    <Style Selector="TabControl.gitPaneSubTabs TabItem">
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="MinHeight" Value="28"/>
+      <Setter Property="Padding" Value="8,4"/>
+    </Style>
+    <Style Selector="Border.gitHistoryBrowseHint">
+      <Setter Property="Background" Value="#220078d4"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource InputBorderBrush}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="4"/>
+      <Setter Property="Padding" Value="5,4"/>
+      <Setter Property="Margin" Value="0,0,0,3"/>
+    </Style>
+    <!-- Git 侧栏：列表容器与列表项 -->
+    <Style Selector="Border.gitPaneListHost">
+      <Setter Property="BorderBrush" Value="{DynamicResource InputBorderBrush}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="4"/>
+      <Setter Property="Padding" Value="2"/>
+      <Setter Property="Background" Value="{DynamicResource InputBackground}"/>
+    </Style>
+    <Style Selector="ListBox.gitPaneCompact">
+      <Setter Property="Padding" Value="0"/>
+    </Style>
+    <Style Selector="ListBox.gitPaneCompact ListBoxItem">
+      <Setter Property="Padding" Value="6,5"/>
+      <Setter Property="MinHeight" Value="0"/>
+      <Setter Property="Margin" Value="0"/>
+    </Style>
+    <Style Selector="ListBox.gitHistoryCommits">
+      <Setter Property="Padding" Value="0"/>
+    </Style>
+    <Style Selector="ListBox.gitHistoryCommits ListBoxItem">
+      <Setter Property="Padding" Value="6,5"/>
+      <Setter Property="MinHeight" Value="0"/>
+      <Setter Property="Margin" Value="0"/>
+    </Style>
+    <Style Selector="ListBox.gitCommitFilesCompact">
+      <Setter Property="Padding" Value="0"/>
+    </Style>
+    <Style Selector="ListBox.gitCommitFilesCompact ListBoxItem">
+      <Setter Property="Padding" Value="6,5"/>
+      <Setter Property="MinHeight" Value="0"/>
+    </Style>
   </Window.Styles>
 
   <Window.KeyBindings>
@@ -588,81 +637,253 @@
             </Grid>
           </Border>
 
-          <!-- Git 版本管理（仅本地，参考 VS 简洁风格） -->
-          <Border IsVisible="{Binding ShowGitPane}"
-                  Padding="6,8"
+          <!-- Git：顶栏分支下拉；已初始化时 Tab「当前」/「历史」 -->
+          <Border x:Name="GitPaneBorder"
+                  IsVisible="{Binding ShowGitPane}"
+                  Padding="4,4"
                   Classes="gitPane">
-            <Grid RowDefinitions="Auto,Auto,Auto,*">
-              <StackPanel Grid.Row="0" Spacing="4">
-                <TextBlock Text="Git 更改" FontWeight="SemiBold" FontSize="12"/>
-                <StackPanel IsVisible="{Binding GitPaneViewModel.HasRepositories}" Spacing="4">
-                  <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
-                    <ComboBox IsVisible="{Binding GitPaneViewModel.HasMultipleRepositories}"
-                              MinWidth="80" MaxWidth="140"
-                              ItemsSource="{Binding GitPaneViewModel.Repositories}"
-                              SelectedItem="{Binding GitPaneViewModel.SelectedRepository, Mode=TwoWay}"
-                              FontSize="11">
-                      <ComboBox.ItemTemplate>
-                        <DataTemplate x:DataType="services:GitRepositoryInfo">
-                          <TextBlock Text="{Binding DisplayName}" TextTrimming="CharacterEllipsis"/>
-                        </DataTemplate>
-                      </ComboBox.ItemTemplate>
-                    </ComboBox>
-                    <Button Content="新建分支" Command="{Binding GitPaneViewModel.CreateBranchCommand}"
-                            Padding="6,2" FontSize="11"
-                            IsVisible="{Binding GitPaneViewModel.SelectedRepositoryIsInitialized}"/>
-                    <ComboBox x:Name="GitBranchComboBox"
-                              MinWidth="90" MaxWidth="160"
-                              ItemsSource="{Binding GitPaneViewModel.BranchNames}"
-                              SelectedItem="{Binding GitPaneViewModel.SelectedBranchName, Mode=TwoWay}"
-                              FontSize="11"
-                              IsVisible="{Binding GitPaneViewModel.SelectedRepositoryIsInitialized}"/>
-                    <Button Content="↻" ToolTip.Tip="刷新"
-                            Command="{Binding GitPaneViewModel.RefreshStatusCommand}"
-                            Width="22" Height="22" Padding="0" FontSize="11"
-                            IsVisible="{Binding GitPaneViewModel.SelectedRepositoryIsInitialized}"/>
-                  </StackPanel>
+            <Grid RowDefinitions="Auto,Auto,*">
+              <StackPanel Grid.Row="0" Spacing="2">
+                <!-- 单行：分支与操作按钮紧挨，避免右侧留空被分割条等抢占命中 -->
+                <StackPanel Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                  <TextBlock Text="分支:" FontSize="12" VerticalAlignment="Center" Opacity="0.92"/>
+                  <ComboBox IsVisible="{Binding GitPaneViewModel.HasMultipleRepositories}"
+                            MinWidth="72" MaxWidth="120"
+                            ItemsSource="{Binding GitPaneViewModel.Repositories}"
+                            SelectedItem="{Binding GitPaneViewModel.SelectedRepository, Mode=TwoWay}"
+                            FontSize="12" VerticalAlignment="Center">
+                    <ComboBox.ItemTemplate>
+                      <DataTemplate x:DataType="services:GitRepositoryInfo">
+                        <TextBlock Text="{Binding DisplayName}" TextTrimming="CharacterEllipsis"/>
+                      </DataTemplate>
+                    </ComboBox.ItemTemplate>
+                  </ComboBox>
+                  <ComboBox x:Name="GitPaneBranchCombo"
+                            MinWidth="120" MaxWidth="220"
+                            FontSize="12"
+                            VerticalAlignment="Center"
+                            ItemsSource="{Binding GitPaneViewModel.BranchListItems}"
+                            SelectedItem="{Binding GitPaneViewModel.SelectedBranchItem, Mode=TwoWay}"
+                            IsVisible="{Binding GitPaneViewModel.SelectedRepositoryIsInitialized}">
+                    <ComboBox.ItemTemplate>
+                      <DataTemplate x:DataType="models:GitBranchListItem">
+                        <Grid ColumnDefinitions="*,Auto" MinWidth="140">
+                          <TextBlock Grid.Column="0"
+                                     Text="{Binding Name}"
+                                     VerticalAlignment="Center"
+                                     Margin="0,0,6,0"/>
+                          <Button Grid.Column="1"
+                                  Width="26" Height="26"
+                                  MinWidth="26" MinHeight="26"
+                                  Padding="0"
+                                  Margin="2,0,0,0"
+                                  VerticalAlignment="Center"
+                                  HorizontalAlignment="Center"
+                                  HorizontalContentAlignment="Center"
+                                  VerticalContentAlignment="Center"
+                                  Background="{DynamicResource SidebarBackground}"
+                                  BorderThickness="0"
+                                  ToolTip.Tip="删除此本地分支"
+                                  IsVisible="{Binding ShowDelete}"
+                                  Click="GitBranchRowDeleteButton_Click">
+                            <TextBlock Text="✕"
+                                       FontSize="12"
+                                       FontWeight="SemiBold"
+                                       Foreground="#c42b1c"
+                                       HorizontalAlignment="Center"
+                                       VerticalAlignment="Center"
+                                       TextAlignment="Center"/>
+                          </Button>
+                        </Grid>
+                      </DataTemplate>
+                    </ComboBox.ItemTemplate>
+                  </ComboBox>
+                  <Button ToolTip.Tip="新建分支"
+                          Command="{Binding GitPaneViewModel.CreateBranchCommand}"
+                          Width="26" Height="26" Padding="0"
+                          VerticalAlignment="Center"
+                          HorizontalContentAlignment="Center"
+                          VerticalContentAlignment="Center"
+                          Background="{DynamicResource SidebarBackground}"
+                          BorderThickness="0"
+                          IsVisible="{Binding GitPaneViewModel.SelectedRepositoryIsInitialized}">
+                    <TextBlock Text="+" FontSize="15" FontWeight="SemiBold"
+                               HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                  </Button>
+                  <Button ToolTip.Tip="手动刷新：状态、分支列表与提交历史"
+                          Command="{Binding GitPaneViewModel.RefreshStatusCommand}"
+                          Width="26" Height="26" Padding="0"
+                          VerticalAlignment="Center"
+                          HorizontalContentAlignment="Center"
+                          VerticalContentAlignment="Center"
+                          Background="{DynamicResource SidebarBackground}"
+                          BorderThickness="0"
+                          IsVisible="{Binding GitPaneViewModel.SelectedRepositoryIsInitialized}">
+                    <TextBlock Text="↻" FontSize="13"
+                               HorizontalAlignment="Center" VerticalAlignment="Center"
+                               Margin="0,3,0,0"/>
+                  </Button>
+                  <Button ToolTip.Tip="删除仓库"
+                          Width="26" Height="26" Padding="0"
+                          VerticalAlignment="Center"
+                          HorizontalContentAlignment="Center"
+                          VerticalContentAlignment="Center"
+                          Background="{DynamicResource SidebarBackground}"
+                          BorderThickness="0"
+                          IsVisible="{Binding GitPaneViewModel.SelectedRepositoryIsInitialized}"
+                          Click="GitPaneDeleteRepositoryButton_OnClick">
+                    <Path Data="M 6 2 L 5 3 L 3 3 L 3 5 L 19 5 L 19 3 L 17 3 L 16 2 Z M 5 7 L 6 19 C 6 20 7 21 8 21 L 14 21 C 15 21 16 20 16 19 L 17 7 Z"
+                        Fill="#e5534b"
+                        Stretch="Uniform"
+                        Width="14" Height="14"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"/>
+                  </Button>
                 </StackPanel>
                 <TextBlock Text="打开文件夹以使用版本管理" FontSize="11" Foreground="{DynamicResource SidebarTextForeground}"
                            Opacity="0.85"
                            IsVisible="{Binding GitPaneViewModel.HasRepositories, Converter={x:Static conv:InverseBoolConverter.Instance}}"/>
               </StackPanel>
-              <StackPanel Grid.Row="1" Margin="0,6,0,0" Spacing="4"
+              <StackPanel Grid.Row="1" Margin="0,4,0,0" Spacing="4"
                          IsVisible="{Binding GitPaneViewModel.ShowInitRepositoryPanel}">
-                <TextBlock Text="此文件夹下尚无 Git 仓库。" FontSize="11" TextWrapping="Wrap"/>
+                <TextBlock FontSize="11" TextWrapping="Wrap"
+                           Text="此文件夹下尚无 Git 仓库。初始化后会创建隐藏的“.git”，并在 main 分支上自动完成首次提交（空提交），便于后续版本管理。"/>
                 <Button Content="初始化 Git 仓库" Command="{Binding GitPaneViewModel.InitRepositoryCommand}"
                         Padding="8,4" FontSize="11"/>
                 <TextBlock Text="{Binding GitPaneViewModel.StatusMessage}" FontSize="10" Opacity="0.8"/>
               </StackPanel>
-              <StackPanel Grid.Row="2" Margin="0,6,0,0" Spacing="4" IsVisible="{Binding GitPaneViewModel.SelectedRepositoryIsInitialized}">
-                <TextBox Text="{Binding GitPaneViewModel.CommitMessage, Mode=TwoWay}"
-                         Watermark="提交说明"
-                         FontSize="11" Padding="6,6" MinHeight="36" AcceptsReturn="True"/>
-                <Button Content="提交修改" Command="{Binding GitPaneViewModel.CommitCommand}"
-                        Padding="8,4" FontSize="11"
-                        ToolTip.Tip="智能提交：自动暂存所有更改后提交"/>
-                <TextBlock Text="{Binding GitPaneViewModel.StatusMessage}" FontSize="10" Opacity="0.8"/>
-              </StackPanel>
-              <Grid Grid.Row="3" RowDefinitions="*" IsVisible="{Binding GitPaneViewModel.SelectedRepositoryIsInitialized}" Margin="0,6,0,0">
-                <ScrollViewer Grid.Row="0" MaxHeight="200" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
-                              Background="Transparent">
-                  <ListBox x:Name="GitChangesListBox"
-                           ItemsSource="{Binding GitPaneViewModel.Changes}"
-                           SelectedItem="{Binding GitPaneViewModel.SelectedChangeItem, Mode=TwoWay}"
-                           Background="Transparent" BorderThickness="0" Padding="0" MinHeight="0"
-                           SelectionMode="Single">
-                    <ListBox.ItemTemplate>
-                      <DataTemplate x:DataType="models:GitChangeItem">
-                        <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,1">
-                          <TextBlock Text="{Binding StatusLetter}" FontSize="11" FontWeight="SemiBold" VerticalAlignment="Center"
-                                     Foreground="{Binding StatusLetter, Converter={x:Static conv:GitStatusLetterToBrushConverter.Instance}}" MinWidth="14"/>
-                          <TextBlock Text="{Binding RelativePath}" FontSize="11" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
-                        </StackPanel>
-                      </DataTemplate>
-                    </ListBox.ItemTemplate>
-                  </ListBox>
-                </ScrollViewer>
-              </Grid>
+              <TabControl Grid.Row="2"
+                          Classes="gitPaneSubTabs"
+                          Margin="0,4,0,0"
+                          SelectedIndex="{Binding GitPaneViewModel.GitPaneTabIndex, Mode=TwoWay}"
+                          VerticalAlignment="Stretch"
+                          IsVisible="{Binding GitPaneViewModel.SelectedRepositoryIsInitialized}">
+                <TabItem Header="当前提交">
+                  <Grid RowDefinitions="Auto,Auto,*" Margin="0,4,0,0">
+                    <StackPanel Grid.Row="0" Spacing="4" IsVisible="{Binding GitPaneViewModel.ShowCommitWorkspace}">
+                      <TextBox x:Name="GitCommitMessageTextBox"
+                               Text="{Binding GitPaneViewModel.CommitMessage, Mode=TwoWay}"
+                               Watermark="提交说明（Commit message）"
+                               FontSize="12" Padding="8,6" MinHeight="36" AcceptsReturn="True"
+                               IsReadOnly="{Binding GitPaneViewModel.IsCommitting}"
+                               GotFocus="GitCommitMessageTextBox_OnGotFocus"/>
+                      <Button Content="Commit" Command="{Binding GitPaneViewModel.CommitCommand}"
+                              Padding="8,5" FontSize="12"
+                              IsEnabled="{Binding GitPaneViewModel.IsCommitting, Converter={x:Static conv:InverseBoolConverter.Instance}}"
+                              ToolTip.Tip="提交：自动暂存当前所有更改后创建一次提交（git commit）；大量文件时在后台执行，请勿重复点击。"/>
+                      <Border Height="1" Margin="0,2,0,0"
+                              Background="{DynamicResource SplitterBorderBrush}"/>
+                    </StackPanel>
+                    <TextBlock Grid.Row="1"
+                               Text="{Binding GitPaneViewModel.StatusMessage}"
+                               FontSize="11" Opacity="0.88"
+                               TextWrapping="Wrap"
+                               Margin="0,4,0,0"
+                               IsVisible="{Binding GitPaneViewModel.StatusMessage, Converter={x:Static conv:IsNotNullConverter.Instance}}"/>
+                    <Grid Grid.Row="2" RowDefinitions="Auto,Auto" Margin="0,3,0,0" VerticalAlignment="Top">
+                      <TextBlock Grid.Row="0"
+                                 Text="{Binding GitPaneViewModel.UncommittedChangesHeader}"
+                                 FontSize="12" FontWeight="SemiBold"
+                                 Margin="0,0,0,2"/>
+                      <Border Grid.Row="1" Classes="gitPaneListHost" MinHeight="88" MaxHeight="220"
+                              VerticalAlignment="Top"
+                              ToolTip.Tip="点击文件可与当前工作区（HEAD）版本对比">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
+                                      Background="Transparent">
+                          <ListBox x:Name="GitChangesListBox"
+                                   Classes="gitPaneCompact"
+                                   ItemsSource="{Binding GitPaneViewModel.Changes}"
+                                   SelectedItem="{Binding GitPaneViewModel.SelectedChangeItem, Mode=TwoWay}"
+                                   Background="Transparent" BorderThickness="0"
+                                   SelectionMode="Single">
+                            <ListBox.ItemTemplate>
+                              <DataTemplate x:DataType="models:GitChangeItem">
+                                <StackPanel Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                                  <TextBlock Text="{Binding StatusLetter}" FontSize="12" FontWeight="SemiBold" VerticalAlignment="Center"
+                                             Foreground="{Binding StatusLetter, Converter={x:Static conv:GitStatusLetterToBrushConverter.Instance}}" MinWidth="16"
+                                             ToolTip.Tip="{Binding StatusLetterTooltip}"/>
+                                  <TextBlock Text="{Binding RelativePath}" FontSize="12" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                                </StackPanel>
+                              </DataTemplate>
+                            </ListBox.ItemTemplate>
+                          </ListBox>
+                        </ScrollViewer>
+                      </Border>
+                    </Grid>
+                  </Grid>
+                </TabItem>
+                <TabItem Header="历史提交">
+                  <Grid RowDefinitions="Auto,Auto,Auto,*" Margin="0,3,0,0">
+                    <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="6" Margin="0,0,0,4"
+                                IsVisible="{Binding GitPaneViewModel.IsCommitSelected}">
+                      <Button Content="git reset --hard（硬重置）" Command="{Binding GitPaneViewModel.HardResetToSelectedCommitCommand}"
+                              Padding="8,5" FontSize="12"
+                              ToolTip.Tip="危险：丢弃未提交更改并回退分支指针。"/>
+                      <Button Content="git revert（生成撤销提交）" Command="{Binding GitPaneViewModel.RevertSelectedCommitCommand}"
+                              Padding="8,5" FontSize="12"
+                              ToolTip.Tip="安全：新增一条提交来撤销当前提交。"/>
+                    </StackPanel>
+                    <Border Grid.Row="1" Classes="gitHistoryBrowseHint"
+                            IsVisible="{Binding GitPaneViewModel.ShowHistoryBrowseHint}"
+                            Margin="0,0,0,3">
+                      <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.95"
+                                 Text="下方为历史提交记录；切换到「当前」标签可回到提交与未提交列表。"/>
+                    </Border>
+                    <Border Grid.Row="2" Classes="gitPaneListHost" MinHeight="80" MaxHeight="168" Margin="0,0,0,3">
+                      <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
+                                    Background="Transparent">
+                        <ListBox x:Name="GitHistoryCommitsListBox"
+                                 Classes="gitHistoryCommits"
+                                 ItemsSource="{Binding GitPaneViewModel.BranchCommits}"
+                                 SelectedItem="{Binding GitPaneViewModel.SelectedBranchCommit, Mode=OneWay}"
+                                 Background="Transparent" BorderThickness="0">
+                          <ListBox.ItemTemplate>
+                            <DataTemplate x:DataType="models:GitCommitItem">
+                              <StackPanel Orientation="Vertical" Spacing="2">
+                                <TextBlock Text="{Binding MessageShort}" FontSize="12" TextTrimming="CharacterEllipsis"/>
+                                <TextBlock Text="{Binding Date, StringFormat=yyyy-MM-dd HH:mm}" FontSize="11" Opacity="0.78"/>
+                              </StackPanel>
+                            </DataTemplate>
+                          </ListBox.ItemTemplate>
+                        </ListBox>
+                      </ScrollViewer>
+                    </Border>
+                    <Grid Grid.Row="3"
+                          RowDefinitions="Auto,Auto"
+                          Margin="0,0,0,0"
+                          VerticalAlignment="Top"
+                          IsVisible="{Binding GitPaneViewModel.IsCommitSelected}">
+                      <TextBlock Grid.Row="0"
+                                 Text="{Binding GitPaneViewModel.HistoryChangedFilesMergedCaption}"
+                                 FontSize="12" FontWeight="SemiBold" Opacity="0.92"
+                                 TextWrapping="Wrap"
+                                 Margin="0,0,0,2"/>
+                      <Border Grid.Row="1" Classes="gitPaneListHost" MinHeight="72" MaxHeight="200"
+                              VerticalAlignment="Top"
+                              ToolTip.Tip="点击文件可与当前工作区版本打开只读双栏对比">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled"
+                                      Background="Transparent">
+                          <ListBox x:Name="GitCommitChangedFilesListBox"
+                                   Classes="gitCommitFilesCompact"
+                                   ItemsSource="{Binding GitPaneViewModel.SelectedCommitChangedFiles}"
+                                   Background="Transparent" BorderThickness="0">
+                            <ListBox.ItemTemplate>
+                              <DataTemplate x:DataType="models:GitCommitChangedFileItem">
+                                <StackPanel Orientation="Horizontal" Spacing="4">
+                                  <TextBlock Text="{Binding StatusLetter}" FontSize="12" FontWeight="Bold" MinWidth="16"
+                                             Foreground="{Binding ChangeKind, Converter={x:Static conv:GitTreeChangeKindToBrushConverter.Instance}}"
+                                             ToolTip.Tip="{Binding StatusLetterTooltip}"/>
+                                  <TextBlock Text="{Binding RelativePath}" FontSize="12" TextTrimming="CharacterEllipsis"/>
+                                </StackPanel>
+                              </DataTemplate>
+                            </ListBox.ItemTemplate>
+                          </ListBox>
+                        </ScrollViewer>
+                      </Border>
+                    </Grid>
+                  </Grid>
+                </TabItem>
+              </TabControl>
             </Grid>
           </Border>
 
@@ -949,27 +1170,35 @@
           </StackPanel>
         </Border>
 
-        <!-- 编辑区 + 预览区，有文档时显示 -->
-        <Grid Grid.Row="1" x:Name="ContentSplitGrid" IsVisible="{Binding ShowEditorView}">
-          <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="*"/>
-            <ColumnDefinition Width="4"/>
-            <ColumnDefinition Width="*"/>
-          </Grid.ColumnDefinitions>
+        <!-- 编辑区 + 预览区，有文档时显示；比对时双只读栏全宽，隐藏渲染区 -->
+        <Grid Grid.Row="1" x:Name="ContentSplitGrid" IsVisible="{Binding ShowEditorView}" RowDefinitions="Auto,*">
+          <Grid Grid.Row="0" ColumnDefinitions="*,Auto,*" Background="{DynamicResource TabBarBackground}"
+                IsVisible="{Binding IsDiffCompareActive}">
+            <TextBlock Grid.Column="0" Text="历史文档（所选提交）"
+                       FontSize="12" VerticalAlignment="Center"
+                       Margin="12,6,8,6"
+                       HorizontalAlignment="Left"
+                       Foreground="{DynamicResource EditorForeground}"/>
+            <Button Grid.Column="1" Content="退出比对" Command="{Binding ExitCompareCommand}"
+                    Padding="10,4" FontSize="11" VerticalAlignment="Center" Margin="0,0,0,0"
+                    Background="#2e7d32" Foreground="White"/>
+            <TextBlock Grid.Column="2" Text="当前文档（工作区）"
+                       FontSize="12" VerticalAlignment="Center"
+                       Margin="8,6,12,6"
+                       HorizontalAlignment="Right"
+                       Foreground="{DynamicResource EditorForeground}"/>
+          </Grid>
+
+          <!-- 三列在此 Grid 上；勿用外层 ContentSplitGrid.ColumnDefinitions（外层只有行、单列） -->
+          <Grid x:Name="EditorPreviewSplitGrid" Grid.Row="1" ColumnDefinitions="*,4,*">
 
           <Grid x:Name="EditorPaneGrid"
                 Grid.Column="0"
-                RowDefinitions="Auto,*"
-                Classes="editorPane">
-            <Border Grid.Row="0" Padding="6,4" Background="{DynamicResource TabBarBackground}"
-                    IsVisible="{Binding IsDiffCompareActive}">
-              <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
-                <TextBlock Text="与版本比对中" FontSize="11" VerticalAlignment="Center"/>
-                <Button Content="退出比对" Command="{Binding ExitCompareCommand}" Padding="6,2" FontSize="11"/>
-              </StackPanel>
-            </Border>
+                RowDefinitions="*"
+                Classes="editorPane"
+                IsVisible="{Binding IsSingleEditorPaneVisible}">
             <ae:TextEditor x:Name="EditorTextBox"
-                           Grid.Row="1"
+                           Grid.Row="0"
                            x:CompileBindings="False"
                            ShowLineNumbers="True"
                            HorizontalScrollBarVisibility="Auto"
@@ -1002,6 +1231,28 @@
             </ae:TextEditor>
           </Grid>
 
+          <Grid x:Name="DiffLeftPaneGrid"
+                Grid.Column="0"
+                RowDefinitions="*"
+                Classes="editorPane"
+                IsVisible="{Binding IsDiffCompareActive}">
+            <Border Background="{DynamicResource ContentBackground}" BorderThickness="0,0,1,0" BorderBrush="{DynamicResource SplitterBorderBrush}">
+              <!-- 与侧栏 diff 行对齐：禁止换行，使每行一逻辑行=一视觉行，避免左右高度不同导致错位 -->
+              <ae:TextEditor x:Name="DiffLeftEditor"
+                             x:CompileBindings="False"
+                             ShowLineNumbers="True"
+                             IsReadOnly="True"
+                             HorizontalScrollBarVisibility="Auto"
+                             VerticalScrollBarVisibility="Auto"
+                             WordWrap="False"
+                             FontFamily="Consolas,Cascadia Code,monospace"
+                             FontSize="14"
+                             Padding="12,8,16,8"
+                             BorderThickness="0"
+                             Classes="editorControl"/>
+            </Border>
+          </Grid>
+
           <!-- 编辑/预览分隔条：拖动时只显示蓝色预览线，松手后再应用布局（VS 风格） -->
           <Border x:Name="ContentSplitter"
                   Grid.Column="1"
@@ -1028,17 +1279,18 @@
           <Grid x:Name="PreviewPaneGrid"
                 Grid.Column="2"
                 RowDefinitions="*"
-                Classes="previewPane">
+                Classes="previewPane"
+                IsVisible="{Binding IsSingleEditorPaneVisible}">
             <controls:MarkdownEngineView x:Name="PreviewEngine"
                                          Grid.Row="0"
                                          Focusable="True"
-                                         IsVisible="{Binding ShowMarkdownPreview}"
+                                         IsVisible="{Binding ShowMarkdownPreviewWhenNotDiffing}"
                                          Markdown="{Binding CurrentMarkdown}"
                                          StyleConfig="{Binding Config.Markdown}"
                                          ZoomLevel="{Binding PreviewZoomLevel}"
                                          Background="{Binding Config.Markdown.BackgroundColor, Converter={x:Static conv:HexToBrushConverter.Instance}}"/>
             <Border Grid.Row="0"
-                    IsVisible="{Binding ShowPreviewImage}"
+                    IsVisible="{Binding ShowPreviewImageWhenNotDiffing}"
                     Background="{Binding Config.Markdown.BackgroundColor, Converter={x:Static conv:HexToBrushConverter.Instance}}">
               <ScrollViewer HorizontalScrollBarVisibility="Auto"
                             VerticalScrollBarVisibility="Auto">
@@ -1046,6 +1298,27 @@
                        Stretch="None"/>
               </ScrollViewer>
             </Border>
+          </Grid>
+
+          <Grid x:Name="DiffRightPaneGrid"
+                Grid.Column="2"
+                RowDefinitions="*"
+                Classes="editorPane"
+                IsVisible="{Binding IsDiffCompareActive}">
+            <!-- 与左侧一致：禁止换行，保证左右行与像素高度对齐 -->
+            <ae:TextEditor x:Name="DiffRightEditor"
+                           x:CompileBindings="False"
+                           ShowLineNumbers="True"
+                           IsReadOnly="True"
+                           HorizontalScrollBarVisibility="Auto"
+                           VerticalScrollBarVisibility="Auto"
+                           WordWrap="False"
+                           FontFamily="Consolas,Cascadia Code,monospace"
+                           FontSize="14"
+                           Padding="12,8,16,8"
+                           BorderThickness="0"
+                           Classes="editorControl"/>
+          </Grid>
           </Grid>
         </Grid>
       </Grid>

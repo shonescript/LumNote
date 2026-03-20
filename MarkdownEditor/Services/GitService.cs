@@ -62,19 +62,54 @@ public sealed class GitService
         return list;
     }
 
-    /// <summary>在指定目录初始化新的 Git 仓库（创建 .git）。</summary>
-    public static bool InitRepository(string directoryPath)
+    /// <summary>在指定目录初始化 Git（创建 .git），并在 <c>main</c> 上创建首次空提交（若尚无提交）。已存在仓库则直接返回成功。</summary>
+    public static (bool success, string? errorMessage) InitRepository(string directoryPath)
     {
-        if (string.IsNullOrWhiteSpace(directoryPath) || !Directory.Exists(directoryPath)) return false;
+        if (string.IsNullOrWhiteSpace(directoryPath) || !Directory.Exists(directoryPath))
+            return (false, "路径无效。");
         try
         {
-            if (!string.IsNullOrEmpty(Repository.Discover(directoryPath))) return true;
+            if (!string.IsNullOrEmpty(Repository.Discover(directoryPath)))
+                return (true, null);
             Repository.Init(directoryPath);
-            return true;
+            using var repo = new Repository(directoryPath);
+            return EnsureInitialCommitOnMainBranch(repo);
         }
-        catch
+        catch (Exception ex)
         {
-            return false;
+            return (false, ex.Message);
+        }
+    }
+
+    private static (bool success, string? errorMessage) EnsureInitialCommitOnMainBranch(Repository repo)
+    {
+        try
+        {
+            if (repo.Commits.Any())
+                return (true, null);
+            var sig = new Signature("User", "user@local", DateTimeOffset.Now);
+            var tree = repo.ObjectDatabase.CreateTree(new TreeDefinition());
+            var commit = repo.ObjectDatabase.CreateCommit(sig, sig, "Initial commit", tree, Enumerable.Empty<Commit>(), false);
+            const string mainRef = "refs/heads/main";
+            if (repo.Refs[mainRef] != null)
+                repo.Refs.Remove(mainRef);
+            repo.Refs.Add(mainRef, commit.Id);
+            repo.Refs.UpdateTarget("HEAD", mainRef);
+            try
+            {
+                if (repo.Refs["refs/heads/master"] != null)
+                    repo.Refs.Remove("refs/heads/master");
+            }
+            catch
+            {
+                // ignore
+            }
+
+            return (true, null);
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
         }
     }
 
@@ -234,6 +269,27 @@ public sealed class GitService
         }
     }
 
+    /// <summary>删除指定本地分支（不得为当前检出分支）。若分支含未合并提交，Git 可能拒绝删除。</summary>
+    public static (bool success, string? errorMessage) DeleteLocalBranch(string repositoryRoot, string branchName)
+    {
+        if (string.IsNullOrWhiteSpace(branchName)) return (false, "分支名无效。");
+        try
+        {
+            using var repo = new Repository(repositoryRoot);
+            var headName = repo.Head?.FriendlyName;
+            if (string.Equals(headName, branchName, StringComparison.OrdinalIgnoreCase))
+                return (false, "不能删除当前检出的分支，请先切换到其他分支。");
+            var b = repo.Branches[branchName];
+            if (b == null) return (false, "分支不存在。");
+            repo.Branches.Remove(b);
+            return (true, null);
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
     /// <summary>切换到指定本地分支。</summary>
     public static (bool success, string? errorMessage) CheckoutBranch(string repositoryRoot, string branchName)
     {
@@ -361,9 +417,6 @@ public sealed class GitService
             var oldLines = oldContent.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
             var newLines = currentContent.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
             BuildLineMapFromLineDiff(oldLines, newLines, map);
-            // #region agent log
-            MarkdownEditor.DebugLog.Write("B", "GitService.GetDiffLineMap.afterBuild", "After BuildLineMap", new { oldCount = oldLines.Length, newCount = newLines.Length, deletedCount = map.DeletedLines.Count });
-            // #endregion
         }
         catch
         {
@@ -482,6 +535,220 @@ public sealed class GitService
                 };
                 repo.Network.Push(head, options);
             }, cancellationToken).ConfigureAwait(false);
+            return (true, null);
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
+    /// <summary>当前 HEAD 可达的最近若干条提交（用于分支历史列表）。</summary>
+    public static IReadOnlyList<GitCommitItem> GetRecentCommitsOnHead(string repositoryRoot, int maxCount = 100)
+    {
+        var result = new List<GitCommitItem>();
+        try
+        {
+            using var repo = new Repository(repositoryRoot);
+            var tip = repo.Head?.Tip;
+            if (tip == null) return result;
+            var filter = new CommitFilter { IncludeReachableFrom = tip };
+            var n = 0;
+            foreach (var c in repo.Commits.QueryBy(filter))
+            {
+                if (n >= maxCount) break;
+                var msg = c.MessageShort ?? "";
+                if (msg.Length > 60) msg = msg.Substring(0, 57) + "...";
+                result.Add(new GitCommitItem(
+                    c.Sha.Substring(0, Math.Min(7, c.Sha.Length)),
+                    c.Sha,
+                    msg,
+                    c.Author?.Name ?? "",
+                    c.Author?.When ?? DateTimeOffset.MinValue));
+                n++;
+            }
+        }
+        catch
+        {
+            // ignore
+        }
+        return result;
+    }
+
+    /// <summary>指定分支可达的最近若干条提交。</summary>
+    public static IReadOnlyList<GitCommitItem> GetRecentCommitsOnBranch(string repositoryRoot, string branchName, int maxCount = 40)
+    {
+        var result = new List<GitCommitItem>();
+        try
+        {
+            using var repo = new Repository(repositoryRoot);
+            var branch = repo.Branches[branchName];
+            var tip = branch?.Tip;
+            if (tip == null) return result;
+            var filter = new CommitFilter { IncludeReachableFrom = tip };
+            var n = 0;
+            foreach (var c in repo.Commits.QueryBy(filter))
+            {
+                if (n >= maxCount) break;
+                var msg = c.MessageShort ?? "";
+                if (msg.Length > 60) msg = msg.Substring(0, 57) + "...";
+                result.Add(new GitCommitItem(
+                    c.Sha.Substring(0, Math.Min(7, c.Sha.Length)),
+                    c.Sha,
+                    msg,
+                    c.Author?.Name ?? "",
+                    c.Author?.When ?? DateTimeOffset.MinValue));
+                n++;
+            }
+        }
+        catch
+        {
+            // ignore
+        }
+        return result;
+    }
+
+    /// <summary>某提交相对其父提交的变更文件列表（合并提交与第一父比较）；首提交与空树比较。</summary>
+    public static IReadOnlyList<GitCommitChangedFileItem> GetChangedFilesInCommit(string repositoryRoot, string commitSha)
+    {
+        var result = new List<GitCommitChangedFileItem>();
+        try
+        {
+            using var repo = new Repository(repositoryRoot);
+            var commit = repo.Lookup<LibGit2Sharp.Commit>(commitSha);
+            if (commit?.Tree == null) return result;
+            var parent = commit.Parents.FirstOrDefault();
+            if (parent == null)
+            {
+                CollectAddedBlobs(commit.Tree, "", result);
+                return result.OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase).ToList();
+            }
+            var changes = repo.Diff.Compare<TreeChanges>(parent.Tree, commit.Tree);
+            foreach (var c in changes)
+            {
+                var kind = c.Status switch
+                {
+                    ChangeKind.Added => GitTreeChangeKind.Added,
+                    ChangeKind.Deleted => GitTreeChangeKind.Deleted,
+                    ChangeKind.Modified => GitTreeChangeKind.Modified,
+                    ChangeKind.Renamed => GitTreeChangeKind.Renamed,
+                    ChangeKind.TypeChanged => GitTreeChangeKind.TypeChanged,
+                    ChangeKind.Copied => GitTreeChangeKind.Added,
+                    _ => GitTreeChangeKind.Modified
+                };
+                var rel = (c.Path ?? "").Replace('/', Path.DirectorySeparatorChar);
+                if (c.Status == ChangeKind.Renamed && !string.IsNullOrEmpty(c.OldPath))
+                    result.Add(new GitCommitChangedFileItem(rel, kind, c.OldPath.Replace('/', Path.DirectorySeparatorChar)));
+                else
+                    result.Add(new GitCommitChangedFileItem(rel, kind));
+            }
+        }
+        catch
+        {
+            // ignore
+        }
+        return result.OrderBy(x => x.RelativePath, StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    private static void CollectAddedBlobs(Tree tree, string prefix, List<GitCommitChangedFileItem> result)
+    {
+        foreach (var entry in tree)
+        {
+            var path = string.IsNullOrEmpty(prefix) ? entry.Name : prefix + "/" + entry.Name;
+            if (entry.TargetType == TreeEntryTargetType.Blob)
+                result.Add(new GitCommitChangedFileItem(path.Replace('/', Path.DirectorySeparatorChar), GitTreeChangeKind.Added));
+            else if (entry.TargetType == TreeEntryTargetType.Tree && entry.Target is Tree sub)
+                CollectAddedBlobs(sub, path, result);
+        }
+    }
+
+    /// <summary>将工作区与暂存区重置为当前 HEAD 指向的提交（丢弃未提交修改，不移动分支指针）。</summary>
+    public static (bool success, string? errorMessage) ResetWorkingTreeToHead(string repositoryRoot)
+    {
+        try
+        {
+            using var repo = new Repository(repositoryRoot);
+            var tip = repo.Head?.Tip;
+            if (tip == null) return (false, "当前无提交（无 HEAD），无法丢弃本地修改。");
+            repo.Reset(ResetMode.Hard, tip);
+            return (true, null);
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
+    /// <summary>删除仓库根目录下的 <c>.git</c>（目录或 gitdir 指针文件），该文件夹不再作为 Git 仓库。</summary>
+    public static (bool success, string? errorMessage) DeleteDotGit(string repositoryRoot)
+    {
+        if (string.IsNullOrWhiteSpace(repositoryRoot) || !Directory.Exists(repositoryRoot))
+            return (false, "路径无效。");
+        try
+        {
+            var root = Path.GetFullPath(repositoryRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var gitPath = Path.Combine(root, ".git");
+            if (Directory.Exists(gitPath))
+            {
+                DeleteDirectoryRecursive(gitPath);
+                return (true, null);
+            }
+
+            if (File.Exists(gitPath))
+            {
+                File.Delete(gitPath);
+                return (true, null);
+            }
+
+            return (false, "未找到 .git。");
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
+    private static void DeleteDirectoryRecursive(string path)
+    {
+        if (!Directory.Exists(path)) return;
+        foreach (var f in Directory.EnumerateFiles(path))
+        {
+            File.SetAttributes(f, FileAttributes.Normal);
+            File.Delete(f);
+        }
+
+        foreach (var d in Directory.EnumerateDirectories(path))
+            DeleteDirectoryRecursive(d);
+        Directory.Delete(path, false);
+    }
+
+    /// <summary>硬重置到指定提交（丢弃工作区与暂存区未提交内容，并移动 HEAD）。</summary>
+    public static (bool success, string? errorMessage) ResetHard(string repositoryRoot, string commitSha)
+    {
+        try
+        {
+            using var repo = new Repository(repositoryRoot);
+            var commit = repo.Lookup<LibGit2Sharp.Commit>(commitSha);
+            if (commit == null) return (false, "找不到该提交。");
+            repo.Reset(ResetMode.Hard, commit);
+            return (true, null);
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
+    /// <summary>生成撤销指定提交的新提交（安全，不改写历史）。</summary>
+    public static (bool success, string? errorMessage) RevertCommit(string repositoryRoot, string commitSha)
+    {
+        try
+        {
+            using var repo = new Repository(repositoryRoot);
+            var commit = repo.Lookup<LibGit2Sharp.Commit>(commitSha);
+            if (commit == null) return (false, "找不到该提交。");
+            var sig = new Signature("User", "user@local", DateTimeOffset.Now);
+            repo.Revert(commit, sig, new RevertOptions());
             return (true, null);
         }
         catch (Exception ex)

@@ -1,6 +1,8 @@
 using System.ComponentModel;
+using System.Globalization;
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Layout;
 using Avalonia.Input;
 using Avalonia.Input.Platform;
 using Avalonia.Interactivity;
@@ -15,10 +17,16 @@ using System.Reactive.Linq;
 using Avalonia.Threading;
 using AvaloniaEdit;
 using AvaloniaEdit.Document;
+using AvaloniaEdit.Rendering;
 using AvaloniaEdit.Search;
 using MarkdownEditor;
 using MarkdownEditor.ViewModels;
 using MarkdownEditor.Engine.Highlighting;
+using MarkdownEditor.Controls;
+using MarkdownEditor.Services;
+using MarkdownEditor.Models;
+using DiffPlex.DiffBuilder.Model;
+using System.Text;
 using MarkdownEditor.Export;
 using MarkdownEditor.Helpers;
 using System.Diagnostics;
@@ -68,6 +76,20 @@ public partial class MainWindow : Window
 
     private readonly EditorController _editorController;
 
+    private MarkdownColorizer? _diffLeftColorizer;
+    private MarkdownColorizer? _diffRightColorizer;
+    private DualPaneDiffBackgroundRenderer? _diffLeftBgRenderer;
+    private DualPaneDiffBackgroundRenderer? _diffRightBgRenderer;
+    private DualPaneDiffSymbolMargin? _diffLeftSymbolMargin;
+    private DualPaneDiffSymbolMargin? _diffRightSymbolMargin;
+    private IReadOnlyList<ChangeType>? _diffLeftLineTypes;
+    private IReadOnlyList<ChangeType>? _diffRightLineTypes;
+    private ScrollViewer? _diffLeftScroll;
+    private ScrollViewer? _diffRightScroll;
+    private bool _diffSyncingScroll;
+    private string? _diffTooltipCachedLeft;
+    private string? _diffTooltipCachedRight;
+
     public MainWindow()
     {
         InitializeComponent();
@@ -85,6 +107,7 @@ public partial class MainWindow : Window
         {
             ApplyThemeFromConfig(vm);
             SetupScrollSync();
+            SetupDiffPaneEditors(vm);
             RegisterAutoSaveDialogs(vm);
             if (PreviewEngine != null && DataContext is MainViewModel m)
                 PreviewEngine.GotFocus += (_, _) => m.ActivePane = "Preview";
@@ -364,15 +387,15 @@ public partial class MainWindow : Window
             };
         }
 
-        if (ContentSplitter != null && ContentSplitGrid != null && ContentSplitterPreviewLine != null && ContentSplitterOverlay != null)
+        if (ContentSplitter != null && EditorPreviewSplitGrid != null && ContentSplitterPreviewLine != null && ContentSplitterOverlay != null)
         {
             ContentSplitter.PointerPressed += (s, e) =>
             {
                 if (!e.GetCurrentPoint(ContentSplitter).Properties.IsLeftButtonPressed) return;
                 e.Handled = true;
                 _contentSplitterDragging = true;
-                var pt = e.GetPosition(ContentSplitGrid);
-                var total = ContentSplitGrid.Bounds.Width;
+                var pt = e.GetPosition(EditorPreviewSplitGrid);
+                var total = EditorPreviewSplitGrid.Bounds.Width;
                 var maxX = Math.Max(contentMinWidth, total - 4 - contentMinWidth);
                 var x = Math.Clamp(pt.X, contentMinWidth, maxX);
                 ContentSplitterPreviewLine.IsVisible = true;
@@ -381,9 +404,9 @@ public partial class MainWindow : Window
             };
             ContentSplitter.PointerMoved += (s, e) =>
             {
-                if (!_contentSplitterDragging || ContentSplitGrid == null) return;
-                var pt = e.GetPosition(ContentSplitGrid);
-                var total = ContentSplitGrid.Bounds.Width;
+                if (!_contentSplitterDragging || EditorPreviewSplitGrid == null) return;
+                var pt = e.GetPosition(EditorPreviewSplitGrid);
+                var total = EditorPreviewSplitGrid.Bounds.Width;
                 var maxX = Math.Max(contentMinWidth, total - 4 - contentMinWidth);
                 var x = Math.Clamp(pt.X, contentMinWidth, maxX);
                 ContentSplitterPreviewLine!.Margin = new Thickness(x, 0, 0, 0);
@@ -395,21 +418,21 @@ public partial class MainWindow : Window
                 _contentSplitterDragging = false;
                 e.Pointer.Capture(null);
                 ContentSplitterPreviewLine!.IsVisible = false;
-                var pt = e.GetPosition(ContentSplitGrid);
-                var total = ContentSplitGrid!.Bounds.Width;
+                var pt = e.GetPosition(EditorPreviewSplitGrid);
+                var total = EditorPreviewSplitGrid.Bounds.Width;
                 var maxX = Math.Max(contentMinWidth, total - 4 - contentMinWidth);
                 var w = Math.Clamp(pt.X, contentMinWidth, maxX);
-                var cols = ContentSplitGrid.ColumnDefinitions;
+                var cols = EditorPreviewSplitGrid.ColumnDefinitions;
                 if (cols.Count >= 3)
                 {
-                    cols[0].Width = new GridLength(w, GridUnitType.Pixel);
-                    cols[2].Width = new GridLength(1, GridUnitType.Star);
-                    if (DataContext is MainViewModel vmContent && total > 4)
-                    {
-                        var usable = total - 4;
-                        var ratio = usable > 0 ? Math.Clamp(w / usable, 0.1, 0.9) : 0.5;
+                    // Star 比例，窗口变宽/变窄时两栏随总宽变化；列必须写在 EditorPreviewSplitGrid 上（外层 ContentSplitGrid 无三列）。
+                    var usable = total > 4 ? total - 4 : total;
+                    var ratio = usable > 0 ? Math.Clamp(w / usable, 0.1, 0.9) : 0.5;
+                    cols[0].Width = new GridLength(ratio, GridUnitType.Star);
+                    cols[1].Width = new GridLength(4, GridUnitType.Pixel);
+                    cols[2].Width = new GridLength(1 - ratio, GridUnitType.Star);
+                    if (DataContext is MainViewModel vmContent)
                         vmContent.Config.Ui.EditorWidth = ratio;
-                    }
                 }
             };
             ContentSplitter.PointerCaptureLost += (s, e) =>
@@ -725,19 +748,33 @@ public partial class MainWindow : Window
                     {
                         var commit = c;
                         var path = node.FullPath;
-                        var mi = new MenuItem { Header = $"{c.MessageShort} — {c.ShaShort}" };
+                        var title = new TextBlock
+                        {
+                            Text = c.MessageShort,
+                            TextTrimming = TextTrimming.CharacterEllipsis,
+                            MaxWidth = 260,
+                            FontSize = 12,
+                        };
+                        var time = new TextBlock
+                        {
+                            Text = c.Date.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.CurrentCulture),
+                            FontSize = 10,
+                            Opacity = 0.75,
+                        };
+                        var mi = new MenuItem
+                        {
+                            Header = new StackPanel
+                            {
+                                Orientation = Orientation.Vertical,
+                                Spacing = 0,
+                                Children = { title, time },
+                            },
+                        };
                         mi.Click += (_, _) =>
                         {
                             vm.OpenDocument(path);
                             vm.EnterCompareWithCommit(path, commit.Sha);
-                            Dispatcher.UIThread.Post(() =>
-                            {
-                                var editorText = EditorTextBox is TextEditor ed ? ed.Document?.Text ?? "" : "";
-                                vm.UpdateDiffLineMap(editorText);
-                                var addedBrush = GetDiffBrushFromResources("DiffAddedBackground");
-                                var removedBrush = GetDiffBrushFromResources("DiffRemovedBackground");
-                                _editorController.SetDiffMode(() => vm.CurrentDiffLineMap, addedBrush, removedBrush);
-                            }, DispatcherPriority.Loaded);
+                            Dispatcher.UIThread.Post(RefreshDualDiffDisplay, DispatcherPriority.Loaded);
                         };
                         FileTreeTimelineItem.Items.Add(mi);
                     }
@@ -984,6 +1021,346 @@ public partial class MainWindow : Window
             ? MarkdownHighlightTheme.LightTheme
             : MarkdownHighlightTheme.DarkTheme;
         _editorController.SetHighlightTheme(theme);
+        SetDiffPaneHighlightTheme(theme);
+    }
+
+    private void SetupDiffPaneEditors(MainViewModel vm)
+    {
+        if (DiffLeftEditor == null || DiffRightEditor == null) return;
+        var theme = string.Equals(vm.Config.Ui.Theme, "Light", StringComparison.OrdinalIgnoreCase)
+            ? MarkdownHighlightTheme.LightTheme
+            : MarkdownHighlightTheme.DarkTheme;
+        if (_diffLeftColorizer != null)
+            DiffLeftEditor.TextArea.TextView.LineTransformers.Remove(_diffLeftColorizer);
+        if (_diffRightColorizer != null)
+            DiffRightEditor.TextArea.TextView.LineTransformers.Remove(_diffRightColorizer);
+        _diffLeftColorizer = new MarkdownColorizer(theme);
+        _diffRightColorizer = new MarkdownColorizer(theme);
+        DiffLeftEditor.TextArea.TextView.LineTransformers.Add(_diffLeftColorizer);
+        DiffRightEditor.TextArea.TextView.LineTransformers.Add(_diffRightColorizer);
+        DiffLeftEditor.FontSize = 14.0 * vm.EditorZoomLevel;
+        DiffRightEditor.FontSize = 14.0 * vm.EditorZoomLevel;
+    }
+
+    private void SetDiffPaneHighlightTheme(MarkdownHighlightTheme theme)
+    {
+        if (DiffLeftEditor == null || DiffRightEditor == null) return;
+        if (_diffLeftColorizer != null)
+            DiffLeftEditor.TextArea.TextView.LineTransformers.Remove(_diffLeftColorizer);
+        if (_diffRightColorizer != null)
+            DiffRightEditor.TextArea.TextView.LineTransformers.Remove(_diffRightColorizer);
+        _diffLeftColorizer = new MarkdownColorizer(theme);
+        _diffRightColorizer = new MarkdownColorizer(theme);
+        DiffLeftEditor.TextArea.TextView.LineTransformers.Add(_diffLeftColorizer);
+        DiffRightEditor.TextArea.TextView.LineTransformers.Add(_diffRightColorizer);
+        try
+        {
+            DiffLeftEditor.TextArea.TextView.Redraw();
+            DiffRightEditor.TextArea.TextView.Redraw();
+        }
+        catch { }
+    }
+
+    private void RefreshDualDiffDisplay()
+    {
+        if (DataContext is not MainViewModel vm || !vm.IsDiffCompareActive || DiffLeftEditor == null || DiffRightEditor == null)
+            return;
+        var path = vm.DiffCompareFilePath;
+        var sha = vm.DiffCompareCommitSha;
+        if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(sha)) return;
+        var repo = Services.GitService.FindRepositoryRootForPath(path);
+        if (string.IsNullOrEmpty(repo)) return;
+        var oldText = Services.GitService.GetFileContentAtCommit(repo, path, sha) ?? "";
+        var newText = GetWorkingCopyTextForCompare(vm, path);
+        var result = SideBySideDiffService.Build(oldText, newText);
+        _diffLeftLineTypes = result.LeftLineTypes;
+        _diffRightLineTypes = result.RightLineTypes;
+        RemoveDiffPaneBackgroundRenderers();
+        RemoveDualPaneSymbolMargins();
+        DiffLeftEditor.Text = result.LeftText;
+        DiffRightEditor.Text = result.RightText;
+        var red = GetDiffBrushFromResources("DiffRemovedBackground");
+        var green = GetDiffBrushFromResources("DiffAddedBackground");
+        var gray = new SolidColorBrush(Color.FromArgb(0x28, 0x80, 0x80, 0x80));
+        var minusSym = new SolidColorBrush(Color.FromRgb(0xE0, 0x60, 0x60));
+        var plusSym = new SolidColorBrush(Color.FromRgb(0x60, 0xD0, 0x60));
+        _diffLeftBgRenderer = new DualPaneDiffBackgroundRenderer(() => _diffLeftLineTypes, true, red, gray);
+        _diffRightBgRenderer = new DualPaneDiffBackgroundRenderer(() => _diffRightLineTypes, false, green, gray);
+        DiffLeftEditor.TextArea.TextView.BackgroundRenderers.Add(_diffLeftBgRenderer);
+        DiffRightEditor.TextArea.TextView.BackgroundRenderers.Add(_diffRightBgRenderer);
+        _diffLeftSymbolMargin = new DualPaneDiffSymbolMargin(() => _diffLeftLineTypes, true, minusSym, plusSym);
+        _diffRightSymbolMargin = new DualPaneDiffSymbolMargin(() => _diffRightLineTypes, false, minusSym, plusSym);
+        _diffLeftSymbolMargin.AddToTextView(DiffLeftEditor.TextArea.TextView);
+        _diffRightSymbolMargin.AddToTextView(DiffRightEditor.TextArea.TextView);
+        DiffLeftEditor.TextArea.LeftMargins.Insert(0, _diffLeftSymbolMargin);
+        DiffRightEditor.TextArea.LeftMargins.Insert(0, _diffRightSymbolMargin);
+        try
+        {
+            DiffLeftEditor.TextArea.TextView.Redraw();
+            DiffRightEditor.TextArea.TextView.Redraw();
+        }
+        catch { }
+        AttachDiffScrollSync();
+        AttachDiffTooltipHandlers();
+    }
+
+    private static string GetWorkingCopyTextForCompare(MainViewModel vm, string filePath)
+    {
+        if (string.Equals(vm.CurrentFilePath, filePath, StringComparison.OrdinalIgnoreCase))
+            return vm.CurrentMarkdown ?? "";
+        try
+        {
+            if (File.Exists(filePath))
+            {
+                var doc = vm.ActiveDocument;
+                if (doc != null && string.Equals(doc.FullPath, filePath, StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        var enc = Encoding.GetEncoding(doc.EncodingName);
+                        return File.ReadAllText(filePath, enc);
+                    }
+                    catch
+                    {
+                        return File.ReadAllText(filePath, Encoding.UTF8);
+                    }
+                }
+                return File.ReadAllText(filePath, Encoding.UTF8);
+            }
+        }
+        catch
+        {
+            // 工作区无此文件（如已删除）则右侧为空
+        }
+        return "";
+    }
+
+    private void RemoveDiffPaneBackgroundRenderers()
+    {
+        if (DiffLeftEditor != null && _diffLeftBgRenderer != null)
+        {
+            DiffLeftEditor.TextArea.TextView.BackgroundRenderers.Remove(_diffLeftBgRenderer);
+            _diffLeftBgRenderer = null;
+        }
+        if (DiffRightEditor != null && _diffRightBgRenderer != null)
+        {
+            DiffRightEditor.TextArea.TextView.BackgroundRenderers.Remove(_diffRightBgRenderer);
+            _diffRightBgRenderer = null;
+        }
+    }
+
+    private void RemoveDualPaneSymbolMargins()
+    {
+        if (DiffLeftEditor != null && _diffLeftSymbolMargin != null)
+        {
+            _diffLeftSymbolMargin.RemoveFromTextView(DiffLeftEditor.TextArea.TextView);
+            DiffLeftEditor.TextArea.LeftMargins.Remove(_diffLeftSymbolMargin);
+            _diffLeftSymbolMargin = null;
+        }
+        if (DiffRightEditor != null && _diffRightSymbolMargin != null)
+        {
+            _diffRightSymbolMargin.RemoveFromTextView(DiffRightEditor.TextArea.TextView);
+            DiffRightEditor.TextArea.LeftMargins.Remove(_diffRightSymbolMargin);
+            _diffRightSymbolMargin = null;
+        }
+    }
+
+    private void AttachDiffScrollSync()
+    {
+        DetachDiffScrollSync();
+        if (DiffLeftEditor == null || DiffRightEditor == null) return;
+        _diffLeftScroll = DiffLeftEditor.GetVisualDescendants().OfType<ScrollViewer>().FirstOrDefault();
+        _diffRightScroll = DiffRightEditor.GetVisualDescendants().OfType<ScrollViewer>().FirstOrDefault();
+        if (_diffLeftScroll != null)
+            _diffLeftScroll.ScrollChanged += DiffLeftScroll_OnScrollChanged;
+        if (_diffRightScroll != null)
+            _diffRightScroll.ScrollChanged += DiffRightScroll_OnScrollChanged;
+    }
+
+    private void DetachDiffScrollSync()
+    {
+        DetachDiffTooltipHandlers();
+        if (_diffLeftScroll != null)
+            _diffLeftScroll.ScrollChanged -= DiffLeftScroll_OnScrollChanged;
+        if (_diffRightScroll != null)
+            _diffRightScroll.ScrollChanged -= DiffRightScroll_OnScrollChanged;
+        _diffLeftScroll = null;
+        _diffRightScroll = null;
+    }
+
+    private void DiffLeftScroll_OnScrollChanged(object? sender, ScrollChangedEventArgs e)
+    {
+        if (_diffSyncingScroll || _diffLeftScroll == null || _diffRightScroll == null) return;
+        _diffSyncingScroll = true;
+        try
+        {
+            _diffRightScroll.Offset = _diffLeftScroll.Offset;
+        }
+        finally
+        {
+            _diffSyncingScroll = false;
+        }
+    }
+
+    private void DiffRightScroll_OnScrollChanged(object? sender, ScrollChangedEventArgs e)
+    {
+        if (_diffSyncingScroll || _diffLeftScroll == null || _diffRightScroll == null) return;
+        _diffSyncingScroll = true;
+        try
+        {
+            _diffLeftScroll.Offset = _diffRightScroll.Offset;
+        }
+        finally
+        {
+            _diffSyncingScroll = false;
+        }
+    }
+
+    private void AttachDiffTooltipHandlers()
+    {
+        DetachDiffTooltipHandlers();
+        if (DiffLeftEditor == null || DiffRightEditor == null) return;
+        DiffLeftEditor.TextArea.PointerMoved += DiffLeftTextArea_PointerMoved;
+        DiffLeftEditor.TextArea.PointerExited += DiffLeftTextArea_PointerExited;
+        DiffRightEditor.TextArea.PointerMoved += DiffRightTextArea_PointerMoved;
+        DiffRightEditor.TextArea.PointerExited += DiffRightTextArea_PointerExited;
+    }
+
+    private void DetachDiffTooltipHandlers()
+    {
+        if (DiffLeftEditor != null)
+        {
+            DiffLeftEditor.TextArea.PointerMoved -= DiffLeftTextArea_PointerMoved;
+            DiffLeftEditor.TextArea.PointerExited -= DiffLeftTextArea_PointerExited;
+            ToolTip.SetTip(DiffLeftEditor, null);
+        }
+        if (DiffRightEditor != null)
+        {
+            DiffRightEditor.TextArea.PointerMoved -= DiffRightTextArea_PointerMoved;
+            DiffRightEditor.TextArea.PointerExited -= DiffRightTextArea_PointerExited;
+            ToolTip.SetTip(DiffRightEditor, null);
+        }
+        _diffTooltipCachedLeft = null;
+        _diffTooltipCachedRight = null;
+    }
+
+    private void DiffLeftTextArea_PointerMoved(object? sender, PointerEventArgs e) =>
+        UpdateDiffPaneTooltip(DiffLeftEditor, ref _diffTooltipCachedLeft, isOldPane: true, e);
+
+    private void DiffRightTextArea_PointerMoved(object? sender, PointerEventArgs e) =>
+        UpdateDiffPaneTooltip(DiffRightEditor, ref _diffTooltipCachedRight, isOldPane: false, e);
+
+    private void DiffLeftTextArea_PointerExited(object? sender, PointerEventArgs e)
+    {
+        if (DiffLeftEditor != null)
+        {
+            _diffTooltipCachedLeft = null;
+            ToolTip.SetTip(DiffLeftEditor, null);
+        }
+    }
+
+    private void DiffRightTextArea_PointerExited(object? sender, PointerEventArgs e)
+    {
+        if (DiffRightEditor != null)
+        {
+            _diffTooltipCachedRight = null;
+            ToolTip.SetTip(DiffRightEditor, null);
+        }
+    }
+
+    private void UpdateDiffPaneTooltip(TextEditor? editor, ref string? cachedTip, bool isOldPane, PointerEventArgs e)
+    {
+        if (editor == null) return;
+        if (DataContext is not MainViewModel vm || !vm.IsDiffCompareActive)
+        {
+            if (cachedTip != null)
+            {
+                cachedTip = null;
+                ToolTip.SetTip(editor, null);
+            }
+            return;
+        }
+        var kinds = isOldPane ? _diffLeftLineTypes : _diffRightLineTypes;
+        if (kinds == null || kinds.Count == 0)
+        {
+            if (cachedTip != null)
+            {
+                cachedTip = null;
+                ToolTip.SetTip(editor, null);
+            }
+            return;
+        }
+        var textView = editor.TextArea.TextView;
+        try
+        {
+            if (!textView.VisualLinesValid) return;
+            var pos = e.GetPosition(textView) + textView.ScrollOffset;
+            var vl = textView.GetVisualLineFromVisualTop(pos.Y);
+            if (vl == null)
+            {
+                if (cachedTip != null)
+                {
+                    cachedTip = null;
+                    ToolTip.SetTip(editor, null);
+                }
+                return;
+            }
+            var lineNum = vl.FirstDocumentLine?.LineNumber ?? 0;
+            if (lineNum <= 0 || lineNum > kinds.Count)
+            {
+                if (cachedTip != null)
+                {
+                    cachedTip = null;
+                    ToolTip.SetTip(editor, null);
+                }
+                return;
+            }
+            var t = kinds[lineNum - 1];
+            var tip = FormatDiffLineTooltip(t, isOldPane);
+            if (tip == cachedTip) return;
+            cachedTip = tip;
+            ToolTip.SetTip(editor, tip);
+        }
+        catch (VisualLinesInvalidException)
+        {
+            if (cachedTip != null)
+            {
+                cachedTip = null;
+                ToolTip.SetTip(editor, null);
+            }
+        }
+    }
+
+    private static string? FormatDiffLineTooltip(ChangeType t, bool isOldPane)
+    {
+        if (isOldPane)
+        {
+            return t switch
+            {
+                ChangeType.Deleted => "删除行",
+                ChangeType.Modified => "修改行",
+                ChangeType.Imaginary => "对齐占位（本侧无对应行）",
+                _ => null
+            };
+        }
+        return t switch
+        {
+            ChangeType.Inserted => "新增行",
+            ChangeType.Modified => "修改行",
+            ChangeType.Imaginary => "对齐占位（本侧无对应行）",
+            _ => null
+        };
+    }
+
+    private void ClearDualDiffEditors()
+    {
+        DetachDiffScrollSync();
+        RemoveDiffPaneBackgroundRenderers();
+        RemoveDualPaneSymbolMargins();
+        _diffLeftLineTypes = null;
+        _diffRightLineTypes = null;
+        if (DiffLeftEditor != null) DiffLeftEditor.Text = "";
+        if (DiffRightEditor != null) DiffRightEditor.Text = "";
     }
 
     private void OnThemeChanged()
@@ -1018,7 +1395,13 @@ public partial class MainWindow : Window
                  or nameof(MainViewModel.IsSearchActive)
                  or nameof(MainViewModel.IsGitActive)
                  or nameof(MainViewModel.IsSettingsActive))
+        {
             UpdateActivityBarHighlight(vm);
+            if (e.PropertyName == nameof(MainViewModel.IsGitActive) && vm.IsGitActive)
+                vm.GitPaneViewModel.RefreshStatus();
+            if (e.PropertyName == nameof(MainViewModel.IsExplorerActive) && vm.IsExplorerActive)
+                vm.RefreshExplorerFromDisk();
+        }
         else if (e.PropertyName == nameof(MainViewModel.IsSearching))
         {
             // 搜索状态由 ViewModel 的 SearchResultStatusText（x 个结果 + 循环小点）与定时器处理
@@ -1027,8 +1410,13 @@ public partial class MainWindow : Window
         {
             ApplyLayout(vm.ShowEditorPaneForCurrentDoc ? vm.LayoutMode : EditorLayoutMode.PreviewOnly);
         }
-        else if (e.PropertyName == nameof(MainViewModel.EditorZoomLevel) && EditorTextBox is TextEditor ed)
-            ed.FontSize = 14.0 * vm.EditorZoomLevel;
+        else if (e.PropertyName == nameof(MainViewModel.EditorZoomLevel))
+        {
+            if (EditorTextBox is TextEditor ed)
+                ed.FontSize = 14.0 * vm.EditorZoomLevel;
+            if (DiffLeftEditor != null) DiffLeftEditor.FontSize = 14.0 * vm.EditorZoomLevel;
+            if (DiffRightEditor != null) DiffRightEditor.FontSize = 14.0 * vm.EditorZoomLevel;
+        }
         else if (e.PropertyName == nameof(MainViewModel.SelectedPreset) && PreviewEngine != null)
         {
             // 渲染区主题（Markdown 样式预设）切换后，立即将最新样式应用到预览控件
@@ -1038,10 +1426,20 @@ public partial class MainWindow : Window
         {
             vm.GitPaneViewModel.TimelineFilePath = vm.CurrentFilePath;
         }
-        else if (e.PropertyName == nameof(MainViewModel.IsDiffCompareActive) && !vm.IsDiffCompareActive)
+        else if (e.PropertyName == nameof(MainViewModel.IsDiffCompareActive))
         {
-            _editorController.SetDiffMode(null);
+            if (vm.IsDiffCompareActive)
+                Dispatcher.UIThread.Post(() => RefreshDualDiffDisplay(), DispatcherPriority.Loaded);
+            else
+            {
+                ClearDualDiffEditors();
+                _editorController.SetDiffMode(null);
+            }
         }
+        else if (e.PropertyName == nameof(MainViewModel.CurrentMarkdown) && vm.IsDiffCompareActive
+                 && !string.IsNullOrEmpty(vm.DiffCompareFilePath)
+                 && string.Equals(vm.DiffCompareFilePath, vm.CurrentFilePath, StringComparison.OrdinalIgnoreCase))
+            Dispatcher.UIThread.Post(RefreshDualDiffDisplay, DispatcherPriority.Background);
     }
 
     private void UpdateActivityBarHighlight(MainViewModel vm)
@@ -1311,7 +1709,9 @@ public partial class MainWindow : Window
         {
             Title = "重命名失败",
             Width = 360,
-            MinHeight = 100,
+            MaxWidth = 480,
+            SizeToContent = SizeToContent.Height,
+            CanResize = false,
             WindowStartupLocation = WindowStartupLocation.CenterOwner,
             Icon = GetAppIcon()
         };
@@ -1323,7 +1723,7 @@ public partial class MainWindow : Window
             Spacing = 12,
             Children =
             {
-                new TextBlock { Text = message, TextWrapping = TextWrapping.Wrap },
+                new TextBlock { Text = message, TextWrapping = TextWrapping.Wrap, MaxWidth = 328 },
                 close
             }
         };
@@ -1827,13 +2227,15 @@ public partial class MainWindow : Window
             {
                 Title = "导出",
                 Width = 360,
-                Height = 100,
+                MaxWidth = 420,
+                SizeToContent = SizeToContent.Height,
+                CanResize = false,
                 WindowStartupLocation = WindowStartupLocation.CenterOwner,
                 Icon = GetAppIcon()
             };
             var closeBtn = new Button { Content = "确定", HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Right };
             closeBtn.Click += (_, _) => msg.Close();
-            msg.Content = new StackPanel { Margin = new Thickness(16), Spacing = 12, Children = { new TextBlock { Text = "当前无内容可导出。请先打开或编辑文档。", TextWrapping = TextWrapping.Wrap }, closeBtn } };
+            msg.Content = new StackPanel { Margin = new Thickness(16), Spacing = 12, Children = { new TextBlock { Text = "当前无内容可导出。请先打开或编辑文档。", TextWrapping = TextWrapping.Wrap, MaxWidth = 328 }, closeBtn } };
             await msg.ShowDialog(this);
             return;
         }
@@ -1844,7 +2246,9 @@ public partial class MainWindow : Window
             {
                 Title = "导出失败",
                 Width = 380,
-                Height = 140,
+                MaxWidth = 440,
+                SizeToContent = SizeToContent.Height,
+                CanResize = false,
                 WindowStartupLocation = WindowStartupLocation.CenterOwner,
                 Icon = GetAppIcon()
             };
@@ -1854,7 +2258,7 @@ public partial class MainWindow : Window
             {
                 Margin = new Thickness(16),
                 Spacing = 12,
-                Children = { new TextBlock { Text = errorMessage, TextWrapping = TextWrapping.Wrap }, okButton }
+                Children = { new TextBlock { Text = errorMessage, TextWrapping = TextWrapping.Wrap, MaxWidth = 348 }, okButton }
             };
             await msg.ShowDialog(this);
         }
@@ -1870,7 +2274,9 @@ public partial class MainWindow : Window
             {
                 Title = "自动保存",
                 Width = 480,
-                MinHeight = 140,
+                MaxWidth = 520,
+                SizeToContent = SizeToContent.Height,
+                CanResize = false,
                 WindowStartupLocation = WindowStartupLocation.CenterOwner,
                 Icon = GetAppIcon(),
             };
@@ -1895,6 +2301,7 @@ public partial class MainWindow : Window
                         Text =
                             $"磁盘上已找不到该文件（可能已被删除或移动）：\n\n{path}\n\n是否要在原路径重新创建文件并写入当前编辑内容？",
                         TextWrapping = TextWrapping.Wrap,
+                        MaxWidth = 448,
                     },
                     buttons,
                 },
@@ -1909,7 +2316,9 @@ public partial class MainWindow : Window
             {
                 Title = "自动保存失败",
                 Width = 420,
-                MinHeight = 120,
+                MaxWidth = 480,
+                SizeToContent = SizeToContent.Height,
+                CanResize = false,
                 WindowStartupLocation = WindowStartupLocation.CenterOwner,
                 Icon = GetAppIcon(),
             };
@@ -1919,7 +2328,7 @@ public partial class MainWindow : Window
             {
                 Margin = new Thickness(16),
                 Spacing = 12,
-                Children = { new TextBlock { Text = message, TextWrapping = TextWrapping.Wrap }, ok },
+                Children = { new TextBlock { Text = message, TextWrapping = TextWrapping.Wrap, MaxWidth = 388 }, ok },
             };
             await msg.ShowDialog(this);
         };
@@ -2123,18 +2532,448 @@ public partial class MainWindow : Window
             Dispatcher.UIThread.Invoke(() => ShowGitCredentialsDialog(this, url, usernameFromUrl));
         gitVm.CreateBranchRequested += async (_, repoPath) =>
         {
-            var win = new GitCreateBranchWindow();
-            await win.ShowDialog(this);
-            var name = win.BranchName;
-            if (string.IsNullOrWhiteSpace(name)) return;
-            var (success, error) = Services.GitService.CreateBranchAndCheckout(repoPath, name);
-            if (success)
-                gitVm.RefreshStatus();
-            else
-                gitVm.StatusMessage = error;
+            if (DataContext is MainViewModel m)
+                await HandleCreateBranchRequestedAsync(m, gitVm, repoPath);
         };
         if (GitChangesListBox != null)
             GitChangesListBox.SelectionChanged += GitChangesListBox_OnSelectionChanged;
+        if (GitHistoryCommitsListBox != null)
+            GitHistoryCommitsListBox.SelectionChanged += GitHistoryCommitsListBox_OnSelectionChanged;
+        if (GitCommitChangedFilesListBox != null)
+            GitCommitChangedFilesListBox.SelectionChanged += GitCommitChangedFilesListBox_OnSelectionChanged;
+        gitVm.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(GitPaneViewModel.GitPaneTabIndex))
+                gitVm.RefreshStatus();
+        };
+        gitVm.CommitMessageEmptyRequested += (_, _) => _ = ShowCommitMessageRequiredDialogAsync();
+        gitVm.CompareFileWithWorkingRequested += (_, t) =>
+        {
+            var (fullPath, sha) = t;
+            vm.OpenDocument(fullPath);
+            vm.EnterCompareWithCommit(fullPath, sha);
+            Dispatcher.UIThread.Post(RefreshDualDiffDisplay, DispatcherPriority.Loaded);
+        };
+        gitVm.HardResetToCommitRequested += async (_, sha) => await ConfirmAndHardResetAsync(vm, sha);
+        gitVm.RevertCommitRequested += async (_, sha) => await ConfirmAndRevertAsync(vm, sha);
+    }
+
+    private enum CreateBranchDirtyChoice { CarryWorkingTree, DiscardWorkingTree }
+
+    private async Task HandleCreateBranchRequestedAsync(MainViewModel vm, GitPaneViewModel gitVm, string repoPath)
+    {
+        CreateBranchDirtyChoice? dirtyChoice = null;
+        if (gitVm.Changes.Count > 0)
+        {
+            dirtyChoice = await ShowCreateBranchDirtyChoiceDialogAsync();
+            if (dirtyChoice == null) return;
+        }
+
+        if (dirtyChoice == CreateBranchDirtyChoice.DiscardWorkingTree)
+        {
+            var (okReset, errReset) = GitService.ResetWorkingTreeToHead(repoPath);
+            if (!okReset)
+            {
+                gitVm.StatusMessage = errReset;
+                await ShowSimpleAlertAsync("无法继续", errReset ?? "丢弃本地修改失败。");
+                return;
+            }
+
+            gitVm.RefreshStatus();
+        }
+
+        var win = new GitCreateBranchWindow();
+        await win.ShowDialog(this);
+        var name = win.BranchName;
+        if (string.IsNullOrWhiteSpace(name)) return;
+        var (success, error) = GitService.CreateBranchAndCheckout(repoPath, name);
+        if (success)
+        {
+            gitVm.RefreshStatus();
+            vm.RefreshExplorerFromDisk();
+        }
+        else
+            gitVm.StatusMessage = error;
+    }
+
+    private async Task<CreateBranchDirtyChoice?> ShowCreateBranchDirtyChoiceDialogAsync()
+    {
+        var dlg = new Window
+        {
+            Title = "新建分支",
+            Width = 420,
+            SizeToContent = SizeToContent.Height,
+            CanResize = false,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Icon = GetAppIcon(),
+        };
+        CreateBranchDirtyChoice? picked = null;
+        var carry = new Button { Content = "带入新分支", Margin = new Thickness(0, 0, 6, 0), MinWidth = 108 };
+        var discard = new Button { Content = "丢弃后新建", Margin = new Thickness(0, 0, 6, 0), MinWidth = 88 };
+        var cancel = new Button { Content = "取消" };
+        carry.Click += (_, _) => { picked = CreateBranchDirtyChoice.CarryWorkingTree; dlg.Close(); };
+        discard.Click += (_, _) => { picked = CreateBranchDirtyChoice.DiscardWorkingTree; dlg.Close(); };
+        cancel.Click += (_, _) => dlg.Close();
+        dlg.Content = new StackPanel
+        {
+            Margin = new Thickness(16),
+            Spacing = 12,
+            Children =
+            {
+                new TextBlock
+                {
+                    Text =
+                        "当前工作区有未提交的修改。请选择：\n\n" +
+                        "· 带入新分支：在新分支上保留这些修改（与由当前 HEAD 检出新建分支一致）。\n" +
+                        "· 丢弃后新建：先丢弃全部未提交修改，再创建并切换到新分支。\n" +
+                        "· 取消：不创建分支。",
+                    TextWrapping = TextWrapping.Wrap,
+                    MaxWidth = 388,
+                },
+                new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    HorizontalAlignment = HorizontalAlignment.Right,
+                    Children = { carry, discard, cancel },
+                },
+            },
+        };
+        await dlg.ShowDialog(this);
+        return picked;
+    }
+
+    private async Task ConfirmAndDeleteDotGitAsync(MainViewModel vm)
+    {
+        var repo = vm.GitPaneViewModel.SelectedRepository?.WorkingDirectory;
+        if (string.IsNullOrEmpty(repo) || !vm.GitPaneViewModel.SelectedRepositoryIsInitialized) return;
+        var dlg = new Window
+        {
+            Title = "删除仓库确认",
+            Width = 440,
+            SizeToContent = SizeToContent.Height,
+            CanResize = false,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Icon = GetAppIcon(),
+        };
+        var confirm = false;
+        var yes = new Button { Content = "确定删除 .git", Margin = new Thickness(0, 0, 8, 0) };
+        var no = new Button { Content = "取消" };
+        yes.Click += (_, _) => { confirm = true; dlg.Close(); };
+        no.Click += (_, _) => dlg.Close();
+        dlg.Content = new StackPanel
+        {
+            Margin = new Thickness(16),
+            Spacing = 10,
+            Children =
+            {
+                new TextBlock
+                {
+                    Text =
+                        "此操作等价于删除仓库根目录下的“.git”文件夹（或 gitdir 链接文件）：Git 的版本记录、分支、远程等元数据会一并移除。\n\n" +
+                        "工作区里的普通文档文件不会被删除；删除后本目录不再视为 Git 仓库。若无其它备份，提交历史通常无法从本应用恢复。\n\n" +
+                        "确定要继续吗？",
+                    TextWrapping = TextWrapping.Wrap,
+                    MaxWidth = 400,
+                },
+                new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    HorizontalAlignment = HorizontalAlignment.Right,
+                    Children = { yes, no },
+                },
+            },
+        };
+        await dlg.ShowDialog(this);
+        if (!confirm) return;
+        try
+        {
+            var (ok, err) = GitService.DeleteDotGit(repo);
+            if (ok)
+            {
+                vm.GitPaneViewModel.RefreshRepositories();
+                vm.RefreshExplorerFromDisk();
+                vm.GitPaneViewModel.StatusMessage = "已移除 .git；可随时使用「初始化 Git 仓库」重新创建。";
+            }
+            else
+                await ShowSimpleAlertAsync("删除失败", err ?? "操作未成功。");
+        }
+        catch (Exception ex)
+        {
+            await ShowSimpleAlertAsync("删除失败", ex.Message);
+        }
+    }
+
+    private async void GitBranchRowDeleteButton_Click(object? sender, RoutedEventArgs e)
+    {
+        e.Handled = true;
+        if (sender is not Button { DataContext: GitBranchListItem item })
+            return;
+        if (item.IsCurrent) return;
+        if (GitPaneBranchCombo != null)
+            GitPaneBranchCombo.IsDropDownOpen = false;
+        if (DataContext is not MainViewModel vm) return;
+        await ConfirmAndDeleteLocalBranchAsync(vm, item.Name);
+    }
+
+    private async Task ConfirmAndDeleteLocalBranchAsync(MainViewModel vm, string branchName)
+    {
+        var dlg = new Window
+        {
+            Title = "删除分支",
+            Width = 400,
+            SizeToContent = SizeToContent.Height,
+            CanResize = false,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Icon = GetAppIcon(),
+        };
+        var confirm = false;
+        var yes = new Button { Content = "删除", Margin = new Thickness(0, 0, 8, 0) };
+        var no = new Button { Content = "取消" };
+        yes.Click += (_, _) => { confirm = true; dlg.Close(); };
+        no.Click += (_, _) => dlg.Close();
+        dlg.Content = new StackPanel
+        {
+            Margin = new Thickness(16),
+            Spacing = 10,
+            Children =
+            {
+                new TextBlock
+                {
+                    Text =
+                        $"确定要删除本地分支「{branchName}」吗？\n\n" +
+                        "此操作仅移除该分支的本地指针；若其上的提交未被其它分支引用，可能变为不可达。未合并的分支可能被 Git 拒绝删除。",
+                    TextWrapping = TextWrapping.Wrap,
+                    MaxWidth = 360,
+                },
+                new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    HorizontalAlignment = HorizontalAlignment.Right,
+                    Children = { yes, no },
+                },
+            },
+        };
+        await dlg.ShowDialog(this);
+        if (!confirm) return;
+        var repo = vm.GitPaneViewModel.SelectedRepository?.WorkingDirectory;
+        if (string.IsNullOrEmpty(repo)) return;
+        try
+        {
+            var (ok, err) = GitService.DeleteLocalBranch(repo, branchName);
+            if (ok)
+            {
+                vm.GitPaneViewModel.RefreshStatus();
+                vm.RefreshExplorerFromDisk();
+                vm.GitPaneViewModel.StatusMessage = $"已删除本地分支「{branchName}」。";
+            }
+            else
+                await ShowSimpleAlertAsync("删除分支失败", err ?? "操作未成功。");
+        }
+        catch (Exception ex)
+        {
+            await ShowSimpleAlertAsync("删除分支失败", ex.Message);
+        }
+    }
+
+    private async void GitPaneDeleteRepositoryButton_OnClick(object? sender, RoutedEventArgs e)
+    {
+        if (DataContext is not MainViewModel vm) return;
+        await ConfirmAndDeleteDotGitAsync(vm);
+    }
+
+    private async System.Threading.Tasks.Task ConfirmAndHardResetAsync(MainViewModel vm, string commitSha)
+    {
+        var dlg = new Window
+        {
+            Title = "硬重置确认",
+            Width = 420,
+            SizeToContent = SizeToContent.Height,
+            CanResize = false,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Icon = GetAppIcon(),
+        };
+        bool confirm = false;
+        var yes = new Button { Content = "确定重置", Margin = new Thickness(0, 0, 8, 0) };
+        var no = new Button { Content = "取消" };
+        yes.Click += (_, _) => { confirm = true; dlg.Close(); };
+        no.Click += (_, _) => dlg.Close();
+        dlg.Content = new StackPanel
+        {
+            Margin = new Thickness(16),
+            Spacing = 10,
+            Children =
+            {
+                new TextBlock
+                {
+                    Text = $"将丢弃所有未提交的修改，并把分支指向提交 {commitSha.Substring(0, Math.Min(7, commitSha.Length))}，其后的本地提交记录将不再可见。\n\n若已推送过远程，需要自行 git push --force。",
+                    TextWrapping = TextWrapping.Wrap,
+                    MaxWidth = 388,
+                },
+                new StackPanel
+                {
+                    Orientation = Avalonia.Layout.Orientation.Horizontal,
+                    HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Right,
+                    Children = { yes, no },
+                },
+            },
+        };
+        await dlg.ShowDialog(this);
+        if (!confirm) return;
+        var repo = vm.GitPaneViewModel.SelectedRepository?.WorkingDirectory;
+        if (string.IsNullOrEmpty(repo)) return;
+        try
+        {
+            var (ok, err) = Services.GitService.ResetHard(repo, commitSha);
+            if (ok)
+            {
+                vm.GitPaneViewModel.RefreshStatus();
+                vm.RefreshExplorerFromDisk();
+                vm.GitPaneViewModel.StatusMessage = "已硬重置，请重新加载打开的文档。";
+                if (!string.IsNullOrEmpty(vm.CurrentFilePath))
+                    vm.OpenDocument(vm.CurrentFilePath);
+            }
+            else
+                await ShowSimpleAlertAsync("硬重置失败", err ?? "操作未成功。");
+        }
+        catch (Exception ex)
+        {
+            await ShowSimpleAlertAsync("硬重置失败", ex.Message);
+        }
+    }
+
+    private async System.Threading.Tasks.Task ConfirmAndRevertAsync(MainViewModel vm, string commitSha)
+    {
+        var repo = vm.GitPaneViewModel.SelectedRepository?.WorkingDirectory;
+        if (string.IsNullOrEmpty(repo)) return;
+        var shortSha = commitSha.Length >= 7 ? commitSha[..7] : commitSha;
+        var dlg = new Window
+        {
+            Title = "Revert 确认",
+            Width = 420,
+            SizeToContent = SizeToContent.Height,
+            CanResize = false,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Icon = GetAppIcon(),
+        };
+        var confirm = false;
+        var yes = new Button { Content = "确定 Revert", Margin = new Thickness(0, 0, 8, 0) };
+        var no = new Button { Content = "取消" };
+        yes.Click += (_, _) => { confirm = true; dlg.Close(); };
+        no.Click += (_, _) => dlg.Close();
+        dlg.Content = new StackPanel
+        {
+            Margin = new Thickness(16),
+            Spacing = 10,
+            Children =
+            {
+                new TextBlock
+                {
+                    Text =
+                        $"将针对提交 {shortSha} 创建一次新的「撤销」提交（git revert），不会抹掉已有历史记录。\n\n若工作区存在未提交修改，Revert 在合并时可能失败（例如提示未提交更改将被覆盖）；请先提交、stash 暂存或处理完本地修改后再试。",
+                    TextWrapping = TextWrapping.Wrap,
+                    MaxWidth = 388,
+                },
+                new StackPanel
+                {
+                    Orientation = Avalonia.Layout.Orientation.Horizontal,
+                    HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Right,
+                    Children = { yes, no },
+                },
+            },
+        };
+        await dlg.ShowDialog(this);
+        if (!confirm) return;
+
+        try
+        {
+            var (ok, err) = Services.GitService.RevertCommit(repo, commitSha);
+            if (ok)
+            {
+                vm.GitPaneViewModel.RefreshStatus();
+                vm.RefreshExplorerFromDisk();
+                vm.GitPaneViewModel.StatusMessage = "已创建撤销提交。";
+            }
+            else
+                await ShowSimpleAlertAsync("Revert 失败", FormatGitRevertFailureMessage(err));
+        }
+        catch (Exception ex)
+        {
+            await ShowSimpleAlertAsync("Revert 失败", FormatGitRevertFailureMessage(ex.Message));
+        }
+    }
+
+    /// <summary>将 LibGit2Sharp / Git 典型英文错误转为可读说明（含未提交被 merge 覆盖）。</summary>
+    private static string FormatGitRevertFailureMessage(string? err)
+    {
+        if (string.IsNullOrWhiteSpace(err))
+            return "操作未成功。";
+        var e = err.Trim();
+        if (e.Contains("uncommitted", StringComparison.OrdinalIgnoreCase) &&
+            (e.Contains("overwritten", StringComparison.OrdinalIgnoreCase) ||
+             e.Contains("overwrite", StringComparison.OrdinalIgnoreCase) ||
+             e.Contains("merge", StringComparison.OrdinalIgnoreCase)))
+        {
+            return "当前工作区有未提交修改，执行 Revert 时合并会覆盖这些修改，Git 已中止。\n\n请先提交、使用 stash 暂存，或处理完本地修改后再试。\n\n—— 原始信息 ——\n" + e;
+        }
+
+        return e;
+    }
+
+    private async System.Threading.Tasks.Task ShowSimpleAlertAsync(string title, string message)
+    {
+        var w = new Window
+        {
+            Title = title,
+            Width = 400,
+            MaxWidth = 480,
+            SizeToContent = SizeToContent.Height,
+            CanResize = false,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Icon = GetAppIcon(),
+        };
+        var okBtn = new Button { Content = "确定", HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Right };
+        okBtn.Click += (_, _) => w.Close();
+        w.Content = new StackPanel
+        {
+            Margin = new Thickness(16),
+            Spacing = 10,
+            Children =
+            {
+                new TextBlock { Text = message, TextWrapping = TextWrapping.Wrap, MaxWidth = 360 },
+                okBtn,
+            },
+        };
+        await w.ShowDialog(this);
+    }
+
+    private System.Threading.Tasks.Task ShowCommitMessageRequiredDialogAsync() =>
+        ShowSimpleAlertAsync("无法提交", "请填写提交说明（Commit message）后再提交。");
+
+    private void GitCommitMessageTextBox_OnGotFocus(object? sender, GotFocusEventArgs e)
+    {
+        if (DataContext is MainViewModel vm && vm.GitPaneViewModel.SelectedRepositoryIsInitialized)
+            vm.GitPaneViewModel.RefreshStatus();
+    }
+
+    private void GitHistoryCommitsListBox_OnSelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (DataContext is not MainViewModel vm) return;
+        if (e.AddedItems?.Count > 0 && e.AddedItems[0] is Models.GitCommitItem added)
+        {
+            vm.GitPaneViewModel.SelectedBranchCommit = added;
+            return;
+        }
+
+        if (e.AddedItems is { Count: 0 } && e.RemovedItems is { Count: > 0 })
+            vm.GitPaneViewModel.SelectedBranchCommit = null;
+    }
+
+    private void GitCommitChangedFilesListBox_OnSelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (DataContext is not MainViewModel vm || e.AddedItems?.Count is not 1) return;
+        if (vm.GitPaneViewModel.SuppressCommitFileCompareSelection) return;
+        if (e.AddedItems[0] is not Models.GitCommitChangedFileItem item) return;
+        vm.GitPaneViewModel.RequestCompareFileWithWorking(item);
     }
 
     private void GitChangesListBox_OnSelectionChanged(object? sender, SelectionChangedEventArgs e)
@@ -2142,45 +2981,28 @@ public partial class MainWindow : Window
         if (DataContext is not MainViewModel vm || e.AddedItems?.Count is not 1) return;
         if (e.AddedItems[0] is not Models.GitChangeItem item || string.IsNullOrEmpty(item.FullPath)) return;
         var path = item.FullPath;
-        vm.EnterCompareWithCommit(path, "HEAD");
         vm.OpenDocument(path);
+        vm.EnterCompareWithCommit(path, "HEAD");
         var retryCount = 0;
         const int maxRetries = 3;
-        void ApplyAndSetDiff()
+        void TryRefresh()
         {
-            var realContent = vm.CurrentMarkdown ?? (EditorTextBox is TextEditor e ? e.Document?.Text ?? "" : "");
-            // #region agent log
-            DebugLog.Write("A", "MainWindow.ApplyAndSetDiff.entry", "ApplyAndSetDiff", new { realLen = realContent?.Length ?? 0, retry = retryCount });
-            // #endregion
-            if (string.IsNullOrEmpty(realContent) && retryCount < maxRetries)
+            var text = vm.CurrentMarkdown ?? "";
+            if (string.IsNullOrEmpty(text) && retryCount < maxRetries)
             {
                 retryCount++;
                 var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(150 * retryCount) };
                 timer.Tick += (_, _) =>
                 {
                     timer.Stop();
-                    ApplyAndSetDiff();
+                    TryRefresh();
                 };
                 timer.Start();
                 return;
             }
-            vm.ApplyVirtualLinesForCompare(realContent);
-            var displayContent = vm.CurrentMarkdown ?? "";
-            var forceSet = EditorTextBox is TextEditor editor && editor.Document != null && displayContent.Length > 0 && editor.Document.Text != displayContent;
-            // #region agent log
-            DebugLog.Write("C", "MainWindow.ApplyAndSetDiff.afterApply", "After Apply", new { displayLen = displayContent?.Length ?? 0, hasVirtual = MarkdownEditor.Services.DiffVirtualLineHelper.ContainsVirtualLines(displayContent), forceSet });
-            // #endregion
-            if (forceSet && EditorTextBox is TextEditor ed0 && ed0.Document != null)
-                ed0.Text = displayContent;
-            var addedBrush = GetDiffBrushFromResources("DiffAddedBackground");
-            var removedBrush = GetDiffBrushFromResources("DiffRemovedBackground");
-            _editorController.SetDiffMode(() => vm.CurrentDiffLineMap, addedBrush, removedBrush);
-            if (EditorTextBox is TextEditor ed)
-            {
-                try { ed.TextArea?.TextView.Redraw(); } catch { }
-            }
+            RefreshDualDiffDisplay();
         }
-        Dispatcher.UIThread.Post(ApplyAndSetDiff, DispatcherPriority.Loaded);
+        Dispatcher.UIThread.Post(TryRefresh, DispatcherPriority.Loaded);
     }
 
     private static (string? username, string? password)? ShowGitCredentialsDialog(Window owner, string? url, string? usernameFromUrl)
@@ -2218,17 +3040,9 @@ public partial class MainWindow : Window
         win.SetCompareWithCurrentAction(() =>
         {
             win.Close();
+            vm.OpenDocument(filePath);
             vm.EnterCompareWithCommit(filePath, commit.Sha);
-            var realContent = vm.CurrentMarkdown ?? (EditorTextBox is TextEditor ed ? ed.Document?.Text ?? "" : "");
-            vm.ApplyVirtualLinesForCompare(realContent);
-            var displayContent = vm.CurrentMarkdown ?? "";
-            if (EditorTextBox is TextEditor editor && editor.Document != null && displayContent.Length > 0 && editor.Document.Text != displayContent)
-                editor.Text = displayContent;
-            var addedBrush = GetDiffBrushFromResources("DiffAddedBackground");
-            var removedBrush = GetDiffBrushFromResources("DiffRemovedBackground");
-            _editorController.SetDiffMode(() => vm.CurrentDiffLineMap, addedBrush, removedBrush);
-            if (EditorTextBox is TextEditor ed2)
-            { try { ed2.TextArea?.TextView.Redraw(); } catch { } }
+            Dispatcher.UIThread.Post(RefreshDualDiffDisplay, DispatcherPriority.Loaded);
         });
         _ = win.ShowDialog(this);
     }
@@ -2268,8 +3082,8 @@ public partial class MainWindow : Window
 
     private void ApplyLayout(EditorLayoutMode mode)
     {
-        var columns = ContentSplitGrid.ColumnDefinitions;
-        if (columns.Count < 3) return;
+        var columns = EditorPreviewSplitGrid?.ColumnDefinitions;
+        if (columns == null || columns.Count < 3) return;
 
         // 从配置中读取编辑区宽度比例，用于 Both 布局时保持上次分栏比例
         double editorRatio = 0.5;

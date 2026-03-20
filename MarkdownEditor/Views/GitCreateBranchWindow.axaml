@@ -2,24 +2,47 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         x:Class="MarkdownEditor.Views.GitCreateBranchWindow"
         Title="新建分支"
-        Width="320"
-        Height="140"
-        MinWidth="280"
+        Width="400"
+        MinWidth="320"
+        SizeToContent="Height"
+        MaxHeight="480"
+        CanResize="False"
         WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False"
         Background="{DynamicResource ContentBackground}">
-  <Grid RowDefinitions="Auto,Auto,Auto" Margin="16">
-    <TextBlock Text="输入新分支名称（建议小写、无空格）："
+  <Grid Margin="20,18" RowDefinitions="Auto,Auto,Auto,Auto,Auto">
+    <TextBlock Grid.Row="0"
+               Text="新建分支"
+               FontSize="14"
+               FontWeight="SemiBold"
+               Foreground="{DynamicResource EditorForeground}"
+               Margin="0,0,0,10"/>
+    <TextBlock Grid.Row="1"
+               Text="请输入新分支名称（建议小写，可用连字符代替空格）。"
                FontSize="11"
                Foreground="{DynamicResource EditorForeground}"
-               Margin="0,0,0,8"/>
+               TextWrapping="Wrap"
+               Opacity="0.9"
+               Margin="0,0,0,12"/>
+    <TextBlock Grid.Row="2"
+               Text="分支名称"
+               FontSize="11"
+               Foreground="{DynamicResource EditorForeground}"
+               Opacity="0.85"
+               Margin="0,0,0,6"/>
     <TextBox x:Name="BranchNameBox"
-             Watermark="例如：feature-notes"
+             Grid.Row="3"
+             Watermark="例如：dev、feature-notes"
              FontSize="12"
-             Padding="6,4"
-             Margin="0,0,0,12"/>
-    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
-      <Button x:Name="OkButton" Content="确定" MinWidth="72" Padding="10,4"/>
-      <Button x:Name="CancelButton" Content="取消" MinWidth="72" Padding="10,4"/>
+             Padding="8,6"
+             MinHeight="36"
+             Margin="0,0,0,20"/>
+    <StackPanel Grid.Row="4"
+                Orientation="Horizontal"
+                HorizontalAlignment="Right"
+                Spacing="10">
+      <Button x:Name="OkButton" Content="确定" MinWidth="88" Padding="12,6"/>
+      <Button x:Name="CancelButton" Content="取消" MinWidth="88" Padding="12,6"/>
     </StackPanel>
   </Grid>
 </Window>

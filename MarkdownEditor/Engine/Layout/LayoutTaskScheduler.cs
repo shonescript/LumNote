@@ -1,5 +1,4 @@
 using System;
-using System.Diagnostics;
 using System.Threading.Tasks;
 using MarkdownEditor.Engine;
 using MarkdownEditor.Engine.Document;
@@ -97,10 +96,6 @@ public sealed class LayoutTaskScheduler
             _version++;
             myVersion = _version;
         }
-        Debug.WriteLine(
-            $"[Layout] LayoutTaskScheduler.EnqueueLayoutFromBlocks version={myVersion} blocks={blocks.Count}"
-        );
-
         _ = Task.Run(() =>
             {
                 try
@@ -119,9 +114,6 @@ public sealed class LayoutTaskScheduler
                             layoutEngine,
                             config,
                             previousCum
-                        );
-                        Debug.WriteLine(
-                            $"[Layout] ComputeSlim blocks={blocks.Count} visible={snapshot.Blocks.Count}"
                         );
                     }
                     else
