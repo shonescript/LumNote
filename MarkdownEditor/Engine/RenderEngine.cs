@@ -35,6 +35,8 @@ public sealed class RenderEngine
     /// <summary>当前增量布局窗口 [Start, End)，用于判断是否需重新构建 _cachedLayouts。</summary>
     private (int start, int end) _layoutWindow = (-1, -1);
 
+    private ViewportTileRasterCache? _tileCache;
+
     public RenderEngine(float width, EngineConfig? config = null, IImageLoader? imageLoader = null, ILayoutEngine? layout = null, SkiaRenderer? renderer = null)
     {
         _width = Math.Max(1, width);
@@ -63,7 +65,8 @@ public sealed class RenderEngine
         _cachedContentWidth = 0;
         _layoutWindow = (-1, -1);
         _cumulativeY = [];
-        _renderer.InvalidateBlockPictureCache();
+        _renderer.PruneBlockPictureCacheBeyondBlockCount(normalizedBlocks.Count);
+        _tileCache?.Clear();
     }
 
     /// <summary>
@@ -85,14 +88,31 @@ public sealed class RenderEngine
         _cachedTotalHeight = snapshot.TotalHeight;
         _cachedContentWidth = snapshot.ContentWidth;
         _layoutWindow = snapshot.LayoutWindow;
-        _renderer.InvalidateBlockPictureCache();
+
+        var newCum = _cumulativeY;
+        var (ws, we) = snapshot.LayoutWindow;
+        if (ws < 0 || we <= ws)
+        {
+            _renderer.InvalidateBlockPictureCache();
+            _tileCache?.Clear();
+        }
+        else
+        {
+            _renderer.InvalidateBlockPictureCacheRange(ws, we);
+            if (_tileCache != null && newCum != null && newCum.Length >= 2)
+                _tileCache.InvalidateDocumentBlockRange(newCum, ws, we);
+        }
     }
 
     /// <summary>获取当前使用的图片加载器，可用于订阅 ImageLoaded 以在图片加载完成后重绘。</summary>
     public IImageLoader? GetImageLoader() => _imageLoader;
 
-    /// <summary>丢弃 Skia 块级录制缓存（布局变更或异步图片就绪时应调用）。</summary>
-    public void InvalidateBlockPictureCache() => _renderer.InvalidateBlockPictureCache();
+    /// <summary>丢弃 Skia 块级录制缓存与视口瓦片缓存（布局变更或异步图片就绪时应调用）。</summary>
+    public void InvalidateBlockPictureCache()
+    {
+        _renderer.InvalidateBlockPictureCache();
+        _tileCache?.Clear();
+    }
 
     /// <summary>获取累积高度数组的副本，供布局任务复用以保持 cum 一致性。若尚未布局则返回 null。</summary>
     internal float[]? GetCumulativeYSnapshot()
@@ -125,6 +145,7 @@ public sealed class RenderEngine
             _cumulativeY = [];
             _cachedTotalHeight = 0;
             _renderer.InvalidateBlockPictureCache();
+            _tileCache?.Clear();
         }
     }
 
@@ -243,6 +264,35 @@ public sealed class RenderEngine
         count = Math.Min(count, layouts.Count - startBlock);
         if (count > 0)
             nextScrollY = layouts[startBlock + count - 1].Bounds.Bottom;
+
+        bool tryTiles =
+            !fullBlocksOnly
+            && _config.EnableViewportTileCache
+            && _layoutWindow.start < 0
+            && (selection == null || selection.Value.IsEmpty);
+
+        if (tryTiles)
+        {
+            var tileCache = _tileCache ??= new ViewportTileRasterCache();
+            tileCache.Configure(_config.ViewportTileHeightPx, _config.ViewportTileCacheMaxEntries);
+            uint bg = _config.PageBackground;
+            var bgColor = new SKColor((byte)(bg >> 16), (byte)(bg >> 8), (byte)bg, (byte)(bg >> 24));
+            ctx.Canvas.Save();
+            ctx.Canvas.Translate(0, -scrollY);
+            bool tiledOk = tileCache.TryRenderTiled(
+                ctx.Canvas,
+                _renderer,
+                layouts,
+                scrollY,
+                viewportHeight,
+                _width,
+                _cachedContentWidth,
+                bgColor,
+                ctx.Scale);
+            ctx.Canvas.Restore();
+            if (tiledOk)
+                return;
+        }
 
         ctx.Canvas.Save();
         ctx.Canvas.Translate(0, -scrollY);

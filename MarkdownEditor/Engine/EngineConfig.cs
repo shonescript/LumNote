@@ -90,7 +90,19 @@ public sealed class EngineConfig
     /// <summary>
     /// 为 true 时，无选区且开启块级 SKPicture 缓存：静止预览可减少重复文本绘制指令（图片异步加载后需配合 InvalidateBlockPictureCache）。
     /// </summary>
-    public bool EnableBlockPictureCache { get; set; }
+    public bool EnableBlockPictureCache { get; set; } = true;
+
+    /// <summary>
+    /// 为 true 且当前为全量布局（非 ComputeSlim 窗口）时，按文档纵轴栅格化为 SKImage 瓦片并 LRU 缓存，减轻大文档重复滚动时的 CPU 绘制。
+    /// 与块级 SKPicture 二选一即可；默认关闭以免双倍内存。
+    /// </summary>
+    public bool EnableViewportTileCache { get; set; }
+
+    /// <summary>视口瓦片高度（文档坐标，像素）。仅 <see cref="EnableViewportTileCache"/> 为 true 时有效。</summary>
+    public int ViewportTileHeightPx { get; set; } = 512;
+
+    /// <summary>瓦片 LRU 最大条数。</summary>
+    public int ViewportTileCacheMaxEntries { get; set; } = 64;
 
     /// <summary>返回将 ZoomLevel 应用到所有像素尺寸后的新配置，ZoomLevel 置为 1。用于传入布局/渲染引擎。</summary>
     public EngineConfig WithZoomApplied()
@@ -134,7 +146,10 @@ public sealed class EngineConfig
             SelectionColor = SelectionColor,
             ImagePlaceholderColor = ImagePlaceholderColor,
             LinkColor = LinkColor,
-            EnableBlockPictureCache = EnableBlockPictureCache
+            EnableBlockPictureCache = EnableBlockPictureCache,
+            EnableViewportTileCache = EnableViewportTileCache,
+            ViewportTileHeightPx = ViewportTileHeightPx,
+            ViewportTileCacheMaxEntries = ViewportTileCacheMaxEntries
         };
     }
 

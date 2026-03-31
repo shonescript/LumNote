@@ -3,6 +3,7 @@ using MarkdownEditor.Engine.Document;
 using MarkdownEditor.Engine.Layout;
 using MarkdownEditor.Latex;
 using SkiaSharp;
+using System;
 using System.Collections.Generic;
 using System.IO;
 
@@ -97,16 +98,83 @@ public sealed class SkiaRenderer : ITextMeasurer
         _blockPictureCache.Clear();
     }
 
+    /// <summary>移除指定文档块索引区间 [startInclusive, endExclusive) 的块图缓存条目。</summary>
+    public void InvalidateBlockPictureCacheRange(int startInclusive, int endExclusive)
+    {
+        if (_blockPictureCache == null || startInclusive >= endExclusive)
+            return;
+        for (int k = startInclusive; k < endExclusive; k++)
+        {
+            if (_blockPictureCache.TryGetValue(k, out var prev))
+            {
+                prev.Pic.Dispose();
+                _blockPictureCache.Remove(k);
+            }
+        }
+    }
+
+    /// <summary>块数量变化时移除无效键（如文档变短后避免孤儿条目占内存）。</summary>
+    public void PruneBlockPictureCacheBeyondBlockCount(int blockCount)
+    {
+        if (_blockPictureCache == null || blockCount <= 0)
+            return;
+        var toRemove = new List<int>();
+        foreach (var key in _blockPictureCache.Keys)
+        {
+            if (key < 0 || key >= blockCount)
+                toRemove.Add(key);
+        }
+        foreach (var k in toRemove)
+        {
+            _blockPictureCache[k].Pic.Dispose();
+            _blockPictureCache.Remove(k);
+        }
+    }
+
+    /// <summary>块内文本与结构指纹，用于 SKPicture 签名及瓦片失效判断。</summary>
+    public static int ComputeBlockLayoutContentHash(LayoutBlock block)
+    {
+        var hc = new HashCode();
+        hc.Add(block.BlockIndex);
+        hc.Add((int)block.Kind);
+        hc.Add(BitConverter.SingleToInt32Bits(block.ContentWidth));
+        if (block.TableInfo is { } ti)
+        {
+            hc.Add(ti.ColCount);
+            hc.Add(ti.RowCount);
+            foreach (var w in ti.ColumnWidths)
+                hc.Add(BitConverter.SingleToInt32Bits(w));
+            foreach (var h in ti.RowHeights)
+                hc.Add(BitConverter.SingleToInt32Bits(h));
+        }
+        foreach (var line in block.Lines)
+        {
+            hc.Add(BitConverter.SingleToInt32Bits(line.Y));
+            hc.Add(BitConverter.SingleToInt32Bits(line.Height));
+            foreach (var run in line.Runs)
+            {
+                hc.Add(run.Text);
+                hc.Add((int)run.Style);
+                hc.Add(run.LinkUrl);
+                hc.Add(run.TableAlign is { } ta ? (int)ta : -1);
+                hc.Add(run.FootnoteRefId);
+            }
+        }
+        return hc.ToHashCode();
+    }
+
     private static ulong BlockPictureSignature(LayoutBlock block, float scale)
     {
         var b = block.Bounds;
+        int content = ComputeBlockLayoutContentHash(block);
         return (ulong)(uint)HashCode.Combine(
             block.BlockIndex,
             block.Kind,
             block.Lines.Count,
             BitConverter.SingleToInt32Bits(b.Width),
             BitConverter.SingleToInt32Bits(b.Height),
-            BitConverter.SingleToInt32Bits(scale));
+            BitConverter.SingleToInt32Bits(scale),
+            content);
     }
 
     /// <summary>文本是否含 \r 或 \n，用于避免无谓的 Replace 分配。</summary>
