@@ -17,6 +17,7 @@ namespace MarkdownEditor.Engine.Layout;
 /// </summary>
 public sealed class SkiaLayoutEngine : ILayoutEngine, ILayoutEnvironment
 {
+    private const string EmbeddedMathFontResourceName = "MarkdownEditor.asserts.otf.latinmodern-math.otf";
     private readonly string _bodyFontFamily;
     private readonly string _codeFontFamily;
     private readonly string _mathFontFamily;
@@ -101,7 +102,28 @@ public sealed class SkiaLayoutEngine : ILayoutEngine, ILayoutEnvironment
     {
         if (_mathTypeface != null) return _mathTypeface;
 
-        // 1) 优先：显式指定的数学字体文件
+        // 1) 优先：程序集内嵌字体资源（发布后不依赖外部路径）
+        try
+        {
+            var asm = typeof(SkiaLayoutEngine).Assembly;
+            using var stream = asm.GetManifestResourceStream(EmbeddedMathFontResourceName);
+            if (stream != null)
+            {
+                using var data = SKData.Create(stream);
+                var tfFromResource = data != null ? SKTypeface.FromData(data) : null;
+                if (tfFromResource != null)
+                {
+                    _mathTypeface = tfFromResource;
+                    return _mathTypeface;
+                }
+            }
+        }
+        catch
+        {
+            // 嵌入资源加载失败时继续后续回退
+        }
+
+        // 2) 其次：显式指定的数学字体文件
         if (!string.IsNullOrWhiteSpace(_mathFontFilePath))
         {
             try
@@ -122,7 +144,7 @@ public sealed class SkiaLayoutEngine : ILayoutEngine, ILayoutEnvironment
             }
         }
 
-        // 2) 其次：MathFontFamily 中配置的数学字体家族列表
+        // 3) 其次：MathFontFamily 中配置的数学字体家族列表
         foreach (var name in _mathFontFamily.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
         {
             try
@@ -140,7 +162,7 @@ public sealed class SkiaLayoutEngine : ILayoutEngine, ILayoutEnvironment
             }
         }
 
-        // 3) 回退到正文字体
+        // 4) 回退到正文字体
         _mathTypeface = GetBodyTypeface();
         return _mathTypeface;
     }

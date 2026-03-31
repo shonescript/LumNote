@@ -56,6 +56,19 @@
     </Content>
   </ItemGroup>
 
+  <!-- 将数学字体嵌入程序集，避免发布后依赖外部路径 -->
+  <ItemGroup>
+    <EmbeddedResource Include="asserts\otf\latinmodern-math.otf"
+                      Condition="Exists('asserts\otf\latinmodern-math.otf')"
+                      LogicalName="MarkdownEditor.asserts.otf.latinmodern-math.otf" />
+    <EmbeddedResource Include="..\_build_out\asserts\otf\latinmodern-math.otf"
+                      Condition="!Exists('asserts\otf\latinmodern-math.otf') and Exists('..\_build_out\asserts\otf\latinmodern-math.otf')"
+                      LogicalName="MarkdownEditor.asserts.otf.latinmodern-math.otf" />
+    <EmbeddedResource Include="..\_chk\asserts\otf\latinmodern-math.otf"
+                      Condition="!Exists('asserts\otf\latinmodern-math.otf') and !Exists('..\_build_out\asserts\otf\latinmodern-math.otf') and Exists('..\_chk\asserts\otf\latinmodern-math.otf')"
+                      LogicalName="MarkdownEditor.asserts.otf.latinmodern-math.otf" />
+  </ItemGroup>
+
   <!-- 将 asserts 目录打包为 Avalonia 资源，供 TreeView 使用箭头图标 -->
   <ItemGroup>
     <AvaloniaResource Include="asserts\**" />
