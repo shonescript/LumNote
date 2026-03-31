@@ -38,6 +38,7 @@ public sealed class SkiaLayoutEngine : ILayoutEngine, ILayoutEnvironment
     private readonly IImageLoader _imageLoader;
     private readonly ITextMeasurer? _tableTextMeasurer;
     private readonly SKPaint _measurePaint = new();
+    private readonly SkiaPrefixWidthCache _prefixWidthCache = new();
     private readonly IBlockLayouter[] _blockLayouters;
     private SKTypeface? _bodyTypeface;
     private SKFont? _fontCache;
@@ -1180,7 +1181,9 @@ public sealed class SkiaLayoutEngine : ILayoutEngine, ILayoutEnvironment
     private float MeasureTextForStyle(string text, RunStyle style, SKPaint paint)
     {
         ConfigurePaintForStyle(style, paint);
-        return paint.MeasureText(text);
+        var w = paint.MeasureText(text);
+        LayoutDiagnostics.OnSkiaMeasureText();
+        return w;
     }
 
     /// <summary>按 \n 切分并合并连续空行为最多 1 个空段（多换行最多显示 2 个）。</summary>
@@ -1421,27 +1424,63 @@ public sealed class SkiaLayoutEngine : ILayoutEngine, ILayoutEnvironment
         var limitPaint = Math.Max(0, maxWidth - 2f);
         if (limitPaint <= 0)
             return ("", text);
+
+        var prefixWidths = _prefixWidthCache.GetOrBuildPrefixWidths(text, style, paint, ConfigurePaintForStyle);
+        if (prefixWidths != null)
+        {
+            if (prefixWidths[text.Length] <= limitPaint)
+                return (text, "");
+            int lo = 0, hi = text.Length;
+            while (lo < hi)
+            {
+                int mid = (lo + hi + 1) >> 1;
+                if (prefixWidths[mid] <= limitPaint)
+                    lo = mid;
+                else
+                    hi = mid - 1;
+            }
+            int lastGoodP = lo;
+            if (lastGoodP == 0)
+                return (text.Substring(0, 1), text.Substring(1));
+            int lastSpaceP = -1;
+            for (int i = lastGoodP; i >= 1; i--)
+            {
+                char ch = text[i - 1];
+                if (ch == ' ' || ch == '\t')
+                {
+                    lastSpaceP = i;
+                    break;
+                }
+            }
+            int breakPosP = lastSpaceP > 0 ? lastSpaceP : lastGoodP;
+            return (text.Substring(0, breakPosP), text.Substring(breakPosP));
+        }
+
         if (paint.MeasureText(text) <= limitPaint)
+        {
+            LayoutDiagnostics.OnSkiaMeasureText();
             return (text, "");
-        int lastGoodP = 0;
-        int lastSpaceP = -1;
+        }
+        int lastGoodP2 = 0;
+        int lastSpaceP2 = -1;
         for (int i = 1; i <= text.Length; i++)
         {
             float w = paint.MeasureText(text.AsSpan(0, i));
+            LayoutDiagnostics.OnSkiaMeasureText();
             if (w <= limitPaint)
             {
-                lastGoodP = i;
+                lastGoodP2 = i;
                 char ch = text[i - 1];
                 if (ch == ' ' || ch == '\t')
-                    lastSpaceP = i;
+                    lastSpaceP2 = i;
             }
             else
                 break;
         }
-        if (lastGoodP == 0)
+        if (lastGoodP2 == 0)
             return (text.Substring(0, 1), text.Substring(1));
-        int breakPosP = lastSpaceP > 0 ? lastSpaceP : lastGoodP;
-        return (text.Substring(0, breakPosP), text.Substring(breakPosP));
+        int breakPosP2 = lastSpaceP2 > 0 ? lastSpaceP2 : lastGoodP2;
+        return (text.Substring(0, breakPosP2), text.Substring(breakPosP2));
     }
 
     private (float width, float height, float depth) MeasureMathMetrics(string latex)

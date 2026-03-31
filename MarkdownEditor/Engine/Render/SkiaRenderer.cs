@@ -3,6 +3,7 @@ using MarkdownEditor.Engine.Document;
 using MarkdownEditor.Engine.Layout;
 using MarkdownEditor.Latex;
 using SkiaSharp;
+using System.Collections.Generic;
 using System.IO;
 
 namespace MarkdownEditor.Engine.Render;
@@ -36,6 +37,8 @@ public sealed class SkiaRenderer : ITextMeasurer
     private readonly Dictionary<RunStyle, SKFont> _fontCache = new();
     private readonly IImageLoader? _imageLoader;
     private readonly IBlockPainter[] _blockPainters;
+    private readonly bool _enableBlockPictureCache;
+    private Dictionary<int, (ulong Sig, SKPicture Pic)>? _blockPictureCache;
 
     public SkiaRenderer(EngineConfig? config = null, IImageLoader? imageLoader = null)
     {
@@ -81,6 +84,29 @@ public sealed class SkiaRenderer : ITextMeasurer
         _linkColor = config.LinkColor;
         _imageLoader = imageLoader ?? new DefaultImageLoader();
         _blockPainters = BlockPainterRegistry.CreateDefault();
+        _enableBlockPictureCache = config.EnableBlockPictureCache;
+    }
+
+    /// <summary>布局或资源变化时丢弃块级录制缓存，避免陈旧位图（例如图片异步加载完成后调用）。</summary>
+    public void InvalidateBlockPictureCache()
+    {
+        if (_blockPictureCache == null)
+            return;
+        foreach (var kv in _blockPictureCache)
+            kv.Value.Pic.Dispose();
+        _blockPictureCache.Clear();
+    }
+
+    private static ulong BlockPictureSignature(LayoutBlock block, float scale)
+    {
+        var b = block.Bounds;
+        return (ulong)(uint)HashCode.Combine(
+            block.BlockIndex,
+            block.Kind,
+            block.Lines.Count,
+            BitConverter.SingleToInt32Bits(b.Width),
+            BitConverter.SingleToInt32Bits(b.Height),
+            BitConverter.SingleToInt32Bits(scale));
     }
 
     /// <summary>文本是否含 \r 或 \n，用于避免无谓的 Replace 分配。</summary>
@@ -316,39 +342,72 @@ public sealed class SkiaRenderer : ITextMeasurer
             return;
         int end = Math.Min(startIndex + count, n);
 
+        bool usePictureCache = _enableBlockPictureCache
+            && (selection == null || selection.Value.IsEmpty);
+
         for (int idx = startIndex; idx < end; idx++)
         {
             var block = blocks[idx];
             if (block == null)
                 continue;
+
+            if (usePictureCache && block.Bounds.Width > 0.5f && block.Bounds.Height > 0.5f)
+            {
+                _blockPictureCache ??= new Dictionary<int, (ulong Sig, SKPicture Pic)>();
+                ulong sig = BlockPictureSignature(block, scale);
+                SKPicture? oldPic = null;
+                if (_blockPictureCache.TryGetValue(block.BlockIndex, out var prev))
+                {
+                    if (prev.Sig == sig)
+                    {
+                        canvas.DrawPicture(prev.Pic, block.Bounds.Left, block.Bounds.Top);
+                        continue;
+                    }
+                    oldPic = prev.Pic;
+                }
+                oldPic?.Dispose();
+
+                using var recorder = new SKPictureRecorder();
+                var bounds = new SKRect(0, 0, block.Bounds.Width, block.Bounds.Height);
+                var recordCanvas = recorder.BeginRecording(bounds);
+                PaintBlockContent(recordCanvas, block, scale, selection);
+                var picture = recorder.EndRecording();
+                _blockPictureCache[block.BlockIndex] = (sig, picture);
+                canvas.DrawPicture(picture, block.Bounds.Left, block.Bounds.Top);
+                continue;
+            }
+
             canvas.Save();
             canvas.Translate(block.Bounds.Left, block.Bounds.Top);
-
-            IBlockPainter? painter = null;
-            foreach (var p in _blockPainters)
-            {
-                if (p.Matches(block.Kind))
-                {
-                    painter = p;
-                    break;
-                }
-            }
-            if (painter != null)
-            {
-                var paintCtx = new BlockPaintContext(
-                    canvas,
-                    scale,
-                    block,
-                    selection,
-                    run => DrawRun(canvas, run, scale, block),
-                    line => DrawSelectionForLine(canvas, line, block, selection),
-                    () => DrawBlockBackground(canvas, block)
-                );
-                painter.Paint(block, paintCtx);
-            }
-
+            PaintBlockContent(canvas, block, scale, selection);
             canvas.Restore();
         }
+    }
+
+    /// <summary>在块局部坐标系（原点在块左上角）下绘制单块内容与装饰。</summary>
+    private void PaintBlockContent(SKCanvas canvas, LayoutBlock block, float scale, SelectionRange? selection)
+    {
+        IBlockPainter? painter = null;
+        foreach (var p in _blockPainters)
+        {
+            if (p.Matches(block.Kind))
+            {
+                painter = p;
+                break;
+            }
+        }
+        if (painter == null)
+            return;
+
+        var paintCtx = new BlockPaintContext(
+            canvas,
+            scale,
+            block,
+            selection,
+            run => DrawRun(canvas, run, scale, block),
+            line => DrawSelectionForLine(canvas, line, block, selection),
+            () => DrawBlockBackground(canvas, block));
+        painter.Paint(block, paintCtx);
     }
 
     /// <summary>按 BlockKind 绘制块级装饰（引用条、代码背景、表格线等），供 BlockPaintContext 回调。</summary>

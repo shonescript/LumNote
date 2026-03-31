@@ -216,6 +216,7 @@ public class EngineRenderControl : Control
                 {
                     try
                     {
+                        _engine?.InvalidateBlockPictureCache();
                         InvalidateVisual();
                     }
                     catch { }

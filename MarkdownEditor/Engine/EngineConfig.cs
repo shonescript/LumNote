@@ -87,6 +87,11 @@ public sealed class EngineConfig
     public uint ImagePlaceholderColor { get; set; } = 0xFF404040;
     public uint LinkColor { get; set; } = 0xFF3794FF;
 
+    /// <summary>
+    /// 为 true 时，无选区且开启块级 SKPicture 缓存：静止预览可减少重复文本绘制指令（图片异步加载后需配合 InvalidateBlockPictureCache）。
+    /// </summary>
+    public bool EnableBlockPictureCache { get; set; }
+
     /// <summary>返回将 ZoomLevel 应用到所有像素尺寸后的新配置，ZoomLevel 置为 1。用于传入布局/渲染引擎。</summary>
     public EngineConfig WithZoomApplied()
     {
@@ -128,7 +133,8 @@ public sealed class EngineConfig
             MathBackground = MathBackground,
             SelectionColor = SelectionColor,
             ImagePlaceholderColor = ImagePlaceholderColor,
-            LinkColor = LinkColor
+            LinkColor = LinkColor,
+            EnableBlockPictureCache = EnableBlockPictureCache
         };
     }
 

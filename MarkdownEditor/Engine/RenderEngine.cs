@@ -63,7 +63,7 @@ public sealed class RenderEngine
         _cachedContentWidth = 0;
         _layoutWindow = (-1, -1);
         _cumulativeY = [];
-
+        _renderer.InvalidateBlockPictureCache();
     }
 
     /// <summary>
@@ -85,10 +85,14 @@ public sealed class RenderEngine
         _cachedTotalHeight = snapshot.TotalHeight;
         _cachedContentWidth = snapshot.ContentWidth;
         _layoutWindow = snapshot.LayoutWindow;
+        _renderer.InvalidateBlockPictureCache();
     }
 
     /// <summary>获取当前使用的图片加载器，可用于订阅 ImageLoaded 以在图片加载完成后重绘。</summary>
     public IImageLoader? GetImageLoader() => _imageLoader;
+
+    /// <summary>丢弃 Skia 块级录制缓存（布局变更或异步图片就绪时应调用）。</summary>
+    public void InvalidateBlockPictureCache() => _renderer.InvalidateBlockPictureCache();
 
     /// <summary>获取累积高度数组的副本，供布局任务复用以保持 cum 一致性。若尚未布局则返回 null。</summary>
     internal float[]? GetCumulativeYSnapshot()
@@ -120,6 +124,7 @@ public sealed class RenderEngine
             _layoutWindow = (-1, -1);
             _cumulativeY = [];
             _cachedTotalHeight = 0;
+            _renderer.InvalidateBlockPictureCache();
         }
     }
 
@@ -254,65 +259,119 @@ public sealed class RenderEngine
         if (_cachedLayouts == null)
             return null;
 
-        foreach (var layoutBlock in _cachedLayouts)
+        var cum = _cumulativeY;
+        if (cum == null || cum.Length < 2)
+            return null;
+
+        int blockCount = cum.Length - 1;
+        int bi = FindBlockIndexForContentY(cum, blockCount, contentY);
+        if (bi < 0)
+            return null;
+
+        LayoutBlock? layoutBlock = null;
+        foreach (var lb in _cachedLayouts)
         {
-            if (contentY < layoutBlock.Bounds.Top || contentY >= layoutBlock.Bounds.Bottom)
-                continue;
-
-            var localX = contentX - layoutBlock.Bounds.Left;
-
-            for (int lineIdx = 0; lineIdx < layoutBlock.Lines.Count; lineIdx++)
+            if (lb.BlockIndex == bi)
             {
-                var layoutLine = layoutBlock.Lines[lineIdx];
-                var lineTop = layoutBlock.Bounds.Top + layoutLine.Y;
-                var lineBottom = lineTop + layoutLine.Height;
-                if (contentY < lineTop || contentY >= lineBottom)
-                    continue;
-
-                var runs = layoutLine.Runs;
-                if (runs.Count == 0)
-                    return (layoutBlock.BlockIndex, 0, false, null, lineIdx);
-
-                LayoutRun? bestRun = null;
-                float bestDist = float.MaxValue;
-                int offsetInRun = 0;
-                for (int i = 0; i < runs.Count; i++)
-                {
-                    var run = runs[i];
-                    if (run.Text.Length == 0) continue;
-                    if (localX >= run.Bounds.Left && localX < run.Bounds.Right)
-                    {
-                        float textLeft = run.Style is RunStyle.TableHeaderCell or RunStyle.TableCell
-                            ? run.Bounds.Left + 8f
-                            : run.Bounds.Left;
-                        float xInRun = Math.Max(0, localX - textLeft);
-                        offsetInRun = _layout.MeasureTextOffset(run.Text, xInRun, run.Style);
-                        return (layoutBlock.BlockIndex, run.CharOffset + offsetInRun, true, run.LinkUrl, lineIdx);
-                    }
-                    var distLeft = run.Bounds.Left - localX;
-                    var distRight = localX - run.Bounds.Right;
-                    if (localX < run.Bounds.Left && distLeft < bestDist)
-                    {
-                        bestDist = Math.Abs(distLeft);
-                        bestRun = run;
-                        offsetInRun = 0;
-                    }
-                    else if (localX >= run.Bounds.Right && distRight < bestDist)
-                    {
-                        bestDist = Math.Abs(distRight);
-                        bestRun = run;
-                        offsetInRun = run.Text.Length;
-                    }
-                }
-                // 落在行尾/行首空白时按最近 run 取字符位置以便拖选，但不携带 LinkUrl：
-                // 否则箭头右侧整段空白会继承 footnote-back 的链接，表现为手型却无跳转或误走 TryOpenLink。
-                if (bestRun != null)
-                    return (layoutBlock.BlockIndex, bestRun.Value.CharOffset + offsetInRun, true, null, lineIdx);
-                return (layoutBlock.BlockIndex, runs[0].CharOffset, runs[0].Text.Length > 0, null, lineIdx);
+                layoutBlock = lb;
+                break;
             }
         }
+        if (layoutBlock == null)
+            return null;
 
-        return null;
+        if (contentY < layoutBlock.Bounds.Top || contentY >= layoutBlock.Bounds.Bottom)
+            return null;
+
+        var localX = contentX - layoutBlock.Bounds.Left;
+        int lineIdx = FindLineIndexForContentY(layoutBlock, contentY);
+        if (lineIdx < 0)
+            return null;
+
+        var layoutLine = layoutBlock.Lines[lineIdx];
+        var runs = layoutLine.Runs;
+        if (runs.Count == 0)
+            return (layoutBlock.BlockIndex, 0, false, null, lineIdx);
+
+        LayoutRun? bestRun = null;
+        float bestDist = float.MaxValue;
+        int offsetInRun = 0;
+        for (int i = 0; i < runs.Count; i++)
+        {
+            var run = runs[i];
+            if (run.Text.Length == 0) continue;
+            if (localX >= run.Bounds.Left && localX < run.Bounds.Right)
+            {
+                float textLeft = run.Style is RunStyle.TableHeaderCell or RunStyle.TableCell
+                    ? run.Bounds.Left + 8f
+                    : run.Bounds.Left;
+                float xInRun = Math.Max(0, localX - textLeft);
+                offsetInRun = _layout.MeasureTextOffset(run.Text, xInRun, run.Style);
+                return (layoutBlock.BlockIndex, run.CharOffset + offsetInRun, true, run.LinkUrl, lineIdx);
+            }
+            var distLeft = run.Bounds.Left - localX;
+            var distRight = localX - run.Bounds.Right;
+            if (localX < run.Bounds.Left && distLeft < bestDist)
+            {
+                bestDist = Math.Abs(distLeft);
+                bestRun = run;
+                offsetInRun = 0;
+            }
+            else if (localX >= run.Bounds.Right && distRight < bestDist)
+            {
+                bestDist = Math.Abs(distRight);
+                bestRun = run;
+                offsetInRun = run.Text.Length;
+            }
+        }
+        if (bestRun != null)
+            return (layoutBlock.BlockIndex, bestRun.Value.CharOffset + offsetInRun, true, null, lineIdx);
+        return (layoutBlock.BlockIndex, runs[0].CharOffset, runs[0].Text.Length > 0, null, lineIdx);
+    }
+
+    /// <summary>文档 Y 落在哪一块：cum[i] 为块 i 顶部，块区间为 [cum[i], cum[i+1])。</summary>
+    private static int FindBlockIndexForContentY(float[] cum, int blockCount, float contentY)
+    {
+        if (blockCount <= 0 || contentY < cum[0] || contentY >= cum[blockCount])
+            return -1;
+
+        int lo = 0, hi = blockCount - 1;
+        while (lo < hi)
+        {
+            int mid = (lo + hi + 1) >> 1;
+            if (cum[mid] <= contentY)
+                lo = mid;
+            else
+                hi = mid - 1;
+        }
+        if (contentY >= cum[lo + 1])
+            return -1;
+        return lo;
+    }
+
+    /// <summary>在块内按行 Y 二分，找到包含 contentY 的行索引。</summary>
+    private static int FindLineIndexForContentY(LayoutBlock layoutBlock, float contentY)
+    {
+        var lines = layoutBlock.Lines;
+        if (lines.Count == 0)
+            return -1;
+
+        int lo = 0, hi = lines.Count - 1;
+        while (lo < hi)
+        {
+            int mid = (lo + hi + 1) >> 1;
+            float lineTop = layoutBlock.Bounds.Top + lines[mid].Y;
+            if (lineTop <= contentY)
+                lo = mid;
+            else
+                hi = mid - 1;
+        }
+
+        float t = layoutBlock.Bounds.Top + lines[lo].Y;
+        float b = t + lines[lo].Height;
+        if (contentY >= t && contentY < b)
+            return lo;
+        return -1;
     }
 
     /// <summary>

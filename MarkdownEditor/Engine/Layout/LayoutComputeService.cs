@@ -189,8 +189,12 @@ public static class LayoutComputeService
             visibleEnd = Math.Max(1, blocks.Count);
         }
 
-        // 第二遍：仅对可见块做完整 Layout，并更新 cum 为真实高度
-        var layoutBlocks = new List<LayoutBlock>(visibleEnd - visibleStart);
+        // 第二遍：仅对可见块做完整 Layout；块高写入 heights[] 后一次前缀和重建 cum，避免每块 O(n) 尾部修正。
+        var heights = new float[blocks.Count];
+        for (int i = 0; i < blocks.Count; i++)
+            heights[i] = cum[i + 1] - cum[i];
+
+        var layoutPairs = new List<(int Index, LayoutBlock Block)>(visibleEnd - visibleStart);
         for (int i = visibleStart; i < visibleEnd; i++)
         {
             var ast = blocks[i];
@@ -199,15 +203,21 @@ public static class LayoutComputeService
 
             var (startLine, endLine) = i < ranges.Count ? ranges[i] : (0, 0);
             var lb = layoutEngine.Layout(ast, contentWidth, i, startLine, endLine);
-            float h = lb.Bounds.Height;
+            heights[i] = lb.Bounds.Height;
+            layoutPairs.Add((i, lb));
+        }
 
-            // 用真实高度更新 cum（仅影响可见块区间，前后用估计值保持一致性）
-            float prevCum = i > 0 ? cum[i] : 0;
-            float delta = h - (cum[i + 1] - cum[i]);
-            for (int j = i + 1; j <= blocks.Count; j++)
-                cum[j] += delta;
+        cum[0] = 0;
+        for (int i = 0; i < blocks.Count; i++)
+            cum[i + 1] = cum[i] + heights[i];
+        LayoutDiagnostics.OnComputeSlimCumulativePass();
 
-            lb.SetGlobalBounds(blockIndent, prevCum, width, prevCum + h);
+        var layoutBlocks = new List<LayoutBlock>(layoutPairs.Count);
+        foreach (var (i, lb) in layoutPairs)
+        {
+            float y0 = cum[i];
+            float h = heights[i];
+            lb.SetGlobalBounds(blockIndent, y0, width, y0 + h);
             layoutBlocks.Add(lb);
 
             if (lb.Lines != null)
