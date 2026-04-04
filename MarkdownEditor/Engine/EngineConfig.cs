@@ -87,6 +87,15 @@ public sealed class EngineConfig
     public uint ImagePlaceholderColor { get; set; } = 0xFF404040;
     public uint LinkColor { get; set; } = 0xFF3794FF;
 
+    /// <summary>Markdown 嵌入图预览解码时最长边像素上限（与视口推算值取 min）。</summary>
+    public int ImagePreviewMaxLongEdgeCap { get; set; } = 2048;
+
+    /// <summary>预览最长边 ≈ 内容区宽度(dip) × 渲染缩放 × 本系数，再与 <see cref="ImagePreviewMaxLongEdgeCap"/> 取 min。</summary>
+    public float ImagePreviewViewportScale { get; set; } = 1.35f;
+
+    /// <summary>预览位图 LRU 最大张数（每张为缩小解码，仍占用内存）。</summary>
+    public int ImagePreviewCacheMaxEntries { get; set; } = 28;
+
     /// <summary>
     /// 为 true 时，无选区且开启块级 SKPicture 缓存：静止预览可减少重复文本绘制指令（图片异步加载后需配合 InvalidateBlockPictureCache）。
     /// </summary>
@@ -146,6 +155,9 @@ public sealed class EngineConfig
             SelectionColor = SelectionColor,
             ImagePlaceholderColor = ImagePlaceholderColor,
             LinkColor = LinkColor,
+            ImagePreviewMaxLongEdgeCap = ImagePreviewMaxLongEdgeCap,
+            ImagePreviewViewportScale = ImagePreviewViewportScale,
+            ImagePreviewCacheMaxEntries = ImagePreviewCacheMaxEntries,
             EnableBlockPictureCache = EnableBlockPictureCache,
             EnableViewportTileCache = EnableViewportTileCache,
             ViewportTileHeightPx = ViewportTileHeightPx,

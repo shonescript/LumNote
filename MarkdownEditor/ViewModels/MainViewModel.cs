@@ -1610,13 +1610,17 @@ public sealed partial class MainViewModel : ViewModelBase
                     foreach (var file in Directory.EnumerateFiles(path, pattern, SearchOption.TopDirectoryOnly))
                     {
                         var fullPath = Path.GetFullPath(file);
-                        if (_documents.Any(d => string.Equals(d.FullPath, fullPath, StringComparison.OrdinalIgnoreCase)))
-                            continue;
-                        var rel = root != null ? Path.GetRelativePath(root, fullPath) : Path.GetFileName(fullPath);
-                        var doc = new DocumentItem(fullPath, rel) { WorkspaceRoot = root };
-                        _documents.Add(doc);
+                        // 根目录文件可能已由 RescanWorkspaceDocuments 加入 _documents，但仍必须在树中创建节点，不可整段 continue。
+                        if (!_documents.Any(d => string.Equals(d.FullPath, fullPath, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            var rel = root != null ? Path.GetRelativePath(root, fullPath) : Path.GetFileName(fullPath);
+                            var doc = new DocumentItem(fullPath, rel) { WorkspaceRoot = root };
+                            _documents.Add(doc);
+                        }
                         var fileName = Path.GetFileName(fullPath);
                         if (string.IsNullOrEmpty(fileName)) continue;
+                        if (folderNode.Children.Any(c => !c.IsFolder && string.Equals(c.FullPath, fullPath, StringComparison.OrdinalIgnoreCase)))
+                            continue;
                         var fileNode = new FileTreeNode(fileName, fullPath, false);
                         fileNode.Level = folderNode.Level + 1;
                         folderNode.Children.Add(fileNode);

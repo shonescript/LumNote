@@ -30,7 +30,12 @@ public sealed class LongImageExporter : IMarkdownExporter
             if (width < 100) width = (int)DefaultWidth;
 
             var config = EngineConfig.FromStyle(options?.StyleConfig) ?? new EngineConfig();
-            var imageLoader = new BasePathImageLoader(documentBasePath ?? "");
+            var imageLoader = new BasePathImageLoader(
+                documentBasePath ?? "",
+                Math.Clamp(config.ImagePreviewCacheMaxEntries, 4, 256));
+            var exportBudget = (int)
+                Math.Clamp(Math.Ceiling(width * 2f), 256, Math.Max(256, config.ImagePreviewMaxLongEdgeCap));
+            imageLoader.ConfigurePreviewDecode(exportBudget, false);
             var doc = new StringDocumentSource(markdown ?? "");
             var engine = new RenderEngine(width, config, imageLoader);
             engine.EnsureFullLayout(doc);

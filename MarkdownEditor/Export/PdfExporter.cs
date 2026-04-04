@@ -28,7 +28,15 @@ public sealed class PdfExporter : IMarkdownExporter
         try
         {
             var config = EngineConfig.FromStyle(options?.StyleConfig) ?? new EngineConfig();
-            var imageLoader = new BasePathImageLoader(documentBasePath ?? "");
+            var imageLoader = new BasePathImageLoader(
+                documentBasePath ?? "",
+                Math.Clamp(config.ImagePreviewCacheMaxEntries, 4, 256));
+            var exportBudget = (int)
+                Math.Clamp(
+                    Math.Ceiling(PageWidthPt * Math.Max(1f, config.ImagePreviewViewportScale)),
+                    256,
+                    Math.Max(256, config.ImagePreviewMaxLongEdgeCap));
+            imageLoader.ConfigurePreviewDecode(exportBudget, false);
             var doc = new StringDocumentSource(markdown ?? "");
             var engine = new RenderEngine(PageWidthPt, config, imageLoader);
             engine.EnsureFullLayout(doc);

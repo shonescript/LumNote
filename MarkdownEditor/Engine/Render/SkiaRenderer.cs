@@ -733,17 +733,20 @@ public sealed class SkiaRenderer : ITextMeasurer
         var url = run.LinkUrl;
         var alt = run.Text;
         var rect = run.Bounds;
-        var bmp = url != null && _imageLoader != null ? _imageLoader.TryGetImage(url) : null;
-
-        // 勿用 bmp.IsEmpty：Skia 文档说明 IsEmpty 在尺寸非零时仍可能为 true；字节解码的图更易中招。
-        if (bmp != null && bmp.Width > 0 && bmp.Height > 0)
+        if (string.IsNullOrEmpty(url) || _imageLoader == null)
         {
-            var srcRect = new SKRectI(0, 0, bmp.Width, bmp.Height);
-            // 按本身尺寸/宽高比绘制，不拉伸；若分配区域小于图片则等比缩小放入
-            float destW = rect.Width;
-            float destH = rect.Height;
-            if (bmp.Width > 0 && bmp.Height > 0)
+            DrawImagePlaceholder(canvas, rect, alt);
+            return;
+        }
+
+        // 在 WithImage 锁内绘制：缓存中为缩小后的预览图，不再每帧 Copy，降低内存峰值。
+        _imageLoader.WithImage(url, bmp =>
+        {
+            if (bmp != null && bmp.Width > 0 && bmp.Height > 0)
             {
+                var srcRect = new SKRectI(0, 0, bmp.Width, bmp.Height);
+                float destW = rect.Width;
+                float destH = rect.Height;
                 var scale = Math.Min(rect.Width / bmp.Width, rect.Height / bmp.Height);
                 if (scale < 1f)
                 {
@@ -755,23 +758,26 @@ public sealed class SkiaRenderer : ITextMeasurer
                     destW = bmp.Width;
                     destH = bmp.Height;
                 }
+                var destRect = new SKRect(rect.Left, rect.Top, rect.Left + destW, rect.Top + destH);
+                canvas.DrawBitmap(bmp, srcRect, destRect);
             }
-            var destRect = new SKRect(rect.Left, rect.Top, rect.Left + destW, rect.Top + destH);
-            canvas.DrawBitmap(bmp, srcRect, destRect);
-        }
-        else
-        {
-            canvas.DrawRect(rect, _imagePlaceholderPaint);
-            _textPaint.TextSize = _baseFontSize * 0.9f;
-            var altDraw = GetDrawableText(string.IsNullOrEmpty(alt) ? "[图]" : alt);
-            canvas.DrawText(
-                altDraw,
-                rect.Left + 4,
-                rect.Bottom - 6,
-                GetFont(RunStyle.Normal),
-                _textPaint
-            );
-        }
+            else
+                DrawImagePlaceholder(canvas, rect, alt);
+        });
+    }
+
+    private void DrawImagePlaceholder(SKCanvas canvas, SKRect rect, string? alt)
+    {
+        canvas.DrawRect(rect, _imagePlaceholderPaint);
+        _textPaint.TextSize = _baseFontSize * 0.9f;
+        var altDraw = GetDrawableText(string.IsNullOrEmpty(alt) ? "[图]" : alt);
+        canvas.DrawText(
+            altDraw,
+            rect.Left + 4,
+            rect.Bottom - 6,
+            GetFont(RunStyle.Normal),
+            _textPaint
+        );
     }
 
     private void DrawMathRun(SKCanvas canvas, LayoutRun run)

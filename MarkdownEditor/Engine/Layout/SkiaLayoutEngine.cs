@@ -512,11 +512,15 @@ public sealed class SkiaLayoutEngine : ILayoutEngine, ILayoutEnvironment
     private (float w, float h) GetImageIntrinsicSize(string url, float maxWidth)
     {
         var contentWidth = Math.Max(80f, maxWidth);
-        var bmp = _imageLoader.TryGetImage(url);
-        if (bmp != null && bmp.Width > 0 && bmp.Height > 0)
+        var fallbackH = _baseFontSize * 6f;
+        if (
+            _imageLoader.TryGetImagePixelSize(url, out var iw, out var ih)
+            && iw > 0
+            && ih > 0
+        )
         {
-            float w = bmp.Width;
-            float h = bmp.Height;
+            float w = iw;
+            float h = ih;
             if (w > contentWidth)
             {
                 var scale = contentWidth / w;
@@ -525,7 +529,7 @@ public sealed class SkiaLayoutEngine : ILayoutEngine, ILayoutEnvironment
             }
             return (w, h);
         }
-        return (contentWidth, _baseFontSize * 6f);
+        return (contentWidth, fallbackH);
     }
 
     /// <summary>

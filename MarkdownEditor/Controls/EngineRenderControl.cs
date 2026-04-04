@@ -228,7 +228,10 @@ public class EngineRenderControl : Control
         var config = EffectiveConfig;
         var w = (float)Math.Max(1, Bounds.Width - config.ContentPaddingX * 2);
         // 始终用 BasePathImageLoader：有文档目录时解析相对路径；绝对路径与网络图仍走内层 DefaultImageLoader（本地只读文件、网络才 Http）
-        var imageLoader = new BasePathImageLoader(_documentBasePath ?? "");
+        var imageLoader = new BasePathImageLoader(
+            _documentBasePath ?? "",
+            Math.Clamp(config.ImagePreviewCacheMaxEntries, 4, 256));
+        imageLoader.ConfigurePreviewDecode(ComputeImagePreviewBudget(w, config), false);
         _engine = new RenderEngine(w, config, imageLoader);
         if (_engine.GetImageLoader() is { } loader)
             loader.ImageLoaded += () =>
@@ -242,6 +245,20 @@ public class EngineRenderControl : Control
                     catch { }
                 });
         return _engine;
+    }
+
+    /// <summary>按内容区宽度与 DPI 推算嵌入图预览解码最长边，并与配置 Cap 取 min。</summary>
+    private int ComputeImagePreviewBudget(float contentWidthDip, EngineConfig cfg)
+    {
+        var scale = (float)(VisualRoot?.RenderScaling ?? 1.0);
+        var cap = Math.Max(256, cfg.ImagePreviewMaxLongEdgeCap);
+        var mult = Math.Max(0.5f, cfg.ImagePreviewViewportScale);
+        return (int)Math.Clamp(Math.Ceiling(contentWidthDip * scale * mult), 256, cap);
+    }
+
+    private void SyncImageLoaderPreviewBudget(RenderEngine engine, float contentWidthDip, EngineConfig cfg)
+    {
+        engine.GetImageLoader()?.ConfigurePreviewDecode(ComputeImagePreviewBudget(contentWidthDip, cfg), false);
     }
 
     /// <summary>请求重新解析与布局（文档或滚动变化时调用）。可由外部在文档内容变更后调用。</summary>
@@ -282,6 +299,7 @@ public class EngineRenderControl : Control
         var w = (float)
             Math.Max(1, (Bounds.Width > 0 ? Bounds.Width : 400) - config.ContentPaddingX * 2);
         engine.SetWidth(w);
+        SyncImageLoaderPreviewBudget(engine, w, config);
         var scrollY = ScrollOffset;
         // 必须用视口高度，不能用 Bounds.Height（作为 ScrollViewer 内容时 Bounds.Height=文档总高）
         var viewportH = ViewportHeight > 0 ? ViewportHeight : 800f;
@@ -423,6 +441,7 @@ public class EngineRenderControl : Control
         var w = (float)
             Math.Max(1, (Bounds.Width > 0 ? Bounds.Width : 400) - config.ContentPaddingX * 2);
         engine.SetWidth(w);
+        SyncImageLoaderPreviewBudget(engine, w, config);
         var scrollY = ScrollOffset;
         var viewportH = ViewportHeight > 0 ? ViewportHeight : 800f;
         float[]? previousCum = engine.GetCumulativeYSnapshot();
@@ -652,6 +671,24 @@ public class EngineRenderControl : Control
     private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
         { ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg" };
 
+    private static bool UrlLooksLikeImageReference(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+            return false;
+        var s = PathSanitizer.Sanitize(url);
+        if (s.Length >= 2 && s[0] == '<' && s[^1] == '>')
+            s = s[1..^1].Trim();
+        s = s.Trim('"', '\'');
+        if (s.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+            || s.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+            || (s.Length > 2 && s[0] == '/' && s[1] == '/'))
+            return true;
+        var q = s.IndexOf('?', StringComparison.Ordinal);
+        if (q >= 0)
+            s = s[..q];
+        return ImageExtensions.Contains(Path.GetExtension(s));
+    }
+
     /// <summary>解析链接：本地路径（相对当前文档或绝对）则打开文件；否则用浏览器打开。</summary>
     private void TryOpenLink(string url)
     {
@@ -834,10 +871,10 @@ public class EngineRenderControl : Control
                     : Avalonia.Input.Cursor.Default;
             bool isTodo =
                 h.linkUrl != null && h.linkUrl.StartsWith("todo-toggle:", StringComparison.Ordinal);
-            ToolTip.SetTip(
-                this,
-                isTodo ? null : (string.IsNullOrEmpty(h.linkUrl) ? null : h.linkUrl)
-            );
+            string? tip = null;
+            if (!isTodo && !string.IsNullOrEmpty(h.linkUrl))
+                tip = UrlLooksLikeImageReference(h.linkUrl) ? "单击查看原图\n" + h.linkUrl : h.linkUrl;
+            ToolTip.SetTip(this, tip);
         }
         else
         {
@@ -940,7 +977,10 @@ public class EngineRenderControl : Control
         bool widthUnchanged = Math.Abs(w - engine.GetWidth()) <= WidthTolerance;
         bool hasLayout = hBefore > cfg.ExtraBottomPadding + LayoutHeightThreshold;
         if (!hasLayout || widthUnchanged)
+        {
             engine.SetWidth(w);
+            SyncImageLoaderPreviewBudget(engine, w, cfg);
+        }
         float h = engine.MeasureTotalHeight(doc);
         if (h <= cfg.ExtraBottomPadding + LayoutHeightThreshold && hasLayout)
             h = hBefore;
@@ -1009,7 +1049,10 @@ public class EngineRenderControl : Control
             bool widthUnchanged = Math.Abs(w - _engine.GetWidth()) <= WidthTolerance;
             bool hasLayout = _engine.MeasureTotalHeight(doc) > config.ExtraBottomPadding + LayoutHeightThreshold;
             if (!hasLayout || widthUnchanged)
+            {
                 _engine.SetWidth(w);
+                SyncImageLoaderPreviewBudget(_engine, w, config);
+            }
         }
 
         var viewportHeight = (float)bounds.Height;

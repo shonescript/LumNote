@@ -8,11 +8,12 @@ namespace MarkdownEditor.Engine.Render;
 public sealed class BasePathImageLoader : IImageLoader
 {
     private readonly string _basePath;
-    private readonly DefaultImageLoader _inner = new();
+    private readonly DefaultImageLoader _inner;
 
-    public BasePathImageLoader(string basePath)
+    public BasePathImageLoader(string basePath, int maxCachedPreviewImages = 28)
     {
         _basePath = basePath ?? "";
+        _inner = new DefaultImageLoader(maxCachedPreviewImages);
     }
 
     public event Action? ImageLoaded
@@ -21,15 +22,14 @@ public sealed class BasePathImageLoader : IImageLoader
         remove => _inner.ImageLoaded -= value;
     }
 
-    public SkiaSharp.SKBitmap? TryGetImage(string url)
+    private string ResolveInnerKey(string url)
     {
-        if (string.IsNullOrEmpty(url)) return null;
         var raw = PathSanitizer.Sanitize(url);
         if (raw.Length >= 2 && raw[0] == '<' && raw[^1] == '>')
             raw = raw[1..^1].Trim();
         var resolved = raw;
         if (DefaultImageLoader.IsNetworkImageUrl(raw) || raw.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
-            return _inner.TryGetImage(resolved);
+            return resolved;
 
         if (!Path.IsPathRooted(raw) && !string.IsNullOrEmpty(_basePath))
         {
@@ -44,6 +44,35 @@ public sealed class BasePathImageLoader : IImageLoader
                 resolved = Path.GetFullPath(Path.Combine(_basePath, sep));
             }
         }
-        return _inner.TryGetImage(resolved);
+        return resolved;
     }
+
+    public SkiaSharp.SKBitmap? TryGetImage(string url)
+    {
+        if (string.IsNullOrEmpty(url))
+            return null;
+        return _inner.TryGetImage(ResolveInnerKey(url));
+    }
+
+    public void WithImage(string url, Action<SkiaSharp.SKBitmap?> action)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        if (string.IsNullOrEmpty(url))
+        {
+            action(null);
+            return;
+        }
+        _inner.WithImage(ResolveInnerKey(url), action);
+    }
+
+    public bool TryGetImagePixelSize(string url, out int width, out int height)
+    {
+        width = height = 0;
+        if (string.IsNullOrEmpty(url))
+            return false;
+        return _inner.TryGetImagePixelSize(ResolveInnerKey(url), out width, out height);
+    }
+
+    public void ConfigurePreviewDecode(int maxLongEdgePixels, bool preferFullDecode = false) =>
+        _inner.ConfigurePreviewDecode(maxLongEdgePixels, preferFullDecode);
 }
