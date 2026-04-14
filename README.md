@@ -59,4 +59,4 @@ dotnet publish MarkdownEditor\MarkdownEditor.csproj -r osx-arm64 -c Release
 ## 依赖
 
 - .NET 10
-- Avalonia 11.2
+- Avalonia 12
