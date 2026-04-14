@@ -2493,7 +2493,27 @@ public partial class MainWindow : Window
             ]
         });
         if (files.Count > 0 && files[0].TryGetLocalPath() is { } path)
-            vm.OpenDocument(path);
+            await OpenDocumentFromPickerAsync(vm, path);
+    }
+
+    /// <summary>
+    /// 通过「打开文件」对话框选中的路径：不使用关闭标签内存快照，并从磁盘刷新（含已打开的同路径标签），避免外部已改文件仍显示旧内容。
+    /// 若该文件已在标签中且有未保存修改，先询问是否丢弃后重载。
+    /// </summary>
+    private async Task OpenDocumentFromPickerAsync(MainViewModel vm, string path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return;
+        var fullPath = Path.GetFullPath(path);
+        var existing = vm.OpenDocuments.FirstOrDefault(d =>
+            !string.IsNullOrEmpty(d.FullPath) &&
+            string.Equals(Path.GetFullPath(d.FullPath), fullPath, StringComparison.OrdinalIgnoreCase));
+        if (existing != null && existing.IsModified)
+        {
+            if (!await ShowReloadDiscardUnsavedDialogAsync(existing.DisplayName))
+                return;
+        }
+
+        vm.OpenDocument(path, forceReloadFromDisk: true);
     }
 
     private async System.Threading.Tasks.Task DoOpenFolderAsync(MainViewModel vm)

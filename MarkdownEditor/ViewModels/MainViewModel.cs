@@ -567,7 +567,8 @@ public sealed partial class MainViewModel : ViewModelBase
     }
 
     /// <summary>将图片以标签页形式在右侧打开（与文档标签一起管理），不读文件内容。</summary>
-    public void OpenImageInTab(string path)
+    /// <param name="forceReloadFromDisk">为 true 且该图片已打开时，从磁盘刷新预览。</param>
+    public void OpenImageInTab(string path, bool forceReloadFromDisk = false)
     {
         if (string.IsNullOrWhiteSpace(path) || !IsPreviewableImagePath(path)) return;
         var fullPath = Path.GetFullPath(path);
@@ -575,6 +576,8 @@ public sealed partial class MainViewModel : ViewModelBase
         var opened = FindOpenDocumentByPath(fullPath);
         if (opened is not null)
         {
+            if (forceReloadFromDisk)
+                ReloadDocumentFromDisk(opened);
             ActiveDocument = opened;
             return;
         }
@@ -916,7 +919,7 @@ public sealed partial class MainViewModel : ViewModelBase
     public ICommand ZoomPreviewOutCommand => new RelayCommand(() => PreviewZoomLevel = Math.Max(0.5, PreviewZoomLevel - 0.1));
     public ICommand SaveCommand => new RelayCommand(SaveCurrent);
     public ICommand CloseDocumentCommand => new RelayCommand<DocumentItem>(CloseDocument);
-    public ICommand OpenRecentDocumentCommand => new RelayCommand<string>(OpenDocument);
+    public ICommand OpenRecentDocumentCommand => new RelayCommand<string>(p => OpenDocument(p));
     /// <summary>侧栏搜索结果点击某条时由视图绑定，设置 SelectedSearchResult 以便视图跳转。</summary>
     public ICommand NavigateToSearchResultCommand => new RelayCommand<SearchResultItem>(item =>
     {
@@ -1914,15 +1917,16 @@ public sealed partial class MainViewModel : ViewModelBase
     }
 
     /// <summary>打开并激活指定路径的文档（供视图导航等调用）。</summary>
-    public void OpenDocument(string? path)
+    /// <param name="forceReloadFromDisk">为 true 时不使用关闭标签缓存，并从磁盘刷新已打开内容（用于「打开文件」对话框等）。</param>
+    public void OpenDocument(string? path, bool forceReloadFromDisk = false)
     {
         if (string.IsNullOrWhiteSpace(path)) return;
         if (IsPreviewableImagePath(path))
         {
-            OpenImageInTab(path);
+            OpenImageInTab(path, forceReloadFromDisk);
             return;
         }
-        LoadDocument(path);
+        LoadDocument(path, forceReloadFromDisk);
     }
 
     /// <summary>与指定 Git 提交比对：进入双栏只读 diff（由视图填充左右编辑区）。</summary>
@@ -2284,7 +2288,7 @@ public sealed partial class MainViewModel : ViewModelBase
         return false;
     }
 
-    private void LoadDocument(string path)
+    private void LoadDocument(string path, bool forceReloadFromDisk = false)
     {
         if (IsDiffCompareActive)
             ExitCompareWithCommit();
@@ -2295,6 +2299,8 @@ public sealed partial class MainViewModel : ViewModelBase
         var opened = FindOpenDocumentByPath(fullPath);
         if (opened is not null)
         {
+            if (forceReloadFromDisk)
+                ReloadDocumentFromDisk(opened);
             ActiveDocument = opened;
             return;
         }
@@ -2308,13 +2314,24 @@ public sealed partial class MainViewModel : ViewModelBase
             _documents.Add(doc);
         }
 
-        // 优先从关闭文档缓存恢复，否则从磁盘读取
-        var cacheIdx = _closedDocumentCache.FindIndex(t => string.Equals(t.path, fullPath, StringComparison.OrdinalIgnoreCase));
-        if (cacheIdx >= 0)
+        if (forceReloadFromDisk)
         {
-            var (_, content) = _closedDocumentCache[cacheIdx];
-            _closedDocumentCache.RemoveAt(cacheIdx);
-            doc.CachedMarkdown = content;
+            var dropIdx = _closedDocumentCache.FindIndex(t => string.Equals(t.path, fullPath, StringComparison.OrdinalIgnoreCase));
+            if (dropIdx >= 0)
+                _closedDocumentCache.RemoveAt(dropIdx);
+            doc.CachedMarkdown = null;
+        }
+
+        // 优先从关闭文档缓存恢复，否则从磁盘读取（「打开文件」强制重载时不走缓存）
+        if (!forceReloadFromDisk)
+        {
+            var cacheIdx = _closedDocumentCache.FindIndex(t => string.Equals(t.path, fullPath, StringComparison.OrdinalIgnoreCase));
+            if (cacheIdx >= 0)
+            {
+                var (_, content) = _closedDocumentCache[cacheIdx];
+                _closedDocumentCache.RemoveAt(cacheIdx);
+                doc.CachedMarkdown = content;
+            }
         }
 
         // 无缓存时在后台读取内容
