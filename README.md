@@ -1,4 +1,12 @@
-# Markdown Editor
+# 【分叉项目：拟移植查看器控件至 MewUI】
+Markdown Editor是个人用下来，最好用的.NET客户端.md编辑器器。其中.md查看器的解析及渲染能力强，性能非常好。
+Mew UI是.NET 跨平台UI新秀，架构极其简洁优秀，依赖极少，性能极高，计划把.md查看器移植至MewUI，实现强强组合：
+（1）先分离出渲染器和查看器控件，不依赖窗体及其他功能；
+（2）把渲染器的实现，从SkiaSharp Canvas替换为MewUI GraphicsContext；
+（3）把编辑器控件的实现，从AvaloniaUI Control替换为MewUI Control；
+（4）打包形成独立MewMdViewer。
+
+# 【源项目：Markdown Editor】
 
 基于 AvaloniaUI 的跨平台 Markdown 文档编辑管理器，使用 .NET 10，100% C# 实现，支持 Native AOT 发布。
 
