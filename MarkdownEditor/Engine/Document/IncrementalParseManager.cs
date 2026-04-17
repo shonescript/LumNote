@@ -8,7 +8,7 @@ namespace MarkdownEditor.Engine.Document;
 /// - ReparseFull：全量重新解析（与旧 RenderEngine.ParseFullDocument 行为一致）；
 /// - ReparseRange：基于行区间的局部重解析，只替换受影响块所在的 BlockSpan，其他块保持引用不变。
 /// </summary>
-internal sealed class IncrementalParseManager
+public sealed class IncrementalParseManager
 {
     /// <summary>最新一次解析得到的原始块列表（尚未做脚注归一化）。</summary>
     public IReadOnlyList<MarkdownNode?> Blocks => _blocks;

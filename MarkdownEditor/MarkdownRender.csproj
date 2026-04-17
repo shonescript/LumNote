@@ -1,0 +1,101 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>Library</OutputType>
+		<TargetFramework>net10.0</TargetFramework>
+		<Nullable>enable</Nullable>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Company></Company>
+		<Product>Markdown Document Viewer</Product>
+		<Description>跨平台 Markdown 文档渲染器 - AOT 编译，高性能</Description>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<None Update="Sample.md">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
+	</ItemGroup>
+
+	<!-- 将 Latin Modern Math 字体文件一并复制到输出目录，供 Skia 运行时从文件加载 -->
+	<ItemGroup>
+		<Content Include="..\_build_out\asserts\otf\latinmodern-math.otf" Condition="!Exists('asserts\otf\latinmodern-math.otf') and Exists('..\_build_out\asserts\otf\latinmodern-math.otf')" Link="asserts\otf\latinmodern-math.otf">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+		<Content Include="..\_chk\asserts\otf\latinmodern-math.otf" Condition="!Exists('asserts\otf\latinmodern-math.otf') and !Exists('..\_build_out\asserts\otf\latinmodern-math.otf') and Exists('..\_chk\asserts\otf\latinmodern-math.otf')" Link="asserts\otf\latinmodern-math.otf">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+	</ItemGroup>
+
+	<!-- 将数学字体嵌入程序集，避免发布后依赖外部路径 -->
+	<ItemGroup>
+		<EmbeddedResource Include="asserts\otf\latinmodern-math.otf" Condition="Exists('asserts\otf\latinmodern-math.otf')" LogicalName="MarkdownEditor.asserts.otf.latinmodern-math.otf" />
+		<EmbeddedResource Include="..\_build_out\asserts\otf\latinmodern-math.otf" Condition="!Exists('asserts\otf\latinmodern-math.otf') and Exists('..\_build_out\asserts\otf\latinmodern-math.otf')" LogicalName="MarkdownEditor.asserts.otf.latinmodern-math.otf" />
+		<EmbeddedResource Include="..\_chk\asserts\otf\latinmodern-math.otf" Condition="!Exists('asserts\otf\latinmodern-math.otf') and !Exists('..\_build_out\asserts\otf\latinmodern-math.otf') and Exists('..\_chk\asserts\otf\latinmodern-math.otf')" LogicalName="MarkdownEditor.asserts.otf.latinmodern-math.otf" />
+	</ItemGroup>
+
+	<!-- 将 asserts 目录打包为 Avalonia 资源，供 TreeView 使用箭头图标 -->
+	<ItemGroup>
+		<AvaloniaXaml Remove="Controls\**" />
+		<AvaloniaXaml Remove="docs\**" />
+		<AvaloniaXaml Remove="Helpers\**" />
+		<AvaloniaXaml Remove="ViewModels\**" />
+		<AvaloniaXaml Remove="Views\**" />
+		<Compile Remove="asserts\**" />
+		<Compile Remove="Controls\**" />
+		<Compile Remove="Converters\**" />
+		<Compile Remove="docs\**" />
+		<Compile Remove="Engine\Highlighting\**" />
+		<Compile Remove="Export\**" />
+		<Compile Remove="Helpers\**" />
+		<Compile Remove="Models\**" />
+		<Compile Remove="Services\**" />
+		<Compile Remove="ViewModels\**" />
+		<Compile Remove="Views\**" />
+		<EmbeddedResource Remove="asserts\**" />
+		<EmbeddedResource Remove="Controls\**" />
+		<EmbeddedResource Remove="Converters\**" />
+		<EmbeddedResource Remove="docs\**" />
+		<EmbeddedResource Remove="Engine\Highlighting\**" />
+		<EmbeddedResource Remove="Export\**" />
+		<EmbeddedResource Remove="Helpers\**" />
+		<EmbeddedResource Remove="Models\**" />
+		<EmbeddedResource Remove="Services\**" />
+		<EmbeddedResource Remove="ViewModels\**" />
+		<EmbeddedResource Remove="Views\**" />
+		<None Remove="asserts\**" />
+		<None Remove="Controls\**" />
+		<None Remove="Converters\**" />
+		<None Remove="docs\**" />
+		<None Remove="Engine\Highlighting\**" />
+		<None Remove="Export\**" />
+		<None Remove="Helpers\**" />
+		<None Remove="Models\**" />
+		<None Remove="Services\**" />
+		<None Remove="ViewModels\**" />
+		<None Remove="Views\**" />
+	</ItemGroup>
+	<ItemGroup>
+		<AvaloniaXaml Remove="App.axaml" />
+	</ItemGroup>
+	<ItemGroup>
+		<Compile Remove="App.axaml.cs" />
+		<Compile Remove="Program.cs" />
+	</ItemGroup>
+	<ItemGroup>
+		<None Remove="App.axaml" />
+		<None Remove="config.sample.json" />
+		<None Remove="MathGuide.md" />
+		<None Remove="Sample_Math.md" />
+		<None Remove="Sample_Math_Regression.md" />
+		<None Remove="Sample_Math_superlength.md" />
+		<None Remove="TrimmerRoots.xml" />
+	</ItemGroup>
+	<ItemGroup>
+		<Compile Include="Engine\Highlighting\CodeTokenizer.cs" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="SkiaSharp" Version="3.119.2" />
+	</ItemGroup>
+
+</Project>

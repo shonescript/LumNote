@@ -44,29 +44,19 @@
     <Content Include="asserts\otf\latinmodern-math.otf" Condition="Exists('asserts\otf\latinmodern-math.otf')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <Content Include="..\_build_out\asserts\otf\latinmodern-math.otf"
-             Condition="!Exists('asserts\otf\latinmodern-math.otf') and Exists('..\_build_out\asserts\otf\latinmodern-math.otf')"
-             Link="asserts\otf\latinmodern-math.otf">
+    <Content Include="..\_build_out\asserts\otf\latinmodern-math.otf" Condition="!Exists('asserts\otf\latinmodern-math.otf') and Exists('..\_build_out\asserts\otf\latinmodern-math.otf')" Link="asserts\otf\latinmodern-math.otf">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <Content Include="..\_chk\asserts\otf\latinmodern-math.otf"
-             Condition="!Exists('asserts\otf\latinmodern-math.otf') and !Exists('..\_build_out\asserts\otf\latinmodern-math.otf') and Exists('..\_chk\asserts\otf\latinmodern-math.otf')"
-             Link="asserts\otf\latinmodern-math.otf">
+    <Content Include="..\_chk\asserts\otf\latinmodern-math.otf" Condition="!Exists('asserts\otf\latinmodern-math.otf') and !Exists('..\_build_out\asserts\otf\latinmodern-math.otf') and Exists('..\_chk\asserts\otf\latinmodern-math.otf')" Link="asserts\otf\latinmodern-math.otf">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
 
   <!-- 将数学字体嵌入程序集，避免发布后依赖外部路径 -->
   <ItemGroup>
-    <EmbeddedResource Include="asserts\otf\latinmodern-math.otf"
-                      Condition="Exists('asserts\otf\latinmodern-math.otf')"
-                      LogicalName="MarkdownEditor.asserts.otf.latinmodern-math.otf" />
-    <EmbeddedResource Include="..\_build_out\asserts\otf\latinmodern-math.otf"
-                      Condition="!Exists('asserts\otf\latinmodern-math.otf') and Exists('..\_build_out\asserts\otf\latinmodern-math.otf')"
-                      LogicalName="MarkdownEditor.asserts.otf.latinmodern-math.otf" />
-    <EmbeddedResource Include="..\_chk\asserts\otf\latinmodern-math.otf"
-                      Condition="!Exists('asserts\otf\latinmodern-math.otf') and !Exists('..\_build_out\asserts\otf\latinmodern-math.otf') and Exists('..\_chk\asserts\otf\latinmodern-math.otf')"
-                      LogicalName="MarkdownEditor.asserts.otf.latinmodern-math.otf" />
+    <EmbeddedResource Include="asserts\otf\latinmodern-math.otf" Condition="Exists('asserts\otf\latinmodern-math.otf')" LogicalName="MarkdownEditor.asserts.otf.latinmodern-math.otf" />
+    <EmbeddedResource Include="..\_build_out\asserts\otf\latinmodern-math.otf" Condition="!Exists('asserts\otf\latinmodern-math.otf') and Exists('..\_build_out\asserts\otf\latinmodern-math.otf')" LogicalName="MarkdownEditor.asserts.otf.latinmodern-math.otf" />
+    <EmbeddedResource Include="..\_chk\asserts\otf\latinmodern-math.otf" Condition="!Exists('asserts\otf\latinmodern-math.otf') and !Exists('..\_build_out\asserts\otf\latinmodern-math.otf') and Exists('..\_chk\asserts\otf\latinmodern-math.otf')" LogicalName="MarkdownEditor.asserts.otf.latinmodern-math.otf" />
   </ItemGroup>
 
   <!-- 将 asserts 目录打包为 Avalonia 资源，供 TreeView 使用箭头图标 -->
@@ -75,13 +65,13 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Avalonia" Version="12.0.0" />
-    <PackageReference Include="Avalonia.Desktop" Version="12.0.0" />
-    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.0.0" />
-    <PackageReference Include="Avalonia.Fonts.Inter" Version="12.0.0" />
-    <PackageReference Include="Avalonia.Skia" Version="12.0.0" />
-    <PackageReference Include="DiffPlex" Version="1.7.2" />
-    <PackageReference Include="System.Reactive" Version="6.0.1" />
+    <PackageReference Include="Avalonia" Version="12.0.1" />
+    <PackageReference Include="Avalonia.Desktop" Version="12.0.1" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.0.1" />
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="12.0.1" />
+    <PackageReference Include="Avalonia.Skia" Version="12.0.1" />
+    <PackageReference Include="DiffPlex" Version="1.9.0" />
+    <PackageReference Include="System.Reactive" Version="6.1.0" />
     <PackageReference Include="LumConfig" Version="1.0.3" />
     <PackageReference Include="LibGit2Sharp" Version="0.31.0" />
   </ItemGroup>

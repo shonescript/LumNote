@@ -1,12 +1,14 @@
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 18
-VisualStudioVersion = 18.4.11626.88 stable
+VisualStudioVersion = 18.4.11626.88
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MarkdownEditor", "MarkdownEditor\MarkdownEditor.csproj", "{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MarkdownEditor.Tests", "MarkdownEditor.Tests\MarkdownEditor.Tests.csproj", "{B2C3D4E5-F6A7-8901-BCDE-F12345678901}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AvaloniaEdit", "external\AvaloniaEdit\src\AvaloniaEdit\AvaloniaEdit.csproj", "{223088E5-4B35-757B-5726-5F02A44AA9DD}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MarkdownRender", "MarkdownEditor\MarkdownRender.csproj", "{FEE3F7BE-C82F-487E-84C7-FD6682BF90F1}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -26,8 +28,15 @@ Global
 		{223088E5-4B35-757B-5726-5F02A44AA9DD}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{223088E5-4B35-757B-5726-5F02A44AA9DD}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{223088E5-4B35-757B-5726-5F02A44AA9DD}.Release|Any CPU.Build.0 = Release|Any CPU
+		{FEE3F7BE-C82F-487E-84C7-FD6682BF90F1}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{FEE3F7BE-C82F-487E-84C7-FD6682BF90F1}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{FEE3F7BE-C82F-487E-84C7-FD6682BF90F1}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{FEE3F7BE-C82F-487E-84C7-FD6682BF90F1}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {6D9F5F3B-718F-44D3-9D8F-D102C8DC2A62}
 	EndGlobalSection
 EndGlobal

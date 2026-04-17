@@ -144,7 +144,7 @@ public sealed class RenderEngine : IDisposable
     }
 
     /// <summary>获取累积高度数组的副本，供布局任务复用以保持 cum 一致性。若尚未布局则返回 null。</summary>
-    internal float[]? GetCumulativeYSnapshot()
+    public float[]? GetCumulativeYSnapshot()
     {
         var cum = _cumulativeY;
         if (cum == null || cum.Length < 2)
@@ -155,13 +155,13 @@ public sealed class RenderEngine : IDisposable
     }
 
     /// <summary>获取布局引擎，供后台布局任务使用。</summary>
-    internal ILayoutEngine GetLayoutEngine() => _layout;
+    public ILayoutEngine GetLayoutEngine() => _layout;
 
     /// <summary>获取引擎配置，供后台布局任务使用。</summary>
-    internal EngineConfig GetConfig() => _config;
+    public EngineConfig GetConfig() => _config;
 
     /// <summary>当前内容区域宽度，供调用方判断 SetWidth 是否会清空布局。</summary>
-    internal float GetWidth() => _width;
+    public float GetWidth() => _width;
 
     public void SetWidth(float width)
     {
