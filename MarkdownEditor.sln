@@ -10,6 +10,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AvaloniaEdit", "external\Av
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MarkdownRender", "MarkdownEditor\MarkdownRender.csproj", "{FEE3F7BE-C82F-487E-84C7-FD6682BF90F1}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MewkdownRender", "MarkdownEditor\MewkdownRender.csproj", "{35CF52D4-2C66-E597-C899-446BA5F566E4}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MewUI", "..\MewUI\src\MewUI\MewUI.csproj", "{3A5CDAF9-1710-74A8-D072-C95C4E65C36C}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -32,6 +36,14 @@ Global
 		{FEE3F7BE-C82F-487E-84C7-FD6682BF90F1}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{FEE3F7BE-C82F-487E-84C7-FD6682BF90F1}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{FEE3F7BE-C82F-487E-84C7-FD6682BF90F1}.Release|Any CPU.Build.0 = Release|Any CPU
+		{35CF52D4-2C66-E597-C899-446BA5F566E4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{35CF52D4-2C66-E597-C899-446BA5F566E4}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{35CF52D4-2C66-E597-C899-446BA5F566E4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{35CF52D4-2C66-E597-C899-446BA5F566E4}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3A5CDAF9-1710-74A8-D072-C95C4E65C36C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3A5CDAF9-1710-74A8-D072-C95C4E65C36C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3A5CDAF9-1710-74A8-D072-C95C4E65C36C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3A5CDAF9-1710-74A8-D072-C95C4E65C36C}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

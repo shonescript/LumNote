@@ -6,7 +6,7 @@
 		<Nullable>enable</Nullable>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Company></Company>
-		<Product>Markdown Document Skia Render</Product>
+		<Product>Markdown Document MewUI Render</Product>
 		<Description>跨平台 Markdown 文档渲染器 - AOT 编译，高性能</Description>
 	</PropertyGroup>
 
@@ -97,6 +97,10 @@
 	<ItemGroup>
 		<PackageReference Include="SkiaSharp" Version="3.119.2" />
 		<PackageReference Include="LumConfig" Version="1.0.3" />
+	</ItemGroup>
+
+	<ItemGroup>
+	  <ProjectReference Include="..\..\MewUI\src\MewUI\MewUI.csproj" />
 	</ItemGroup>
 
 </Project>
